@@ -1,10 +1,13 @@
-mod connection;
-mod ipc;
-mod messages;
-mod node;
-mod protocol;
+use std::sync::Arc;
 
 use clap::Parser;
+use tokio::sync::broadcast;
+
+use nafaq_sidecar::connection::ConnectionManager;
+use nafaq_sidecar::ipc;
+use nafaq_sidecar::messages::Event;
+use nafaq_sidecar::node;
+use nafaq_sidecar::protocol::NafaqProtocol;
 
 #[derive(Parser)]
 #[command(name = "nafaq-sidecar")]
@@ -26,6 +29,38 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     tracing::info!("nafaq-sidecar starting on port {}", cli.port);
 
-    // TODO: wire up endpoint + ws server
-    Ok(())
+    // Broadcast channels for events (JSON) and media (binary)
+    let (event_tx, _event_rx) = broadcast::channel::<Event>(256);
+    let (media_tx, _media_rx) = broadcast::channel::<Vec<u8>>(256);
+
+    // Connection manager
+    let conn_manager = Arc::new(ConnectionManager::new(event_tx.clone(), media_tx.clone()));
+
+    // Create Iroh endpoint
+    let endpoint = node::create_endpoint().await?;
+    tracing::info!("Iroh endpoint ID: {}", endpoint.id());
+
+    // Set up the protocol router
+    let protocol = NafaqProtocol::new(conn_manager.clone());
+    let router = iroh::protocol::Router::builder(endpoint.clone())
+        .accept(node::NAFAQ_ALPN.to_vec(), protocol)
+        .spawn();
+    tracing::info!("Protocol router started");
+
+    // Run the WebSocket IPC server (blocks until shutdown)
+    let ws_result = ipc::run_ws_server(
+        cli.port,
+        endpoint.clone(),
+        conn_manager,
+        event_tx,
+        media_tx,
+    )
+    .await;
+
+    // Shutdown
+    tracing::info!("Shutting down...");
+    router.shutdown().await.ok();
+    endpoint.close().await;
+
+    ws_result
 }
