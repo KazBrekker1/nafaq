@@ -11,11 +11,13 @@
   },
   "dependencies": {
     "electrobun": "latest",
+    "qrcode": "^1.5.4",
     "vue": "^3.5",
     "vue-router": "4"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.2.2",
+    "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^5",
     "concurrently": "^9",
     "tailwindcss": "^4.2.2",
