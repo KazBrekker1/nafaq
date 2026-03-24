@@ -16,8 +16,9 @@ const statusHandlers: StatusHandler[] = [];
 
 let rpc: any = null;
 
+// electrobun/view is externalized — resolved at runtime by Electrobun's webview
 try {
-  const { Electroview } = require("electrobun/view");
+  const { Electroview } = await import("electrobun/view");
 
   rpc = Electroview.defineRPC({
     handlers: {
@@ -36,6 +37,7 @@ try {
       },
     },
   });
+  console.log("[view] Electrobun RPC initialized");
 } catch {
   console.log("[view] Electrobun not available, running standalone");
 }
