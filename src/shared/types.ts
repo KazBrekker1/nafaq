@@ -61,8 +61,8 @@ export function decodeMediaFrame(data: Uint8Array): MediaFrame | null {
   const view = new DataView(data.buffer, data.byteOffset);
   return {
     streamType: data[0],
-    peerId: data.slice(1, 33),
+    peerId: data.subarray(1, 33),
     timestampMs: view.getBigUint64(33, false),
-    payload: data.slice(MEDIA_FRAME_HEADER_SIZE),
+    payload: data.subarray(MEDIA_FRAME_HEADER_SIZE),
   };
 }

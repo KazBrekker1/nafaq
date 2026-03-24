@@ -68,7 +68,9 @@ export function useMedia() {
         const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
         micLevel.value = Math.min(100, Math.round((avg / 128) * 100));
       }, 100);
-    } catch {}
+    } catch (e) {
+      console.warn("[media] Mic level monitor failed:", e);
+    }
   }
 
   function stopPreview() {

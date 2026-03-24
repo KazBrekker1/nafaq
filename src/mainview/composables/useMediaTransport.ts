@@ -9,14 +9,25 @@ import { hexToBytes, bytesToHex } from "../lib/hex";
 
 const SIDECAR_PORT = 9320;
 
-export type OnAudioFrame = (peerId: string, data: Uint8Array, timestamp: number) => void;
-export type OnVideoFrame = (peerId: string, data: Uint8Array, timestamp: number) => void;
+export type OnMediaFrame = (peerId: string, data: Uint8Array, timestamp: number) => void;
 
 export function useMediaTransport() {
   const connected = ref(false);
   let ws: WebSocket | null = null;
-  let onAudio: OnAudioFrame | null = null;
-  let onVideo: OnVideoFrame | null = null;
+  let onAudio: OnMediaFrame | null = null;
+  let onVideo: OnMediaFrame | null = null;
+
+  // Cache peer ID bytes to avoid re-parsing on every frame
+  const peerBytesCache = new Map<string, Uint8Array>();
+
+  function getPeerBytes(peerIdHex: string): Uint8Array {
+    let bytes = peerBytesCache.get(peerIdHex);
+    if (!bytes) {
+      bytes = hexToBytes(peerIdHex);
+      peerBytesCache.set(peerIdHex, bytes);
+    }
+    return bytes;
+  }
 
   function connect() {
     if (ws) return;
@@ -40,12 +51,15 @@ export function useMediaTransport() {
       ws = null;
     };
 
-    ws.onerror = () => {};
+    ws.onerror = (e) => {
+      console.warn("[media-transport] WebSocket error:", e);
+    };
   }
 
   function disconnect() {
     if (ws) { ws.close(); ws = null; }
     connected.value = false;
+    peerBytesCache.clear();
   }
 
   function handleBinaryFrame(data: Uint8Array) {
@@ -60,28 +74,21 @@ export function useMediaTransport() {
     }
   }
 
-  function sendAudio(peerIdHex: string, data: Uint8Array) {
+  function sendFrame(streamType: number, peerIdHex: string, data: Uint8Array) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(encodeMediaFrame({
-      streamType: STREAM_AUDIO,
-      peerId: hexToBytes(peerIdHex),
+      streamType,
+      peerId: getPeerBytes(peerIdHex),
       timestampMs: BigInt(Date.now()),
       payload: data,
     }));
   }
 
-  function sendVideo(peerIdHex: string, data: Uint8Array) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(encodeMediaFrame({
-      streamType: STREAM_VIDEO,
-      peerId: hexToBytes(peerIdHex),
-      timestampMs: BigInt(Date.now()),
-      payload: data,
-    }));
-  }
+  function sendAudio(peerIdHex: string, data: Uint8Array) { sendFrame(STREAM_AUDIO, peerIdHex, data); }
+  function sendVideo(peerIdHex: string, data: Uint8Array) { sendFrame(STREAM_VIDEO, peerIdHex, data); }
 
-  function setOnAudio(handler: OnAudioFrame) { onAudio = handler; }
-  function setOnVideo(handler: OnVideoFrame) { onVideo = handler; }
+  function setOnAudio(handler: OnMediaFrame) { onAudio = handler; }
+  function setOnVideo(handler: OnMediaFrame) { onVideo = handler; }
 
   onUnmounted(() => { disconnect(); });
 

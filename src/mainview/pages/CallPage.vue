@@ -24,7 +24,16 @@ const callDuration = ref("0:00");
 const remoteVideoFrame = ref<VideoFrame | null>(null);
 
 let durationInterval: ReturnType<typeof setInterval> | null = null;
-let startTime = Date.now();
+let cleaned = false;
+
+function cleanup() {
+  if (cleaned) return;
+  cleaned = true;
+  if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
+  audioPipeline.stop();
+  videoPipeline.stop();
+  transport.disconnect();
+}
 
 onMounted(async () => {
   if (call.state.value !== "connected") {
@@ -36,20 +45,16 @@ onMounted(async () => {
     await media.startPreview();
   }
 
-  // Connect media transport (direct WS to sidecar)
   transport.connect();
 
-  // Set up receive handlers
   transport.setOnAudio((_peerId, data, timestamp) => {
     audioPipeline.decodeChunk(data, timestamp);
   });
 
   transport.setOnVideo((_peerId, data, timestamp) => {
-    const isKey = data.length > 0 && (data[0] & 0x01) === 0;
-    videoPipeline.decodeChunk(data, timestamp, isKey);
+    videoPipeline.decodeChunk(data, timestamp);
   });
 
-  // Start decoders
   audioPipeline.startDecoding();
   videoPipeline.startDecoding((frame: VideoFrame) => {
     if (remoteVideoFrame.value) {
@@ -58,19 +63,11 @@ onMounted(async () => {
     remoteVideoFrame.value = frame;
   });
 
-  // Start encoders
   if (media.localStream.value && call.peerId.value) {
-    const peerId = call.peerId.value;
-    audioPipeline.startEncoding(media.localStream.value, (data) => {
-      transport.sendAudio(peerId, data);
-    });
-    videoPipeline.startEncoding(media.localStream.value, (data) => {
-      transport.sendVideo(peerId, data);
-    });
+    startEncoders(call.peerId.value);
   }
 
-  // Call duration timer
-  startTime = Date.now();
+  const startTime = Date.now();
   durationInterval = setInterval(() => {
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
     const mins = Math.floor(elapsed / 60);
@@ -79,18 +76,20 @@ onMounted(async () => {
   }, 1000);
 });
 
-onUnmounted(() => {
-  if (durationInterval) clearInterval(durationInterval);
-  audioPipeline.stop();
-  videoPipeline.stop();
-  transport.disconnect();
-});
+onUnmounted(() => { cleanup(); });
+
+function startEncoders(peerId: string) {
+  if (!media.localStream.value) return;
+  audioPipeline.startEncoding(media.localStream.value, (data) => {
+    transport.sendAudio(peerId, data);
+  });
+  videoPipeline.startEncoding(media.localStream.value, (data) => {
+    transport.sendVideo(peerId, data);
+  });
+}
 
 function handleEndCall() {
-  if (durationInterval) clearInterval(durationInterval);
-  audioPipeline.stop();
-  videoPipeline.stop();
-  transport.disconnect();
+  cleanup();
   media.stopPreview();
   chat.clearMessages();
   call.endCall();
@@ -102,24 +101,17 @@ function handleSendChat(text: string) {
   }
 }
 
-function handleToggleAudio() {
-  media.toggleAudio();
-  if (media.audioMuted.value) {
-    audioPipeline.stopEncoding();
-  } else if (media.localStream.value && call.peerId.value) {
-    audioPipeline.startEncoding(media.localStream.value, (data) => {
-      transport.sendAudio(call.peerId.value!, data);
-    });
-  }
-}
+function handleToggle(kind: "audio" | "video") {
+  const pipeline = kind === "audio" ? audioPipeline : videoPipeline;
+  const muted = kind === "audio" ? media.audioMuted : media.videoMuted;
+  kind === "audio" ? media.toggleAudio() : media.toggleVideo();
 
-function handleToggleVideo() {
-  media.toggleVideo();
-  if (media.videoMuted.value) {
-    videoPipeline.stopEncoding();
+  if (muted.value) {
+    pipeline.stopEncoding();
   } else if (media.localStream.value && call.peerId.value) {
-    videoPipeline.startEncoding(media.localStream.value, (data) => {
-      transport.sendVideo(call.peerId.value!, data);
+    const send = kind === "audio" ? transport.sendAudio : transport.sendVideo;
+    pipeline.startEncoding(media.localStream.value, (data: Uint8Array) => {
+      send(call.peerId.value!, data);
     });
   }
 }
@@ -152,8 +144,8 @@ function handleToggleVideo() {
           :audioMuted="media.audioMuted.value"
           :videoMuted="media.videoMuted.value"
           :chatOpen="chatOpen"
-          @toggleAudio="handleToggleAudio"
-          @toggleVideo="handleToggleVideo"
+          @toggleAudio="handleToggle('audio')"
+          @toggleVideo="handleToggle('video')"
           @toggleChat="chatOpen = !chatOpen"
           @endCall="handleEndCall"
         />

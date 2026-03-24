@@ -151,14 +151,16 @@ impl ConnectionManager {
         mut recv: RecvStream,
         media_tx: broadcast::Sender<Vec<u8>>,
     ) {
+        // Parse peer ID once, reuse for every frame
+        let peer_id_bytes: [u8; 32] = peer_id
+            .parse::<iroh::EndpointId>()
+            .map(|id| *id.as_bytes())
+            .unwrap_or([0u8; 32]);
+
         let mut buf = vec![0u8; 65536];
         loop {
             match recv.read(&mut buf).await {
                 Ok(Some(n)) => {
-                    let peer_id_bytes: [u8; 32] = peer_id
-                        .parse::<iroh::EndpointId>()
-                        .map(|id| *id.as_bytes())
-                        .unwrap_or([0u8; 32]);
 
                     let frame = MediaFrame {
                         stream_type,

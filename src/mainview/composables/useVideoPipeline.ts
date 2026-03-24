@@ -7,6 +7,7 @@ export function useVideoPipeline() {
   let encoder: VideoEncoder | null = null;
   let decoder: VideoDecoder | null = null;
   let captureInterval: ReturnType<typeof setInterval> | null = null;
+  let captureVideoEl: HTMLVideoElement | null = null;
   let onEncodedCallback:
     | ((data: Uint8Array, isKey: boolean) => void)
     | null = null;
@@ -46,10 +47,11 @@ export function useVideoPipeline() {
       framerate: 15,
     });
 
-    const videoEl = document.createElement("video");
-    videoEl.srcObject = stream;
-    videoEl.muted = true;
-    videoEl.play();
+    if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; }
+    captureVideoEl = document.createElement("video");
+    captureVideoEl.srcObject = stream;
+    captureVideoEl.muted = true;
+    captureVideoEl.play();
 
     const captureCanvas = new OffscreenCanvas(width, height);
     const ctx = captureCanvas.getContext("2d")!;
@@ -57,9 +59,9 @@ export function useVideoPipeline() {
 
     captureInterval = setInterval(() => {
       if (!encoder || encoder.state !== "configured") return;
-      if (videoEl.readyState < 2) return;
+      if (!captureVideoEl || captureVideoEl.readyState < 2) return;
 
-      ctx.drawImage(videoEl, 0, 0, width, height);
+      ctx.drawImage(captureVideoEl, 0, 0, width, height);
       const frame = new VideoFrame(captureCanvas, {
         timestamp: frameCount * (1_000_000 / 15),
       });
@@ -78,6 +80,11 @@ export function useVideoPipeline() {
     if (captureInterval) {
       clearInterval(captureInterval);
       captureInterval = null;
+    }
+    if (captureVideoEl) {
+      captureVideoEl.pause();
+      captureVideoEl.srcObject = null;
+      captureVideoEl = null;
     }
     if (encoder) {
       if (encoder.state !== "closed") encoder.close();
@@ -99,8 +106,11 @@ export function useVideoPipeline() {
     console.log("[video-dec] Started decoding");
   }
 
-  function decodeChunk(data: Uint8Array, timestamp: number, isKey: boolean) {
+  /** Decode an encoded video chunk. Keyframe detection is automatic via VP8 header inspection. */
+  function decodeChunk(data: Uint8Array, timestamp: number) {
     if (!decoder || decoder.state !== "configured") return;
+    // VP8 keyframe: bit 0 of first byte is 0
+    const isKey = data.length > 0 && (data[0] & 0x01) === 0;
     const chunk = new EncodedVideoChunk({
       type: isKey ? "key" : "delta",
       timestamp: timestamp * 1000,

@@ -103,17 +103,12 @@ main().catch((err) => {
   process.exit(1);
 });
 
-// ── Cleanup ────────────────────────────────────────────────
-
-process.on("SIGINT", async () => {
+async function shutdown() {
   console.log("[main] Shutting down...");
   bridge.disconnect();
   await sidecar.stop();
   process.exit(0);
-});
+}
 
-process.on("SIGTERM", async () => {
-  bridge.disconnect();
-  await sidecar.stop();
-  process.exit(0);
-});
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
