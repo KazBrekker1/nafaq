@@ -1,5 +1,34 @@
 import { ref } from "vue";
 
+// AudioWorklet processor code — runs off the main thread.
+// Inlined as a Blob URL to avoid Vite asset resolution complexity.
+const WORKLET_CODE = `
+class AudioCaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._frameCount = 0;
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0] || input[0].length === 0) return true;
+    const samples = new Float32Array(input[0]);
+    this.port.postMessage({
+      samples,
+      frameCount: this._frameCount,
+      numFrames: samples.length,
+    });
+    this._frameCount++;
+    return true;
+  }
+}
+registerProcessor("audio-capture-processor", AudioCaptureProcessor);
+`;
+
+function createWorkletUrl(): string {
+  const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
+  return URL.createObjectURL(blob);
+}
+
 export function useAudioPipeline() {
   const encoding = ref(false);
   const decoding = ref(false);
@@ -8,8 +37,9 @@ export function useAudioPipeline() {
   let decoder: AudioDecoder | null = null;
   let audioCtx: AudioContext | null = null;
   let playbackCtx: AudioContext | null = null;
-  let processorNode: ScriptProcessorNode | null = null;
+  let workletNode: AudioWorkletNode | null = null;
   let sourceNode: MediaStreamAudioSourceNode | null = null;
+  let workletBlobUrl: string | null = null;
   let onEncodedCallback: ((data: Uint8Array) => void) | null = null;
   let nextPlayTime = 0;
 
@@ -36,37 +66,50 @@ export function useAudioPipeline() {
     });
 
     audioCtx = new AudioContext({ sampleRate: 48000 });
+
+    workletBlobUrl = createWorkletUrl();
+    await audioCtx.audioWorklet.addModule(workletBlobUrl);
+
     sourceNode = audioCtx.createMediaStreamSource(stream);
-    processorNode = audioCtx.createScriptProcessor(1024, 1, 1);
+    workletNode = new AudioWorkletNode(audioCtx, "audio-capture-processor");
 
     let frameCount = 0;
 
-    processorNode.onaudioprocess = (event) => {
+    workletNode.port.onmessage = (event) => {
       if (!encoder || encoder.state !== "configured") return;
-      const inputData = event.inputBuffer.getChannelData(0);
+
+      const { samples, numFrames } = event.data as {
+        samples: Float32Array;
+        numFrames: number;
+      };
+
+      const data = new Float32Array(new ArrayBuffer(numFrames * 4));
+      data.set(samples);
+
       const audioData = new AudioData({
         format: "f32-planar" as AudioSampleFormat,
         sampleRate: 48000,
-        numberOfFrames: inputData.length,
+        numberOfFrames: numFrames,
         numberOfChannels: 1,
-        timestamp: frameCount * (inputData.length / 48000) * 1_000_000,
-        data: inputData,
+        timestamp: frameCount * (numFrames / 48000) * 1_000_000,
+        data,
       });
       frameCount++;
       encoder.encode(audioData);
       audioData.close();
     };
 
-    sourceNode.connect(processorNode);
-    processorNode.connect(audioCtx.destination);
+    sourceNode.connect(workletNode);
+    workletNode.connect(audioCtx.destination);
     encoding.value = true;
-    console.log("[audio-enc] Started encoding");
+    console.log("[audio-enc] Started encoding via AudioWorklet");
   }
 
   function stopEncoding() {
-    if (processorNode) {
-      processorNode.disconnect();
-      processorNode = null;
+    if (workletNode) {
+      workletNode.port.onmessage = null;
+      workletNode.disconnect();
+      workletNode = null;
     }
     if (sourceNode) {
       sourceNode.disconnect();
@@ -79,6 +122,10 @@ export function useAudioPipeline() {
     if (audioCtx) {
       audioCtx.close();
       audioCtx = null;
+    }
+    if (workletBlobUrl) {
+      URL.revokeObjectURL(workletBlobUrl);
+      workletBlobUrl = null;
     }
     encoding.value = false;
   }
