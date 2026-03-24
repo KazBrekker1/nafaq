@@ -1,12 +1,11 @@
 import { join } from "path";
+import { existsSync } from "fs";
 import type { Subprocess } from "bun";
 
 export interface SidecarOptions {
   port: number;
-  binaryPath?: string;
+  binaryPath: string;
   onExit?: (exitCode: number | null) => void;
-  onStdout?: (line: string) => void;
-  onStderr?: (line: string) => void;
 }
 
 export class SidecarManager {
@@ -21,29 +20,20 @@ export class SidecarManager {
     this.options = options;
   }
 
-  private getBinaryPath(): string {
-    if (this.options.binaryPath) return this.options.binaryPath;
-
-    // In dev: use cargo build output relative to project root
-    // In production: use bundled binary from Electrobun resources
-    try {
-      const PATHS = require("electrobun/bun").default;
-      return join(PATHS.RESOURCES_FOLDER, "bin", "nafaq-sidecar");
-    } catch {
-      return join(import.meta.dir, "..", "..", "sidecar", "target", "debug", "nafaq-sidecar");
-    }
-  }
-
   async start(): Promise<void> {
-    if (this.proc) {
-      console.warn("[sidecar] Already running");
+    if (this.proc) return;
+
+    const { binaryPath, port } = this.options;
+
+    if (!existsSync(binaryPath)) {
+      console.error(`[sidecar] Binary not found: ${binaryPath}`);
+      console.error("[sidecar] Build it with: cd sidecar && cargo build");
       return;
     }
 
-    const binaryPath = this.getBinaryPath();
-    console.log(`[sidecar] Starting: ${binaryPath} --port ${this.options.port}`);
+    console.log(`[sidecar] Starting: ${binaryPath} --port ${port}`);
 
-    this.proc = Bun.spawn([binaryPath, "--port", String(this.options.port)], {
+    this.proc = Bun.spawn([binaryPath, "--port", String(port)], {
       stdout: "pipe",
       stderr: "pipe",
       onExit: (_proc, exitCode, signalCode, _error) => {
@@ -60,20 +50,10 @@ export class SidecarManager {
       },
     });
 
-    if (this.proc.stdout) {
-      this.pipeStream(this.proc.stdout, (line) => {
-        console.log(`[sidecar:out] ${line}`);
-        this.options.onStdout?.(line);
-      });
-    }
-    if (this.proc.stderr) {
-      this.pipeStream(this.proc.stderr, (line) => {
-        console.error(`[sidecar:err] ${line}`);
-        this.options.onStderr?.(line);
-      });
-    }
+    if (this.proc.stdout) this.pipeStream(this.proc.stdout, (l) => console.log(`[sidecar:out] ${l}`));
+    if (this.proc.stderr) this.pipeStream(this.proc.stderr, (l) => console.error(`[sidecar:err] ${l}`));
 
-    await Bun.sleep(500);
+    await Bun.sleep(2000);
     console.log(`[sidecar] Started with PID ${this.proc?.pid}`);
     this.restartCount = 0;
   }
@@ -102,14 +82,10 @@ export class SidecarManager {
     return this.proc !== null;
   }
 
-  private async pipeStream(
-    stream: ReadableStream<Uint8Array>,
-    onLine: (line: string) => void,
-  ): Promise<void> {
+  private async pipeStream(stream: ReadableStream<Uint8Array>, onLine: (line: string) => void): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -121,8 +97,28 @@ export class SidecarManager {
           if (line.trim()) onLine(line);
         }
       }
-    } catch {
-      // Stream closed
-    }
+    } catch {}
   }
+}
+
+/** Resolve the sidecar binary path based on environment. */
+export function resolveSidecarPath(channel: string): string {
+  if (channel !== "dev") {
+    // Production: bundled in app's Resources/bin/
+    return join(import.meta.dir, "bin", "nafaq-sidecar");
+  }
+
+  // Dev: the Electrobun build dir is .../build/dev-macos-arm64/App.app/Contents/Resources/
+  // Walk up to find the project root (contains sidecar/Cargo.toml)
+  let dir = import.meta.dir;
+  for (let i = 0; i < 10; i++) {
+    const candidate = join(dir, "sidecar", "target", "debug", "nafaq-sidecar");
+    if (existsSync(candidate)) return candidate;
+    const parent = join(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  // Last resort: check if it's in PATH
+  return "nafaq-sidecar";
 }
