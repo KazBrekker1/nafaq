@@ -69,10 +69,10 @@ const mainWindow = new BrowserWindow({
 bridge.setWebviewRPC({
   send: {
     onSidecarEvent: (event) => {
-      (mainWindow as any).defaultView.rpc.send.onSidecarEvent(event);
+      try { (mainWindow as any).defaultView.rpc.send.onSidecarEvent(event); } catch {}
     },
     onSidecarStatus: (status) => {
-      (mainWindow as any).defaultView.rpc.send.onSidecarStatus(status);
+      try { (mainWindow as any).defaultView.rpc.send.onSidecarStatus(status); } catch {}
     },
   },
 });
