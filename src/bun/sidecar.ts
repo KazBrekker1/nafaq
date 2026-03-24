@@ -46,7 +46,7 @@ export class SidecarManager {
     this.proc = Bun.spawn([binaryPath, "--port", String(this.options.port)], {
       stdout: "pipe",
       stderr: "pipe",
-      onExit: (proc, exitCode, signalCode, error) => {
+      onExit: (_proc, exitCode, signalCode, _error) => {
         console.log(`[sidecar] Exited with code ${exitCode}, signal ${signalCode}`);
         this.proc = null;
         this.options.onExit?.(exitCode);

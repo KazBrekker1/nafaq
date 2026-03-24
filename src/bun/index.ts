@@ -1,6 +1,6 @@
 import { SidecarManager } from "./sidecar";
 import { SidecarBridge } from "./bridge";
-import type { Command } from "../shared/types";
+
 
 const SIDECAR_PORT = 9320;
 const VITE_DEV_PORT = 5173;
@@ -29,15 +29,17 @@ async function main() {
 
   // 3. Try to create Electrobun window
   try {
-    const { BrowserWindow, BrowserView, Updater } = await import("electrobun/bun");
+    // Dynamic import — only available inside the Electrobun runtime
+    const electrobun: any = await import("electrobun/bun");
+    const { BrowserWindow, BrowserView, Updater } = electrobun;
 
     // Define RPC handlers for the webview
-    const mainviewRPC = BrowserView.defineRPC({
+    BrowserView.defineRPC({
       maxRequestTime: 10000,
       handlers: {
         requests: {
-          sendCommand: ({ command }: { command: Command }) => {
-            return bridge.sendCommand(command);
+          sendCommand: (params: any) => {
+            return bridge.sendCommand(params.command);
           },
           getSidecarStatus: () => {
             return {
@@ -63,7 +65,7 @@ async function main() {
       }
     } catch {}
 
-    const mainWindow = new BrowserWindow({
+    const mainWindow: any = new BrowserWindow({
       title: "Nafaq",
       url,
       frame: {
