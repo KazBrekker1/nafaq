@@ -57,7 +57,6 @@ onUnmounted(() => { cleanup(); });
 
 function handleEndCall() {
   cleanup();
-  media.stopPreview();
   chat.clearMessages();
   call.endCall();
 }

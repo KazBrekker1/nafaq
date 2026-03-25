@@ -4,6 +4,7 @@
 // Receive: decode → AudioContext scheduled playback / Canvas drawImage
 
 const encoding = ref(false);
+const OPUS_CONFIG = { codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 } as const;
 
 let audioEncoder: AudioEncoder | null = null;
 let videoEncoder: VideoEncoder | null = null;
@@ -25,6 +26,7 @@ export function useMediaTransport() {
   async function startSending(stream: MediaStream, peerId: string) {
     if (encoding.value) return;
     encoding.value = true;
+    useRawPcm = false;
 
     const { invoke } = await import("@tauri-apps/api/core");
 
@@ -33,11 +35,11 @@ export function useMediaTransport() {
     if (audioTrack) {
       let codecSupported = false;
       try {
-        const support = await AudioEncoder.isConfigSupported({
-          codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000,
-        });
+        const support = await AudioEncoder.isConfigSupported(OPUS_CONFIG);
         codecSupported = support.supported === true;
-      } catch {}
+      } catch (e) {
+        console.warn("[audio-enc] Opus probe failed:", e);
+      }
 
       if (codecSupported) {
         audioEncoder = new AudioEncoder({
@@ -48,7 +50,7 @@ export function useMediaTransport() {
           },
           error: (e) => console.error("[audio-enc]", e),
         });
-        audioEncoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 });
+        audioEncoder.configure(OPUS_CONFIG);
       } else {
         useRawPcm = true;
       }
@@ -135,8 +137,9 @@ export function useMediaTransport() {
         if (!captureVideoEl || captureVideoEl.readyState < 2) return;
         ctx.drawImage(captureVideoEl, 0, 0, width, height);
         const frame = new VideoFrame(canvas, { timestamp: vFrameCount * (1_000_000 / 15) });
+        const isKeyFrame = vFrameCount === 0 || vFrameCount % 30 === 0;
         vFrameCount++;
-        videoEncoder.encode(frame, { keyFrame: vFrameCount % 30 === 0 });
+        videoEncoder.encode(frame, { keyFrame: isKeyFrame });
         frame.close();
       }, 1000 / 15);
     }
@@ -159,18 +162,11 @@ export function useMediaTransport() {
           audioData.copyTo(ch, { planeIndex: 0 });
           buffer.copyToChannel(ch, 0);
           audioData.close();
-
-          const source = playbackCtx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(playbackCtx.destination);
-          const now = playbackCtx.currentTime;
-          if (nextPlayTime < now - 0.2) nextPlayTime = now;
-          source.start(nextPlayTime);
-          nextPlayTime += buffer.duration;
+          scheduleAudioBuffer(buffer);
         },
         error: (e) => console.error("[audio-dec]", e),
       });
-      audioDecoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
+      audioDecoder.configure(OPUS_CONFIG);
     }
 
     // Video decoder
@@ -200,13 +196,7 @@ export function useMediaTransport() {
         const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
         const ch = buffer.getChannelData(0);
         for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
-        const source = playbackCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(playbackCtx.destination);
-        const now = playbackCtx.currentTime;
-        if (nextPlayTime < now - 0.2) nextPlayTime = now;
-        source.start(nextPlayTime);
-        nextPlayTime += buffer.duration;
+        scheduleAudioBuffer(buffer);
       } else if (audioDecoder?.state === "configured") {
         audioDecoder.decode(new EncodedAudioChunk({
           type: "key",
@@ -252,6 +242,17 @@ export function useMediaTransport() {
     unlistenAudio = null; unlistenVideo = null;
     remoteCanvas = null;
     useRawPcm = false;
+  }
+
+  function scheduleAudioBuffer(buffer: AudioBuffer) {
+    if (!playbackCtx) return;
+    const source = playbackCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(playbackCtx.destination);
+    const now = playbackCtx.currentTime;
+    if (nextPlayTime < now - 0.2) nextPlayTime = now;
+    source.start(nextPlayTime);
+    nextPlayTime += buffer.duration;
   }
 
   return { encoding, startSending, startReceiving, stop };
