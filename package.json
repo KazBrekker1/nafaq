@@ -2,26 +2,24 @@
   "name": "nafaq",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "vite build && electrobun dev",
-    "dev:hmr": "concurrently \"bun run hmr\" \"vite build && electrobun dev\"",
-    "hmr": "vite --port 5173",
-    "build": "vite build && electrobun build --env=canary",
-    "build:sidecar": "cd sidecar && cargo build --release"
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
-    "electrobun": "latest",
-    "qrcode": "^1.5.4",
-    "vue": "^3.5",
-    "vue-router": "4"
+    "@tauri-apps/api": "^2.9.1",
+    "@nuxt/ui": "^4.3.0",
+    "nuxt": "^4.2.2",
+    "vue": "^3.5.27",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.2.2",
-    "@types/qrcode": "^1.5.6",
-    "@vitejs/plugin-vue": "^5",
-    "concurrently": "^9",
-    "tailwindcss": "^4.2.2",
-    "typescript": "^5.7",
-    "vite": "^6"
+    "@tauri-apps/cli": "^2.9.6",
+    "@types/qrcode": "^1.5.5",
+    "typescript": "^5.9.3"
   }
 }
