@@ -7,7 +7,6 @@ mod state;
 
 use std::sync::Arc;
 
-use base64::Engine;
 use connection::ConnectionManager;
 use iroh::protocol::Router;
 use messages::{Event, MediaFrame, STREAM_AUDIO, STREAM_VIDEO};
@@ -15,6 +14,13 @@ use protocol::NafaqProtocol;
 use state::AppState;
 use tauri::Emitter;
 use tokio::sync::broadcast;
+
+#[derive(Clone, serde::Serialize)]
+struct MediaEvent {
+    stream_type: u8,
+    data: Vec<u8>,
+    timestamp: u64,
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -83,12 +89,11 @@ pub fn run() {
                 }
             });
 
-            // Spawn media forwarder (binary frames → base64 Tauri events)
+            // Spawn media forwarder (binary frames → Tauri events)
             let app_handle2 = app.handle().clone();
             let mut media_rx = media_tx_for_setup.subscribe();
 
             tauri::async_runtime::spawn(async move {
-                let b64 = base64::engine::general_purpose::STANDARD;
                 loop {
                     match media_rx.recv().await {
                         Ok(raw) => {
@@ -98,11 +103,11 @@ pub fn run() {
                                     STREAM_VIDEO => "video-received",
                                     _ => continue,
                                 };
-                                let payload = serde_json::json!({
-                                    "data": b64.encode(&frame.payload),
-                                    "timestamp": frame.timestamp_ms,
+                                let _ = app_handle2.emit(event_name, MediaEvent {
+                                    stream_type: frame.stream_type,
+                                    data: frame.payload,
+                                    timestamp: frame.timestamp_ms,
                                 });
-                                let _ = app_handle2.emit(event_name, payload);
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
