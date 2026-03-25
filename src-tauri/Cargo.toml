@@ -23,5 +23,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 opus = "0.3"
-libvpx-sys = "1.4"
+env-libvpx-sys = { version = "5", features = ["generate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
