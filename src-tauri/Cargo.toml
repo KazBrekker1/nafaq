@@ -12,7 +12,6 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-shell = "2"
 iroh = "0.97"
 iroh-tickets = "0.4"
 tokio = { version = "1", features = ["full"] }
@@ -25,3 +24,6 @@ anyhow = "1"
 opus = "0.3"
 env-libvpx-sys = { version = "5", features = ["generate"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-shell = "2"

@@ -168,11 +168,9 @@ impl ConnectionManager {
             .map(|id| *id.as_bytes())
             .unwrap_or([0u8; 32]);
 
-        let mut buf = vec![0u8; 65536];
         loop {
-            match recv.read(&mut buf).await {
-                Ok(Some(n)) => {
-
+            match crate::messages::read_framed(&mut recv).await {
+                Ok(Some(data)) => {
                     let frame = MediaFrame {
                         stream_type,
                         peer_id: peer_id_bytes,
@@ -180,7 +178,7 @@ impl ConnectionManager {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64,
-                        payload: buf[..n].to_vec(),
+                        payload: data,
                     };
                     let _ = media_tx.send(frame.encode());
                 }
@@ -234,7 +232,7 @@ impl ConnectionManager {
     async fn send_on_stream(stream: &Arc<Mutex<Option<SendStream>>>, data: &[u8]) -> Result<()> {
         let mut guard = stream.lock().await;
         if let Some(ref mut send) = *guard {
-            send.write_all(data).await?;
+            crate::messages::write_framed(send, data).await?;
         }
         Ok(())
     }
