@@ -25,7 +25,7 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 function connectToSidecar() {
   if (ws) return;
 
-  ws = new WebSocket(`ws://127.0.0.1:${SIDECAR_PORT}`);
+  ws = new WebSocket(`ws://localhost:${SIDECAR_PORT}`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
