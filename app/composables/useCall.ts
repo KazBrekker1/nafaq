@@ -25,7 +25,7 @@ export function useCall() {
       const t = await invoke<string>("create_call");
       ticket.value = t;
       state.value = "waiting";
-      navigateTo("/lobby");
+      // Stay on home page to display/share the ticket. Peer connection auto-navigates to /call.
     } catch (e) {
       error.value = `Failed to create call: ${e}`;
       state.value = "idle";
