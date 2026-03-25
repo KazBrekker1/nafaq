@@ -7,9 +7,10 @@ mod state;
 
 use std::sync::Arc;
 
+use base64::Engine;
 use connection::ConnectionManager;
 use iroh::protocol::Router;
-use messages::Event;
+use messages::{Event, MediaFrame, STREAM_AUDIO, STREAM_VIDEO};
 use protocol::NafaqProtocol;
 use state::AppState;
 use tauri::Emitter;
@@ -29,6 +30,7 @@ pub fn run() {
 
     let (event_tx, _) = broadcast::channel::<Event>(256);
     let (media_tx, _) = broadcast::channel::<Vec<u8>>(1024);
+    let media_tx_for_setup = media_tx.clone();
     let conn_manager = Arc::new(ConnectionManager::new(event_tx.clone(), media_tx));
 
     // Create endpoint + router on the async runtime
@@ -75,6 +77,36 @@ pub fn run() {
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Event forwarder lagged by {n} messages");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Spawn media forwarder (binary frames → base64 Tauri events)
+            let app_handle2 = app.handle().clone();
+            let mut media_rx = media_tx_for_setup.subscribe();
+
+            tauri::async_runtime::spawn(async move {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                loop {
+                    match media_rx.recv().await {
+                        Ok(raw) => {
+                            if let Some(frame) = MediaFrame::decode(&raw) {
+                                let event_name = match frame.stream_type {
+                                    STREAM_AUDIO => "audio-received",
+                                    STREAM_VIDEO => "video-received",
+                                    _ => continue,
+                                };
+                                let payload = serde_json::json!({
+                                    "data": b64.encode(&frame.payload),
+                                    "timestamp": frame.timestamp_ms,
+                                });
+                                let _ = app_handle2.emit(event_name, payload);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Media forwarder lagged by {n} frames");
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }

@@ -2,10 +2,13 @@
 const call = useCall();
 const media = useMedia();
 const chat = useChat();
+const transport = useMediaTransport();
 
 const chatOpen = ref(true);
 const callDuration = ref("0:00");
 const localVideoEl = ref<HTMLVideoElement | null>(null);
+const remoteVideoEl = ref<HTMLVideoElement | null>(null);
+const remoteAudioEl = ref<HTMLAudioElement | null>(null);
 let durationInterval: ReturnType<typeof setInterval> | null = null;
 let cleaned = false;
 
@@ -13,6 +16,7 @@ function cleanup() {
   if (cleaned) return;
   cleaned = true;
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
+  transport.stop();
 }
 
 onMounted(async () => {
@@ -23,12 +27,19 @@ onMounted(async () => {
 
   if (!media.localStream.value) await media.startPreview();
 
-  // Bind local video
   nextTick(() => {
     if (localVideoEl.value && media.localStream.value) {
       localVideoEl.value.srcObject = media.localStream.value;
     }
   });
+
+  // Start media transport
+  if (media.localStream.value && call.peerId.value) {
+    transport.startSending(media.localStream.value, call.peerId.value);
+  }
+  if (remoteAudioEl.value && remoteVideoEl.value) {
+    transport.startReceiving(remoteAudioEl.value, remoteVideoEl.value);
+  }
 
   const startTime = Date.now();
   durationInterval = setInterval(() => {
@@ -39,7 +50,6 @@ onMounted(async () => {
   }, 1000);
 });
 
-// Re-bind video when stream changes
 watch(() => media.localStream.value, (stream) => {
   if (localVideoEl.value && stream) localVideoEl.value.srcObject = stream;
 });
@@ -77,19 +87,17 @@ function handleSendChat(text: string) {
 
       <!-- Video area -->
       <div class="flex-1 relative flex items-center justify-center">
-        <!-- Remote video placeholder -->
-        <div class="text-center">
-          <span class="text-[var(--color-border-muted)] text-sm font-bold tracking-widest block">
-            Remote Video
-          </span>
-          <div v-for="peer in call.peers.value" :key="peer" class="mt-3">
+        <!-- Remote video -->
+        <video ref="remoteVideoEl" autoplay playsinline class="w-full h-full object-contain absolute inset-0" />
+        <audio ref="remoteAudioEl" autoplay />
+
+        <!-- Peer info overlay (shown when no remote video) -->
+        <div class="text-center z-10">
+          <div v-for="peer in call.peers.value" :key="peer" class="mt-2">
             <span class="text-[10px] text-[var(--color-muted)] bg-black/50 px-3 py-1 font-mono">
               {{ peer.slice(0, 16) }}...
             </span>
           </div>
-          <span class="text-[10px] text-[var(--color-muted)] block mt-4 tracking-widest">
-            Media streaming coming soon
-          </span>
         </div>
 
         <!-- Self PiP -->
