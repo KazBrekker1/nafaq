@@ -10,9 +10,6 @@ export default defineConfig({
     outDir: "../../dist",
     emptyOutDir: true,
     target: "esnext",
-    rollupOptions: {
-      external: ["electrobun/view"],
-    },
   },
   server: {
     port: 5173,

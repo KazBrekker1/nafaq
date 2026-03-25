@@ -16,7 +16,8 @@ const statusHandlers: StatusHandler[] = [];
 
 let rpc: any = null;
 
-// electrobun/view is externalized — resolved at runtime by Electrobun's webview
+// Electrobun's preload script injects globals (window.__electrobunWebviewId, etc.)
+// that the Electroview class uses. Bundled by Vite, resolved at runtime.
 try {
   const { Electroview } = await import("electrobun/view");
 
@@ -38,8 +39,8 @@ try {
     },
   });
   console.log("[view] Electrobun RPC initialized");
-} catch {
-  console.log("[view] Electrobun not available, running standalone");
+} catch (e) {
+  console.log("[view] Electrobun not available, running standalone", e);
 }
 
 // ── Public API ─────────────────────────────────────────────
