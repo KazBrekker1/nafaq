@@ -5,6 +5,12 @@ export default defineNuxtConfig({
   future: { compatibilityVersion: 4 },
   compatibilityDate: "2025-07-01",
 
+  css: ["@/assets/css/main.css"],
+
+  icon: {
+    provider: "iconify",
+  },
+
   vite: {
     envPrefix: ["VITE_", "TAURI_"],
     server: {
