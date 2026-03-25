@@ -1,19 +1,25 @@
-// Media transport: encode local streams via MediaRecorder, send via Tauri,
-// receive from peer, play back via MediaSource for continuous streaming.
+// Media transport: WebCodecs per-frame encode/decode pipeline.
+// Audio: AudioWorklet → AudioEncoder (Opus or raw PCM fallback) → invoke("send_audio")
+// Video: Canvas capture at 15fps → VideoEncoder (VP8) → invoke("send_video")
+// Receive: decode → AudioContext scheduled playback / Canvas drawImage
 
 const encoding = ref(false);
-let audioRecorder: MediaRecorder | null = null;
-let videoRecorder: MediaRecorder | null = null;
+
+let audioEncoder: AudioEncoder | null = null;
+let videoEncoder: VideoEncoder | null = null;
+let audioDecoder: AudioDecoder | null = null;
+let videoDecoder: VideoDecoder | null = null;
+let playbackCtx: AudioContext | null = null;
+let captureCtx: AudioContext | null = null;
+let captureVideoEl: HTMLVideoElement | null = null;
+let captureInterval: ReturnType<typeof setInterval> | null = null;
+let workletNode: AudioWorkletNode | null = null;
+let sourceNode: MediaStreamAudioSourceNode | null = null;
+let nextPlayTime = 0;
 let unlistenAudio: (() => void) | null = null;
 let unlistenVideo: (() => void) | null = null;
-
-// MediaSource playback
-let audioMediaSource: MediaSource | null = null;
-let videoMediaSource: MediaSource | null = null;
-let audioSourceBuffer: SourceBuffer | null = null;
-let videoSourceBuffer: SourceBuffer | null = null;
-let audioQueue: Uint8Array[] = [];
-let videoQueue: Uint8Array[] = [];
+let remoteCanvas: HTMLCanvasElement | null = null;
+let useRawPcm = false;
 
 export function useMediaTransport() {
   async function startSending(stream: MediaStream, peerId: string) {
@@ -22,155 +28,231 @@ export function useMediaTransport() {
 
     const { invoke } = await import("@tauri-apps/api/core");
 
-    // Audio encoding
+    // --- Audio ---
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack) {
-      const audioStream = new MediaStream([audioTrack]);
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus" : "audio/webm";
-      audioRecorder = new MediaRecorder(audioStream, { mimeType, audioBitsPerSecond: 32000 });
-      audioRecorder.ondataavailable = async (e) => {
-        if (e.data.size > 0) {
-          const buffer = await e.data.arrayBuffer();
-          invoke("send_audio", { peerId, data: new Uint8Array(buffer) }).catch(() => {});
+      let codecSupported = false;
+      try {
+        const support = await AudioEncoder.isConfigSupported({
+          codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000,
+        });
+        codecSupported = support.supported === true;
+      } catch {}
+
+      if (codecSupported) {
+        audioEncoder = new AudioEncoder({
+          output: (chunk: EncodedAudioChunk) => {
+            const buf = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(buf);
+            invoke("send_audio", { peerId, data: buf }).catch(() => {});
+          },
+          error: (e) => console.error("[audio-enc]", e),
+        });
+        audioEncoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 });
+      } else {
+        useRawPcm = true;
+      }
+
+      captureCtx = new AudioContext({ sampleRate: 48000 });
+      const WORKLET_CODE = `
+        class CaptureProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const ch = inputs[0]?.[0];
+            if (ch && ch.length > 0) {
+              this.port.postMessage({ samples: new Float32Array(ch) });
+            }
+            return true;
+          }
+        }
+        registerProcessor("capture", CaptureProcessor);
+      `;
+      const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+      await captureCtx.audioWorklet.addModule(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      sourceNode = captureCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+      workletNode = new AudioWorkletNode(captureCtx, "capture");
+
+      let frameCount = 0;
+      workletNode.port.onmessage = (event) => {
+        const { samples } = event.data as { samples: Float32Array };
+        if (useRawPcm) {
+          const pcm = new Int16Array(samples.length);
+          for (let i = 0; i < samples.length; i++) {
+            pcm[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767)));
+          }
+          invoke("send_audio", { peerId, data: new Uint8Array(pcm.buffer) }).catch(() => {});
+        } else if (audioEncoder?.state === "configured") {
+          const data = new Float32Array(new ArrayBuffer(samples.length * 4));
+          data.set(samples);
+          const audioData = new AudioData({
+            format: "f32-planar" as AudioSampleFormat,
+            sampleRate: 48000,
+            numberOfFrames: samples.length,
+            numberOfChannels: 1,
+            timestamp: frameCount * (samples.length / 48000) * 1_000_000,
+            data,
+          });
+          frameCount++;
+          audioEncoder.encode(audioData);
+          audioData.close();
         }
       };
-      audioRecorder.start(200);
+
+      sourceNode.connect(workletNode);
+      workletNode.connect(captureCtx.destination);
     }
 
-    // Video encoding
+    // --- Video ---
     const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack) {
-      const videoStream = new MediaStream([videoTrack]);
-      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
-        ? "video/webm;codecs=vp8" : "video/webm";
-      videoRecorder = new MediaRecorder(videoStream, { mimeType, videoBitsPerSecond: 500000 });
-      videoRecorder.ondataavailable = async (e) => {
-        if (e.data.size > 0) {
-          const buffer = await e.data.arrayBuffer();
-          invoke("send_video", { peerId, data: new Uint8Array(buffer) }).catch(() => {});
-        }
-      };
-      videoRecorder.start(200);
-    }
+      const settings = videoTrack.getSettings();
+      const width = Math.min(settings.width || 640, 640);
+      const height = Math.min(settings.height || 480, 480);
 
-    console.log("[media-transport] Started sending");
+      videoEncoder = new VideoEncoder({
+        output: (chunk: EncodedVideoChunk) => {
+          const buf = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(buf);
+          invoke("send_video", { peerId, data: buf }).catch(() => {});
+        },
+        error: (e) => console.error("[video-enc]", e),
+      });
+      videoEncoder.configure({ codec: "vp8", width, height, bitrate: 500_000, framerate: 15 });
+
+      if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; }
+      captureVideoEl = document.createElement("video");
+      captureVideoEl.srcObject = stream;
+      captureVideoEl.muted = true;
+      captureVideoEl.play();
+
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext("2d")!;
+      let vFrameCount = 0;
+
+      captureInterval = setInterval(() => {
+        if (!videoEncoder || videoEncoder.state !== "configured") return;
+        if (!captureVideoEl || captureVideoEl.readyState < 2) return;
+        ctx.drawImage(captureVideoEl, 0, 0, width, height);
+        const frame = new VideoFrame(canvas, { timestamp: vFrameCount * (1_000_000 / 15) });
+        vFrameCount++;
+        videoEncoder.encode(frame, { keyFrame: vFrameCount % 30 === 0 });
+        frame.close();
+      }, 1000 / 15);
+    }
   }
 
-  async function startReceiving(audioEl: HTMLAudioElement, videoEl: HTMLVideoElement) {
+  async function startReceiving(canvas: HTMLCanvasElement) {
+    remoteCanvas = canvas;
     const { listen } = await import("@tauri-apps/api/event");
 
-    // Set up MediaSource for audio playback
-    setupMediaSource(audioEl, "audio/webm;codecs=opus", "audio");
+    // Audio decoder + playback
+    playbackCtx = new AudioContext({ sampleRate: 48000 });
+    nextPlayTime = playbackCtx.currentTime;
 
-    // Set up MediaSource for video playback
-    setupMediaSource(videoEl, "video/webm;codecs=vp8", "video");
+    if (!useRawPcm) {
+      audioDecoder = new AudioDecoder({
+        output: (audioData: AudioData) => {
+          if (!playbackCtx) return;
+          const buffer = playbackCtx.createBuffer(1, audioData.numberOfFrames, 48000);
+          const ch = new Float32Array(audioData.numberOfFrames);
+          audioData.copyTo(ch, { planeIndex: 0 });
+          buffer.copyToChannel(ch, 0);
+          audioData.close();
 
-    // Listen for incoming audio
-    unlistenAudio = await listen<{ data: string }>("audio-received", (event) => {
-      const bytes = base64ToUint8Array(event.payload.data);
-      if (bytes.length > 0) appendToBuffer("audio", bytes);
-    });
-
-    // Listen for incoming video
-    unlistenVideo = await listen<{ data: string }>("video-received", (event) => {
-      const bytes = base64ToUint8Array(event.payload.data);
-      if (bytes.length > 0) appendToBuffer("video", bytes);
-    });
-
-    console.log("[media-transport] Started receiving");
-  }
-
-  function setupMediaSource(el: HTMLMediaElement, mimeType: string, type: "audio" | "video") {
-    // Check if MediaSource supports this type
-    if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported(mimeType)) {
-      console.warn(`[media-transport] MediaSource doesn't support ${mimeType}, using fallback`);
-      // Fallback: accumulate and play via Blob URL
-      return;
+          const source = playbackCtx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(playbackCtx.destination);
+          const now = playbackCtx.currentTime;
+          if (nextPlayTime < now - 0.2) nextPlayTime = now;
+          source.start(nextPlayTime);
+          nextPlayTime += buffer.duration;
+        },
+        error: (e) => console.error("[audio-dec]", e),
+      });
+      audioDecoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1 });
     }
 
-    const ms = new MediaSource();
-    el.src = URL.createObjectURL(ms);
-
-    ms.addEventListener("sourceopen", () => {
-      try {
-        const sb = ms.addSourceBuffer(mimeType);
-        sb.mode = "sequence";
-
-        sb.addEventListener("updateend", () => {
-          // Flush queued buffers
-          const queue = type === "audio" ? audioQueue : videoQueue;
-          if (queue.length > 0 && !sb.updating) {
-            const next = queue.shift()!;
-            try { sb.appendBuffer(next); } catch {}
+    // Video decoder
+    videoDecoder = new VideoDecoder({
+      output: (frame: VideoFrame) => {
+        if (remoteCanvas) {
+          const ctx = remoteCanvas.getContext("2d");
+          if (ctx) {
+            if (remoteCanvas.width !== frame.displayWidth) remoteCanvas.width = frame.displayWidth;
+            if (remoteCanvas.height !== frame.displayHeight) remoteCanvas.height = frame.displayHeight;
+            ctx.drawImage(frame, 0, 0);
           }
-        });
-
-        if (type === "audio") {
-          audioMediaSource = ms;
-          audioSourceBuffer = sb;
-        } else {
-          videoMediaSource = ms;
-          videoSourceBuffer = sb;
         }
-      } catch (e) {
-        console.error(`[media-transport] Failed to create ${type} SourceBuffer:`, e);
+        frame.close();
+      },
+      error: (e) => console.error("[video-dec]", e),
+    });
+    videoDecoder.configure({ codec: "vp8" });
+
+    // Event listeners — payload is { stream_type, data: number[], timestamp }
+    type MediaPayload = { stream_type: number; data: number[]; timestamp: number };
+
+    unlistenAudio = await listen<MediaPayload>("audio-received", (event) => {
+      const bytes = new Uint8Array(event.payload.data);
+      if (useRawPcm && playbackCtx) {
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+        const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
+        const ch = buffer.getChannelData(0);
+        for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
+        const source = playbackCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(playbackCtx.destination);
+        const now = playbackCtx.currentTime;
+        if (nextPlayTime < now - 0.2) nextPlayTime = now;
+        source.start(nextPlayTime);
+        nextPlayTime += buffer.duration;
+      } else if (audioDecoder?.state === "configured") {
+        audioDecoder.decode(new EncodedAudioChunk({
+          type: "key",
+          timestamp: event.payload.timestamp * 1000,
+          data: bytes,
+        }));
       }
     });
 
-    el.play().catch(() => {});
-  }
-
-  function appendToBuffer(type: "audio" | "video", data: Uint8Array) {
-    const sb = type === "audio" ? audioSourceBuffer : videoSourceBuffer;
-    const queue = type === "audio" ? audioQueue : videoQueue;
-
-    if (!sb) {
-      // MediaSource not ready, queue it
-      queue.push(data);
-      if (queue.length > 100) queue.shift(); // prevent unbounded growth
-      return;
-    }
-
-    if (sb.updating) {
-      queue.push(data);
-      if (queue.length > 100) queue.shift();
-    } else {
-      try { sb.appendBuffer(data); } catch { queue.push(data); }
-    }
+    unlistenVideo = await listen<MediaPayload>("video-received", (event) => {
+      const bytes = new Uint8Array(event.payload.data);
+      if (videoDecoder?.state === "configured" && bytes.length > 0) {
+        const isKey = (bytes[0] & 0x01) === 0;
+        videoDecoder.decode(new EncodedVideoChunk({
+          type: isKey ? "key" : "delta",
+          timestamp: event.payload.timestamp * 1000,
+          data: bytes,
+        }));
+      }
+    });
   }
 
   function stop() {
-    if (audioRecorder?.state !== "inactive") audioRecorder?.stop();
-    if (videoRecorder?.state !== "inactive") videoRecorder?.stop();
-    audioRecorder = null;
-    videoRecorder = null;
+    if (audioEncoder?.state !== "closed") try { audioEncoder?.close(); } catch {}
+    if (videoEncoder?.state !== "closed") try { videoEncoder?.close(); } catch {}
+    audioEncoder = null;
+    videoEncoder = null;
     encoding.value = false;
 
-    unlistenAudio?.();
-    unlistenVideo?.();
-    unlistenAudio = null;
-    unlistenVideo = null;
+    if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
+    if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
+    if (captureCtx) { captureCtx.close(); captureCtx = null; }
+    if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; captureVideoEl = null; }
+    if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
 
-    // Clean up MediaSource
-    try { audioMediaSource?.endOfStream(); } catch {}
-    try { videoMediaSource?.endOfStream(); } catch {}
-    audioMediaSource = null;
-    videoMediaSource = null;
-    audioSourceBuffer = null;
-    videoSourceBuffer = null;
-    audioQueue = [];
-    videoQueue = [];
+    if (audioDecoder?.state !== "closed") try { audioDecoder?.close(); } catch {}
+    if (videoDecoder?.state !== "closed") try { videoDecoder?.close(); } catch {}
+    audioDecoder = null;
+    videoDecoder = null;
+    if (playbackCtx) { playbackCtx.close(); playbackCtx = null; }
 
-    console.log("[media-transport] Stopped");
+    unlistenAudio?.(); unlistenVideo?.();
+    unlistenAudio = null; unlistenVideo = null;
+    remoteCanvas = null;
+    useRawPcm = false;
   }
 
   return { encoding, startSending, startReceiving, stop };
-}
-
-function base64ToUint8Array(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
 }

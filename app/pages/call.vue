@@ -7,8 +7,7 @@ const transport = useMediaTransport();
 const chatOpen = ref(true);
 const callDuration = ref("0:00");
 const localVideoEl = ref<HTMLVideoElement | null>(null);
-const remoteVideoEl = ref<HTMLVideoElement | null>(null);
-const remoteAudioEl = ref<HTMLAudioElement | null>(null);
+const remoteCanvasEl = ref<HTMLCanvasElement | null>(null);
 let durationInterval: ReturnType<typeof setInterval> | null = null;
 let cleaned = false;
 
@@ -49,11 +48,9 @@ watch(() => media.localStream.value, (stream) => {
   }
 }, { immediate: true });
 
-// Start receiving when remote elements are available
-watch([remoteAudioEl, remoteVideoEl], ([audioEl, videoEl]) => {
-  if (audioEl && videoEl) {
-    transport.startReceiving(audioEl, videoEl);
-  }
+// Start receiving when remote canvas is available
+watch(remoteCanvasEl, (canvas) => {
+  if (canvas) transport.startReceiving(canvas);
 });
 
 onUnmounted(() => { cleanup(); });
@@ -90,8 +87,7 @@ function handleSendChat(text: string) {
       <!-- Video area -->
       <div class="flex-1 relative flex items-center justify-center">
         <!-- Remote video -->
-        <video ref="remoteVideoEl" autoplay playsinline class="w-full h-full object-contain absolute inset-0" />
-        <audio ref="remoteAudioEl" autoplay />
+        <canvas ref="remoteCanvasEl" class="w-full h-full object-contain absolute inset-0" />
 
         <!-- Peer info overlay (shown when no remote video) -->
         <div class="text-center z-10">
