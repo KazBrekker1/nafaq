@@ -41,11 +41,9 @@ onMounted(async () => {
   }, 1000);
 });
 
-// Bind local video when stream or ref becomes available
-watch(() => media.localStream.value, (stream) => {
-  if (localVideoEl.value) {
-    localVideoEl.value.srcObject = stream || null;
-  }
+// Bind local video when stream or element becomes available
+watch([() => media.localStream.value, localVideoEl], ([stream, el]) => {
+  if (el) el.srcObject = stream || null;
 }, { immediate: true });
 
 // Start receiving when remote canvas is available

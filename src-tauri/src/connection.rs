@@ -18,7 +18,7 @@ struct PeerConnection {
 }
 
 pub struct ConnectionManager {
-    peers: Mutex<HashMap<String, PeerConnection>>,
+    peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     event_tx: broadcast::Sender<Event>,
     media_tx: broadcast::Sender<Vec<u8>>,
 }
@@ -35,7 +35,7 @@ impl ConnectionManager {
         media_tx: broadcast::Sender<Vec<u8>>,
     ) -> Self {
         Self {
-            peers: Mutex::new(HashMap::new()),
+            peers: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             media_tx,
         }
@@ -96,6 +96,7 @@ impl ConnectionManager {
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {
         let media_tx = self.media_tx.clone();
         let event_tx_uni = self.event_tx.clone();
+        let peers_ref = self.peers.clone();
         let peer_id_uni = peer_id.clone();
         let connection_uni = connection.clone();
 
@@ -116,6 +117,8 @@ impl ConnectionManager {
                     }
                     Err(_) => {
                         tracing::info!("Connection lost for peer {peer_id_uni}");
+                        // Remove dead peer from map to prevent memory leak
+                        peers_ref.lock().await.remove(&peer_id_uni);
                         let _ = event_tx_uni.send(Event::PeerDisconnected {
                             peer_id: peer_id_uni.clone(),
                         });

@@ -85,8 +85,7 @@ export function useMediaTransport() {
           }
           invoke("send_audio", { peerId, data: new Uint8Array(pcm.buffer) }).catch(() => {});
         } else if (audioEncoder?.state === "configured") {
-          const data = new Float32Array(new ArrayBuffer(samples.length * 4));
-          data.set(samples);
+          const data = new Float32Array(samples);
           const audioData = new AudioData({
             format: "f32-planar" as AudioSampleFormat,
             sampleRate: 48000,
@@ -169,15 +168,17 @@ export function useMediaTransport() {
       audioDecoder.configure(OPUS_CONFIG);
     }
 
-    // Video decoder
+    // Video decoder — cache 2d context to avoid lookup per frame
+    let canvasCtx: CanvasRenderingContext2D | null = null;
+
     videoDecoder = new VideoDecoder({
       output: (frame: VideoFrame) => {
         if (remoteCanvas) {
-          const ctx = remoteCanvas.getContext("2d");
-          if (ctx) {
+          if (!canvasCtx) canvasCtx = remoteCanvas.getContext("2d");
+          if (canvasCtx) {
             if (remoteCanvas.width !== frame.displayWidth) remoteCanvas.width = frame.displayWidth;
             if (remoteCanvas.height !== frame.displayHeight) remoteCanvas.height = frame.displayHeight;
-            ctx.drawImage(frame, 0, 0);
+            canvasCtx.drawImage(frame, 0, 0);
           }
         }
         frame.close();
