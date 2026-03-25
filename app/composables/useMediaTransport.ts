@@ -1,15 +1,11 @@
-// Media transport: WebCodecs per-frame encode/decode pipeline.
-// Audio: AudioWorklet → AudioEncoder (Opus or raw PCM fallback) → invoke("send_audio")
-// Video: Canvas capture at 15fps → VideoEncoder (VP8) → invoke("send_video")
-// Receive: decode → AudioContext scheduled playback / Canvas drawImage
+// Media transport: raw frames → Rust codec pipeline.
+// Audio: AudioWorklet → buffer 960 samples → Int16 PCM → invoke("send_audio") → Rust Opus encode
+// Video: Canvas capture 15fps → getImageData RGBA → invoke("send_video") → Rust VP8 encode
+// Receive: Rust decodes → PCM Int16 / JPEG → JS playback
 
 const encoding = ref(false);
-const OPUS_CONFIG = { codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 } as const;
+const OPUS_FRAME_SAMPLES = 960; // 20ms at 48kHz
 
-let audioEncoder: AudioEncoder | null = null;
-let videoEncoder: VideoEncoder | null = null;
-let audioDecoder: AudioDecoder | null = null;
-let videoDecoder: VideoDecoder | null = null;
 let playbackCtx: AudioContext | null = null;
 let captureCtx: AudioContext | null = null;
 let captureVideoEl: HTMLVideoElement | null = null;
@@ -20,41 +16,36 @@ let nextPlayTime = 0;
 let unlistenAudio: (() => void) | null = null;
 let unlistenVideo: (() => void) | null = null;
 let remoteCanvas: HTMLCanvasElement | null = null;
-let useRawPcm = false;
 
 export function useMediaTransport() {
   async function startSending(stream: MediaStream, peerId: string) {
     if (encoding.value) return;
     encoding.value = true;
-    useRawPcm = false;
 
     const { invoke } = await import("@tauri-apps/api/core");
+
+    // Determine resolution — cap at 320x240 on mobile
+    const isMobile = /android/i.test(navigator.userAgent);
+    const videoTrack = stream.getVideoTracks()[0];
+    const maxDim = isMobile ? 320 : 640;
+    const width = videoTrack
+      ? Math.min(videoTrack.getSettings().width || maxDim, maxDim)
+      : maxDim;
+    const height = videoTrack
+      ? Math.min(
+          videoTrack.getSettings().height || (isMobile ? 240 : 480),
+          isMobile ? 240 : 480,
+        )
+      : isMobile
+        ? 240
+        : 480;
+
+    // Initialize Rust codecs BEFORE audio or video setup — needed for both paths
+    await invoke("init_codecs", { width, height });
 
     // --- Audio ---
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack) {
-      let codecSupported = false;
-      try {
-        const support = await AudioEncoder.isConfigSupported(OPUS_CONFIG);
-        codecSupported = support.supported === true;
-      } catch (e) {
-        console.warn("[audio-enc] Opus probe failed:", e);
-      }
-
-      if (codecSupported) {
-        audioEncoder = new AudioEncoder({
-          output: (chunk: EncodedAudioChunk) => {
-            const buf = new Uint8Array(chunk.byteLength);
-            chunk.copyTo(buf);
-            invoke("send_audio", { peerId, data: buf }).catch(() => {});
-          },
-          error: (e) => console.error("[audio-enc]", e),
-        });
-        audioEncoder.configure(OPUS_CONFIG);
-      } else {
-        useRawPcm = true;
-      }
-
       captureCtx = new AudioContext({ sampleRate: 48000 });
       const WORKLET_CODE = `
         class CaptureProcessor extends AudioWorkletProcessor {
@@ -68,35 +59,50 @@ export function useMediaTransport() {
         }
         registerProcessor("capture", CaptureProcessor);
       `;
-      const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+      const blobUrl = URL.createObjectURL(
+        new Blob([WORKLET_CODE], { type: "application/javascript" }),
+      );
       await captureCtx.audioWorklet.addModule(blobUrl);
       URL.revokeObjectURL(blobUrl);
 
-      sourceNode = captureCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+      sourceNode = captureCtx.createMediaStreamSource(
+        new MediaStream([audioTrack]),
+      );
       workletNode = new AudioWorkletNode(captureCtx, "capture");
 
-      let frameCount = 0;
+      // Buffer 128-sample worklet chunks into 960-sample Opus frames
+      const sampleBuffer = new Float32Array(OPUS_FRAME_SAMPLES);
+      let bufferOffset = 0;
+
       workletNode.port.onmessage = (event) => {
         const { samples } = event.data as { samples: Float32Array };
-        if (useRawPcm) {
-          const pcm = new Int16Array(samples.length);
-          for (let i = 0; i < samples.length; i++) {
-            pcm[i] = Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32767)));
+        let srcOffset = 0;
+
+        while (srcOffset < samples.length) {
+          const remaining = OPUS_FRAME_SAMPLES - bufferOffset;
+          const toCopy = Math.min(remaining, samples.length - srcOffset);
+          sampleBuffer.set(
+            samples.subarray(srcOffset, srcOffset + toCopy),
+            bufferOffset,
+          );
+          bufferOffset += toCopy;
+          srcOffset += toCopy;
+
+          if (bufferOffset === OPUS_FRAME_SAMPLES) {
+            // Convert Float32 → Int16 LE
+            const pcm = new Int16Array(OPUS_FRAME_SAMPLES);
+            for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
+              pcm[i] = Math.max(
+                -32768,
+                Math.min(32767, Math.round(sampleBuffer[i]! * 32767)),
+              );
+            }
+            invoke("send_audio", {
+              peerId,
+              data: Array.from(new Uint8Array(pcm.buffer)),
+            }).catch(() => {});
+            bufferOffset = 0;
           }
-          invoke("send_audio", { peerId, data: new Uint8Array(pcm.buffer) }).catch(() => {});
-        } else if (audioEncoder?.state === "configured") {
-          const data = new Float32Array(samples);
-          const audioData = new AudioData({
-            format: "f32-planar" as AudioSampleFormat,
-            sampleRate: 48000,
-            numberOfFrames: samples.length,
-            numberOfChannels: 1,
-            timestamp: frameCount * (samples.length / 48000) * 1_000_000,
-            data,
-          });
-          frameCount++;
-          audioEncoder.encode(audioData);
-          audioData.close();
         }
       };
 
@@ -105,23 +111,11 @@ export function useMediaTransport() {
     }
 
     // --- Video ---
-    const videoTrack = stream.getVideoTracks()[0];
     if (videoTrack) {
-      const settings = videoTrack.getSettings();
-      const width = Math.min(settings.width || 640, 640);
-      const height = Math.min(settings.height || 480, 480);
-
-      videoEncoder = new VideoEncoder({
-        output: (chunk: EncodedVideoChunk) => {
-          const buf = new Uint8Array(chunk.byteLength);
-          chunk.copyTo(buf);
-          invoke("send_video", { peerId, data: buf }).catch(() => {});
-        },
-        error: (e) => console.error("[video-enc]", e),
-      });
-      videoEncoder.configure({ codec: "vp8", width, height, bitrate: 500_000, framerate: 15 });
-
-      if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; }
+      if (captureVideoEl) {
+        captureVideoEl.pause();
+        captureVideoEl.srcObject = null;
+      }
       captureVideoEl = document.createElement("video");
       captureVideoEl.srcObject = stream;
       captureVideoEl.muted = true;
@@ -132,14 +126,18 @@ export function useMediaTransport() {
       let vFrameCount = 0;
 
       captureInterval = setInterval(() => {
-        if (!videoEncoder || videoEncoder.state !== "configured") return;
         if (!captureVideoEl || captureVideoEl.readyState < 2) return;
         ctx.drawImage(captureVideoEl, 0, 0, width, height);
-        const frame = new VideoFrame(canvas, { timestamp: vFrameCount * (1_000_000 / 15) });
-        const isKeyFrame = vFrameCount === 0 || vFrameCount % 30 === 0;
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const keyframe = vFrameCount === 0 || vFrameCount % 30 === 0;
         vFrameCount++;
-        videoEncoder.encode(frame, { keyFrame: isKeyFrame });
-        frame.close();
+        invoke("send_video", {
+          peerId,
+          data: Array.from(new Uint8Array(imageData.data.buffer)),
+          width,
+          height,
+          keyframe,
+        }).catch(() => {});
       }, 1000 / 15);
     }
   }
@@ -148,101 +146,103 @@ export function useMediaTransport() {
     remoteCanvas = canvas;
     const { listen } = await import("@tauri-apps/api/event");
 
-    // Audio decoder + playback
     playbackCtx = new AudioContext({ sampleRate: 48000 });
     nextPlayTime = playbackCtx.currentTime;
 
-    if (!useRawPcm) {
-      audioDecoder = new AudioDecoder({
-        output: (audioData: AudioData) => {
-          if (!playbackCtx) return;
-          const buffer = playbackCtx.createBuffer(1, audioData.numberOfFrames, 48000);
-          const ch = new Float32Array(audioData.numberOfFrames);
-          audioData.copyTo(ch, { planeIndex: 0 });
-          buffer.copyToChannel(ch, 0);
-          audioData.close();
-          scheduleAudioBuffer(buffer);
-        },
-        error: (e) => console.error("[audio-dec]", e),
-      });
-      audioDecoder.configure(OPUS_CONFIG);
-    }
-
-    // Video decoder — cache 2d context to avoid lookup per frame
+    // Cache canvas context
     let canvasCtx: CanvasRenderingContext2D | null = null;
 
-    videoDecoder = new VideoDecoder({
-      output: (frame: VideoFrame) => {
-        if (remoteCanvas) {
+    type AudioPayload = {
+      stream_type: number;
+      data: number[];
+      timestamp: number;
+    };
+    type VideoPayload = {
+      stream_type: number;
+      data: number[];
+      timestamp: number;
+      width: number;
+      height: number;
+    };
+
+    // Audio receive — PCM Int16 from Rust Opus decoder
+    unlistenAudio = await listen<AudioPayload>("audio-received", (event) => {
+      if (!playbackCtx) return;
+      const bytes = new Uint8Array(event.payload.data);
+      const int16 = new Int16Array(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength / 2,
+      );
+      const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
+      const ch = buffer.getChannelData(0);
+      for (let i = 0; i < int16.length; i++) ch[i] = int16[i]! / 32768;
+      scheduleAudioBuffer(buffer);
+    });
+
+    // Video receive — JPEG from Rust VP8 decoder
+    unlistenVideo = await listen<VideoPayload>("video-received", (event) => {
+      if (!remoteCanvas) return;
+      const bytes = new Uint8Array(event.payload.data);
+      const blob = new Blob([bytes], { type: "image/jpeg" });
+      createImageBitmap(blob)
+        .then((bitmap) => {
+          if (!remoteCanvas) return;
           if (!canvasCtx) canvasCtx = remoteCanvas.getContext("2d");
           if (canvasCtx) {
-            if (remoteCanvas.width !== frame.displayWidth) remoteCanvas.width = frame.displayWidth;
-            if (remoteCanvas.height !== frame.displayHeight) remoteCanvas.height = frame.displayHeight;
-            canvasCtx.drawImage(frame, 0, 0);
+            if (remoteCanvas.width !== bitmap.width)
+              remoteCanvas.width = bitmap.width;
+            if (remoteCanvas.height !== bitmap.height)
+              remoteCanvas.height = bitmap.height;
+            canvasCtx.drawImage(bitmap, 0, 0);
+            bitmap.close();
           }
-        }
-        frame.close();
-      },
-      error: (e) => console.error("[video-dec]", e),
-    });
-    videoDecoder.configure({ codec: "vp8" });
-
-    // Event listeners — payload is { stream_type, data: number[], timestamp }
-    type MediaPayload = { stream_type: number; data: number[]; timestamp: number };
-
-    unlistenAudio = await listen<MediaPayload>("audio-received", (event) => {
-      const bytes = new Uint8Array(event.payload.data);
-      if (useRawPcm && playbackCtx) {
-        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-        const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
-        const ch = buffer.getChannelData(0);
-        for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
-        scheduleAudioBuffer(buffer);
-      } else if (audioDecoder?.state === "configured") {
-        audioDecoder.decode(new EncodedAudioChunk({
-          type: "key",
-          timestamp: event.payload.timestamp * 1000,
-          data: bytes,
-        }));
-      }
-    });
-
-    unlistenVideo = await listen<MediaPayload>("video-received", (event) => {
-      const bytes = new Uint8Array(event.payload.data);
-      if (videoDecoder?.state === "configured" && bytes.length > 0) {
-        const isKey = (bytes[0] & 0x01) === 0;
-        videoDecoder.decode(new EncodedVideoChunk({
-          type: isKey ? "key" : "delta",
-          timestamp: event.payload.timestamp * 1000,
-          data: bytes,
-        }));
-      }
+        })
+        .catch(() => {});
     });
   }
 
-  function stop() {
-    if (audioEncoder?.state !== "closed") try { audioEncoder?.close(); } catch {}
-    if (videoEncoder?.state !== "closed") try { videoEncoder?.close(); } catch {}
-    audioEncoder = null;
-    videoEncoder = null;
+  async function stop() {
     encoding.value = false;
 
-    if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
-    if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
-    if (captureCtx) { captureCtx.close(); captureCtx = null; }
-    if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; captureVideoEl = null; }
-    if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+    if (workletNode) {
+      workletNode.port.onmessage = null;
+      workletNode.disconnect();
+      workletNode = null;
+    }
+    if (sourceNode) {
+      sourceNode.disconnect();
+      sourceNode = null;
+    }
+    if (captureCtx) {
+      captureCtx.close();
+      captureCtx = null;
+    }
+    if (captureVideoEl) {
+      captureVideoEl.pause();
+      captureVideoEl.srcObject = null;
+      captureVideoEl = null;
+    }
+    if (captureInterval) {
+      clearInterval(captureInterval);
+      captureInterval = null;
+    }
+    if (playbackCtx) {
+      playbackCtx.close();
+      playbackCtx = null;
+    }
 
-    if (audioDecoder?.state !== "closed") try { audioDecoder?.close(); } catch {}
-    if (videoDecoder?.state !== "closed") try { videoDecoder?.close(); } catch {}
-    audioDecoder = null;
-    videoDecoder = null;
-    if (playbackCtx) { playbackCtx.close(); playbackCtx = null; }
-
-    unlistenAudio?.(); unlistenVideo?.();
-    unlistenAudio = null; unlistenVideo = null;
+    unlistenAudio?.();
+    unlistenVideo?.();
+    unlistenAudio = null;
+    unlistenVideo = null;
     remoteCanvas = null;
-    useRawPcm = false;
+
+    // Clean up Rust codec state
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("destroy_codecs");
+    } catch {}
   }
 
   function scheduleAudioBuffer(buffer: AudioBuffer) {

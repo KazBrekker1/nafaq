@@ -11,11 +11,11 @@ const remoteCanvasEl = ref<HTMLCanvasElement | null>(null);
 let durationInterval: ReturnType<typeof setInterval> | null = null;
 let cleaned = false;
 
-function cleanup() {
+async function cleanup() {
   if (cleaned) return;
   cleaned = true;
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
-  transport.stop();
+  await transport.stop();
   media.stopPreview();
 }
 
