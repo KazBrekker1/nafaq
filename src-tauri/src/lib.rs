@@ -71,7 +71,7 @@ pub fn run() {
                                 Event::ControlReceived { .. } => "control-received",
                                 Event::ConnectionStatus { .. } => "connection-status",
                                 Event::Error { .. } => "nafaq-error",
-                                _ => continue,
+                                Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);
                         }

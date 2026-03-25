@@ -80,13 +80,18 @@ async function initCallListeners() {
     const { listen } = await import("@tauri-apps/api/event");
 
     // Get initial node info (retry if Iroh still initializing)
+    let retries = 0;
     async function fetchNodeInfo() {
       try {
         const info = await invoke<{ id: string; ticket: string }>("get_node_info");
         nodeId.value = info.id;
         sidecarConnected.value = true;
       } catch {
-        setTimeout(fetchNodeInfo, 2000);
+        if (++retries < 15) {
+          setTimeout(fetchNodeInfo, 2000);
+        } else {
+          error.value = "Failed to connect to Iroh after 30s";
+        }
       }
     }
     fetchNodeInfo();

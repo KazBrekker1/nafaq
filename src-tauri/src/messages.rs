@@ -6,7 +6,7 @@ pub const STREAM_VIDEO: u8 = 0x02;
 pub const STREAM_CHAT: u8 = 0x03;
 pub const STREAM_CONTROL: u8 = 0x04;
 
-/// Messages from Bun → Sidecar (JSON over WebSocket text frames)
+/// Commands from frontend → Rust backend (via Tauri invoke)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -27,7 +27,7 @@ pub enum ControlAction {
     PeerAnnounce { peer_id: String, ticket: String },
 }
 
-/// Events from Sidecar → Bun (JSON over WebSocket text frames)
+/// Events from Rust backend → frontend (via Tauri events)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {

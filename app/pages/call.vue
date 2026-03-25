@@ -17,6 +17,7 @@ function cleanup() {
   cleaned = true;
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
   transport.stop();
+  media.stopPreview();
 }
 
 onMounted(async () => {
@@ -27,18 +28,9 @@ onMounted(async () => {
 
   if (!media.localStream.value) await media.startPreview();
 
-  nextTick(() => {
-    if (localVideoEl.value && media.localStream.value) {
-      localVideoEl.value.srcObject = media.localStream.value;
-    }
-  });
-
-  // Start media transport
+  // Start sending media to peer
   if (media.localStream.value && call.peerId.value) {
     transport.startSending(media.localStream.value, call.peerId.value);
-  }
-  if (remoteAudioEl.value && remoteVideoEl.value) {
-    transport.startReceiving(remoteAudioEl.value, remoteVideoEl.value);
   }
 
   const startTime = Date.now();
@@ -50,8 +42,18 @@ onMounted(async () => {
   }, 1000);
 });
 
+// Bind local video when stream or ref becomes available
 watch(() => media.localStream.value, (stream) => {
-  if (localVideoEl.value && stream) localVideoEl.value.srcObject = stream;
+  if (localVideoEl.value) {
+    localVideoEl.value.srcObject = stream || null;
+  }
+}, { immediate: true });
+
+// Start receiving when remote elements are available
+watch([remoteAudioEl, remoteVideoEl], ([audioEl, videoEl]) => {
+  if (audioEl && videoEl) {
+    transport.startReceiving(audioEl, videoEl);
+  }
 });
 
 onUnmounted(() => { cleanup(); });

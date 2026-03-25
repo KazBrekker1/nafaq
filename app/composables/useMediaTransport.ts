@@ -32,7 +32,7 @@ export function useMediaTransport() {
       audioRecorder.ondataavailable = async (e) => {
         if (e.data.size > 0) {
           const buffer = await e.data.arrayBuffer();
-          invoke("send_audio", { peerId, data: Array.from(new Uint8Array(buffer)) }).catch(() => {});
+          invoke("send_audio", { peerId, data: new Uint8Array(buffer) }).catch(() => {});
         }
       };
       audioRecorder.start(200);
@@ -48,7 +48,7 @@ export function useMediaTransport() {
       videoRecorder.ondataavailable = async (e) => {
         if (e.data.size > 0) {
           const buffer = await e.data.arrayBuffer();
-          invoke("send_video", { peerId, data: Array.from(new Uint8Array(buffer)) }).catch(() => {});
+          invoke("send_video", { peerId, data: new Uint8Array(buffer) }).catch(() => {});
         }
       };
       videoRecorder.start(200);
