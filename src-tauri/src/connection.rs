@@ -94,9 +94,11 @@ impl ConnectionManager {
 
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {
         let media_tx = self.media_tx.clone();
+        let event_tx_uni = self.event_tx.clone();
         let peer_id_uni = peer_id.clone();
         let connection_uni = connection.clone();
 
+        // Uni stream receiver (audio/video from peer)
         tokio::spawn(async move {
             loop {
                 match connection_uni.accept_uni().await {
@@ -112,7 +114,10 @@ impl ConnectionManager {
                         });
                     }
                     Err(_) => {
-                        tracing::info!("Uni stream accept ended for peer {peer_id_uni}");
+                        tracing::info!("Connection lost for peer {peer_id_uni}");
+                        let _ = event_tx_uni.send(Event::PeerDisconnected {
+                            peer_id: peer_id_uni.clone(),
+                        });
                         break;
                     }
                 }
@@ -122,6 +127,7 @@ impl ConnectionManager {
         let event_tx = self.event_tx.clone();
         let peer_id_bi = peer_id.clone();
 
+        // Bi stream receiver (chat/control from peer)
         tokio::spawn(async move {
             loop {
                 match connection.accept_bi().await {
@@ -137,6 +143,7 @@ impl ConnectionManager {
                         });
                     }
                     Err(_) => {
+                        // Don't double-emit — uni receiver handles disconnect
                         tracing::info!("Bi stream accept ended for peer {peer_id_bi}");
                         break;
                     }
