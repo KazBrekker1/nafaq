@@ -1,24 +1,23 @@
-import { ref, onUnmounted } from "vue";
-
 export interface MediaDevice {
   deviceId: string;
   label: string;
 }
 
+// Singleton state — shared across lobby and call pages
+const localStream = ref<MediaStream | null>(null);
+const cameras = ref<MediaDevice[]>([]);
+const microphones = ref<MediaDevice[]>([]);
+const selectedCamera = ref("");
+const selectedMic = ref("");
+const micLevel = ref(0);
+const audioMuted = ref(false);
+const videoMuted = ref(false);
+const error = ref<string | null>(null);
+
+let analyserInterval: ReturnType<typeof setInterval> | null = null;
+let audioContext: AudioContext | null = null;
+
 export function useMedia() {
-  const localStream = ref<MediaStream | null>(null);
-  const cameras = ref<MediaDevice[]>([]);
-  const microphones = ref<MediaDevice[]>([]);
-  const selectedCamera = ref("");
-  const selectedMic = ref("");
-  const micLevel = ref(0);
-  const audioMuted = ref(false);
-  const videoMuted = ref(false);
-  const error = ref<string | null>(null);
-
-  let analyserInterval: ReturnType<typeof setInterval> | null = null;
-  let audioContext: AudioContext | null = null;
-
   async function enumerateDevices() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -96,8 +95,6 @@ export function useMedia() {
     selectedMic.value = deviceId;
     if (localStream.value) await startPreview();
   }
-
-  onUnmounted(() => { stopPreview(); });
 
   return {
     localStream, cameras, microphones, selectedCamera, selectedMic,

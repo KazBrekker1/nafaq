@@ -5,6 +5,7 @@ const chat = useChat();
 
 const chatOpen = ref(true);
 const callDuration = ref("0:00");
+const localVideoEl = ref<HTMLVideoElement | null>(null);
 let durationInterval: ReturnType<typeof setInterval> | null = null;
 let cleaned = false;
 
@@ -22,6 +23,13 @@ onMounted(async () => {
 
   if (!media.localStream.value) await media.startPreview();
 
+  // Bind local video
+  nextTick(() => {
+    if (localVideoEl.value && media.localStream.value) {
+      localVideoEl.value.srcObject = media.localStream.value;
+    }
+  });
+
   const startTime = Date.now();
   durationInterval = setInterval(() => {
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -29,6 +37,11 @@ onMounted(async () => {
     const secs = elapsed % 60;
     callDuration.value = `${mins}:${secs.toString().padStart(2, "0")}`;
   }, 1000);
+});
+
+// Re-bind video when stream changes
+watch(() => media.localStream.value, (stream) => {
+  if (localVideoEl.value && stream) localVideoEl.value.srcObject = stream;
 });
 
 onUnmounted(() => { cleanup(); });
@@ -50,7 +63,12 @@ function handleSendChat(text: string) {
     <div class="flex-1 bg-[var(--color-surface-alt)] relative flex flex-col">
       <!-- Top bar -->
       <div class="absolute top-0 left-0 right-0 flex justify-between px-4 py-3 z-20 bg-gradient-to-b from-black/80 to-transparent">
-        <span class="text-sm font-black tracking-widest">{{ callDuration }}</span>
+        <div class="flex items-center gap-4">
+          <span class="text-sm font-black tracking-widest">{{ callDuration }}</span>
+          <span class="text-[10px] text-[var(--color-muted)] tracking-wider">
+            {{ call.peers.value.length }} peer{{ call.peers.value.length !== 1 ? "s" : "" }}
+          </span>
+        </div>
         <div class="flex items-center gap-2">
           <div class="w-2 h-2 bg-[var(--color-accent)]" />
           <span class="text-[10px] text-[var(--color-accent)] tracking-widest font-bold">P2P Direct</span>
@@ -59,12 +77,35 @@ function handleSendChat(text: string) {
 
       <!-- Video area -->
       <div class="flex-1 relative flex items-center justify-center">
-        <!-- Remote placeholder -->
-        <span class="text-[var(--color-border-muted)] text-sm font-bold tracking-widest">Waiting for video...</span>
-        <!-- Self PiP -->
-        <div class="absolute bottom-20 right-4 w-[180px] h-[110px] bg-[#111] border-2 border-[var(--color-border)] overflow-hidden z-10">
-          <video ref="localVideoEl" autoplay muted playsinline class="w-full h-full object-cover" />
+        <!-- Remote video placeholder -->
+        <div class="text-center">
+          <span class="text-[var(--color-border-muted)] text-sm font-bold tracking-widest block">
+            Remote Video
+          </span>
+          <div v-for="peer in call.peers.value" :key="peer" class="mt-3">
+            <span class="text-[10px] text-[var(--color-muted)] bg-black/50 px-3 py-1 font-mono">
+              {{ peer.slice(0, 16) }}...
+            </span>
+          </div>
+          <span class="text-[10px] text-[var(--color-muted)] block mt-4 tracking-widest">
+            Media streaming coming soon
+          </span>
         </div>
+
+        <!-- Self PiP -->
+        <div class="absolute bottom-20 right-4 w-[200px] h-[130px] bg-[#111] border-2 border-[var(--color-border)] overflow-hidden z-10">
+          <video ref="localVideoEl" autoplay muted playsinline class="w-full h-full object-cover" />
+          <span class="absolute bottom-1 left-2 text-[9px] text-[var(--color-accent)] bg-black/70 px-2 py-0.5 font-bold tracking-wider">You</span>
+        </div>
+      </div>
+
+      <!-- Mic level indicator -->
+      <div class="absolute bottom-16 left-4 z-20 flex gap-[2px] items-end">
+        <div v-for="i in 8" :key="i" class="w-[3px]"
+          :style="{
+            height: `${3 + (i <= media.micLevel.value / 12 ? (media.micLevel.value / 12) * 1.5 : 0)}px`,
+            background: i <= media.micLevel.value / 12 ? 'var(--color-accent)' : 'var(--color-border-muted)'
+          }" />
       </div>
 
       <!-- Controls -->
