@@ -12,64 +12,94 @@ type StatusHandler = (status: { connected: boolean }) => void;
 const eventHandlers: EventHandler[] = [];
 const statusHandlers: StatusHandler[] = [];
 
-// ── RPC Setup ──────────────────────────────────────────────
+// ── Direct WebSocket to Sidecar ────────────────────────────
+// Bypasses Electrobun RPC — connects the webview directly to the
+// sidecar's WebSocket for both JSON commands and binary media.
 
-let rpc: any = null;
+const SIDECAR_PORT = 9320;
+let ws: WebSocket | null = null;
+let wsConnected = false;
+let nodeId: string | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-// Electrobun's preload script injects globals (window.__electrobunWebviewId, etc.)
-// that the Electroview class uses. Bundled by Vite, resolved at runtime.
-try {
-  const { Electroview } = await import("electrobun/view");
+function connectToSidecar() {
+  if (ws) return;
 
-  rpc = Electroview.defineRPC({
-    handlers: {
-      requests: {},
-      messages: {
-        onSidecarEvent: (event: Event) => {
-          for (const handler of eventHandlers) {
-            try { handler(event); } catch (e) { console.error("Event handler error:", e); }
-          }
-        },
-        onSidecarStatus: (status: { connected: boolean }) => {
-          for (const handler of statusHandlers) {
-            try { handler(status); } catch (e) { console.error("Status handler error:", e); }
-          }
-        },
-      },
-    },
-  });
-  console.log("[view] Electrobun RPC initialized");
-} catch (e) {
-  console.log("[view] Electrobun not available, running standalone", e);
+  ws = new WebSocket(`ws://127.0.0.1:${SIDECAR_PORT}`);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    wsConnected = true;
+    for (const h of statusHandlers) h({ connected: true });
+    // Request node info on connect
+    sendCommand({ type: "get_node_info" });
+  };
+
+  ws.onmessage = (event: MessageEvent) => {
+    if (typeof event.data === "string") {
+      try {
+        const parsed: Event = JSON.parse(event.data);
+        if (parsed.type === "node_info") {
+          nodeId = parsed.id;
+        }
+        for (const h of eventHandlers) {
+          try { h(parsed); } catch (e) { console.error("Event handler error:", e); }
+        }
+      } catch {}
+    }
+    // Binary frames handled by useMediaTransport composable
+  };
+
+  ws.onclose = () => {
+    wsConnected = false;
+    ws = null;
+    for (const h of statusHandlers) h({ connected: false });
+    // Auto-reconnect
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectToSidecar();
+      }, 2000);
+    }
+  };
+
+  ws.onerror = () => {};
 }
+
+function sendCommand(command: Command): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(command));
+  return true;
+}
+
+// Start connecting (will keep retrying until sidecar is ready)
+connectToSidecar();
 
 // ── Public API ─────────────────────────────────────────────
 
 export const nafaq = {
   async sendCommand(command: Command): Promise<boolean> {
-    if (!rpc) return false;
-    return rpc.request.sendCommand({ command });
+    return sendCommand(command);
   },
 
   async getStatus(): Promise<{ connected: boolean; nodeId: string | null }> {
-    if (!rpc) return { connected: false, nodeId: null };
-    return rpc.request.getSidecarStatus({});
+    return { connected: wsConnected, nodeId };
   },
 
   async createCall(): Promise<boolean> {
-    return this.sendCommand({ type: "create_call" });
+    return sendCommand({ type: "create_call" });
   },
 
   async joinCall(ticket: string): Promise<boolean> {
-    return this.sendCommand({ type: "join_call", ticket });
+    return sendCommand({ type: "join_call", ticket });
   },
 
   async endCall(peerId: string): Promise<boolean> {
-    return this.sendCommand({ type: "end_call", peer_id: peerId });
+    return sendCommand({ type: "end_call", peer_id: peerId });
   },
 
   async sendChat(peerId: string, message: string): Promise<boolean> {
-    return this.sendCommand({ type: "send_chat", peer_id: peerId, message });
+    return sendCommand({ type: "send_chat", peer_id: peerId, message });
   },
 
   onEvent(handler: EventHandler): () => void {
@@ -82,6 +112,8 @@ export const nafaq = {
 
   onStatus(handler: StatusHandler): () => void {
     statusHandlers.push(handler);
+    // Fire immediately with current status
+    handler({ connected: wsConnected });
     return () => {
       const idx = statusHandlers.indexOf(handler);
       if (idx >= 0) statusHandlers.splice(idx, 1);
