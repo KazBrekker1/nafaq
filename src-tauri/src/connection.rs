@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -10,10 +11,10 @@ use crate::messages::{
 
 struct PeerConnection {
     connection: Connection,
-    audio_send: Option<SendStream>,
-    video_send: Option<SendStream>,
-    chat_send: Option<SendStream>,
-    control_send: Option<SendStream>,
+    audio_send: Arc<Mutex<Option<SendStream>>>,
+    video_send: Arc<Mutex<Option<SendStream>>>,
+    chat_send: Arc<Mutex<Option<SendStream>>>,
+    control_send: Arc<Mutex<Option<SendStream>>>,
 }
 
 pub struct ConnectionManager {
@@ -73,10 +74,10 @@ impl ConnectionManager {
 
         let peer_conn = PeerConnection {
             connection: connection.clone(),
-            audio_send: Some(audio_send),
-            video_send: Some(video_send),
-            chat_send: Some(chat_send),
-            control_send: Some(control_send),
+            audio_send: Arc::new(Mutex::new(Some(audio_send))),
+            video_send: Arc::new(Mutex::new(Some(video_send))),
+            chat_send: Arc::new(Mutex::new(Some(chat_send))),
+            control_send: Arc::new(Mutex::new(Some(control_send))),
         };
 
         {
@@ -227,30 +228,38 @@ impl ConnectionManager {
         }
     }
 
-    pub async fn send_audio(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let mut peers = self.peers.lock().await;
-        if let Some(peer) = peers.get_mut(peer_id) {
-            if let Some(ref mut send) = peer.audio_send {
-                send.write_all(data).await?;
-            }
+    async fn send_on_stream(stream: &Arc<Mutex<Option<SendStream>>>, data: &[u8]) -> Result<()> {
+        let mut guard = stream.lock().await;
+        if let Some(ref mut send) = *guard {
+            send.write_all(data).await?;
         }
         Ok(())
+    }
+
+    pub async fn send_audio(&self, peer_id: &str, data: &[u8]) -> Result<()> {
+        let stream = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|p| p.audio_send.clone())
+        };
+        if let Some(s) = stream { Self::send_on_stream(&s, data).await } else { Ok(()) }
     }
 
     pub async fn send_video(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let mut peers = self.peers.lock().await;
-        if let Some(peer) = peers.get_mut(peer_id) {
-            if let Some(ref mut send) = peer.video_send {
-                send.write_all(data).await?;
-            }
-        }
-        Ok(())
+        let stream = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|p| p.video_send.clone())
+        };
+        if let Some(s) = stream { Self::send_on_stream(&s, data).await } else { Ok(()) }
     }
 
     pub async fn send_chat(&self, peer_id: &str, message: &str) -> Result<()> {
-        let mut peers = self.peers.lock().await;
-        if let Some(peer) = peers.get_mut(peer_id) {
-            if let Some(ref mut send) = peer.chat_send {
+        let stream = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|p| p.chat_send.clone())
+        };
+        if let Some(s) = stream {
+            let mut guard = s.lock().await;
+            if let Some(ref mut send) = *guard {
                 crate::messages::write_framed(send, message.as_bytes()).await?;
             }
         }
@@ -259,9 +268,13 @@ impl ConnectionManager {
 
     pub async fn send_control(&self, peer_id: &str, action: &ControlAction) -> Result<()> {
         let data = serde_json::to_vec(action)?;
-        let mut peers = self.peers.lock().await;
-        if let Some(peer) = peers.get_mut(peer_id) {
-            if let Some(ref mut send) = peer.control_send {
+        let stream = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|p| p.control_send.clone())
+        };
+        if let Some(s) = stream {
+            let mut guard = s.lock().await;
+            if let Some(ref mut send) = *guard {
                 crate::messages::write_framed(send, &data).await?;
             }
         }
