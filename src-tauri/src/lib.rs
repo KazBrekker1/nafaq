@@ -145,6 +145,8 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_shell::init());
     }
 
+    builder = builder.plugin(tauri_plugin_store::Builder::new().build());
+
     builder
         .setup(move |app| {
             // Spawn event forwarder (broadcast -> Tauri events)
@@ -442,6 +444,8 @@ pub fn run() {
             commands::destroy_codecs,
             commands::reinit_video_encoder,
             commands::reinit_video_encoder_with_config,
+            commands::get_pinned_name,
+            commands::set_pinned_name,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");

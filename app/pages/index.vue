@@ -23,11 +23,7 @@ const hasName = computed(() => displayName.value.trim().length > 0);
       </div>
 
       <div class="mb-6 sm:mb-8">
-        <UInput
-          v-model="displayName"
-          placeholder="Your name"
-          class="rounded-none text-sm text-center"
-        />
+        <NameInput v-model="displayName" />
       </div>
 
       <div v-if="error" class="border-2 border-[var(--color-danger)] p-3 mb-6 text-xs text-[var(--color-danger)]">

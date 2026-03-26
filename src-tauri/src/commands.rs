@@ -1,5 +1,6 @@
 use base64::Engine;
 use tauri::{ipc::Channel, Emitter, State};
+use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::messages::{
@@ -345,6 +346,41 @@ pub async fn reinit_video_encoder_with_config(
         "Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps"
     );
     Ok(())
+}
+
+// ── Name persistence commands ───────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_pinned_name(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let store = app
+        .store("settings.json")
+        .map_err(|e| e.to_string())?;
+    let pinned = store
+        .get("name_pinned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !pinned {
+        return Ok(None);
+    }
+    Ok(store
+        .get("display_name")
+        .and_then(|v| v.as_str().map(String::from)))
+}
+
+#[tauri::command]
+pub async fn set_pinned_name(
+    app: tauri::AppHandle,
+    name: Option<String>,
+    pinned: bool,
+) -> Result<(), String> {
+    let store = app
+        .store("settings.json")
+        .map_err(|e| e.to_string())?;
+    store.set("name_pinned", serde_json::json!(pinned));
+    if let Some(n) = name {
+        store.set("display_name", serde_json::json!(n));
+    }
+    store.save().map_err(|e| e.to_string())
 }
 
 // ── Encode-once broadcast commands ──────────────────────────────────
