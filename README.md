@@ -38,14 +38,14 @@ Audio is captured via Web Audio worklets, video via canvas frame capture. Both a
 
 ## Stack
 
-| | |
-|---|---|
-| **Frontend** | Nuxt 4 · Vue 3 · Nuxt UI |
-| **Desktop** | Tauri 2 |
-| **Mobile** | Tauri 2 (Android) |
-| **Transport** | Iroh 0.97 (QUIC) |
-| **Audio** | Opus |
-| **Video** | H.264 (OpenH264) |
+|               |                          |
+| ------------- | ------------------------ |
+| **Frontend**  | Nuxt 4 · Vue 3 · Nuxt UI |
+| **Desktop**   | Tauri 2                  |
+| **Mobile**    | Tauri 2 (Android)        |
+| **Transport** | Iroh 0.97 (QUIC)         |
+| **Audio**     | Opus                     |
+| **Video**     | H.264 (OpenH264)         |
 
 ## Getting Started
 
@@ -89,10 +89,12 @@ Updates version across `package.json`, `tauri.conf.json`, and `Cargo.toml`.
 
 Grab the latest build from [GitHub Releases](https://github.com/KazBrekker1/nafaq/releases/latest).
 
-| Platform | Format |
-|----------|--------|
-| macOS (Apple Silicon) | `.dmg` |
-| macOS (Intel) | `.dmg` |
-| Windows | `.msi` |
-| Linux | `.deb` / `.AppImage` |
-| Android | `.apk` |
+| Platform              | Format               |
+| --------------------- | -------------------- |
+| macOS (Apple Silicon) | `.dmg`               |
+| macOS (Intel)         | `.dmg`               |
+| Windows               | `.msi`               |
+| Linux                 | `.deb` / `.AppImage` |
+| Android               | `.apk`               |
+
+> **macOS note:** After installing, you may need to run `xattr -c /Applications/Nafaq.app` to clear the quarantine flag.
