@@ -6,6 +6,7 @@ target/
 .DS_Store
 .osgrep
 .nuxt/
+
 .nitro
 .cache
 .output

@@ -6,7 +6,7 @@ const ticket = ref<string | null>(null);
 const shareTicket = ref<string | null>(null);
 const peerId = ref<string | null>(null);
 const nodeId = ref<string | null>(null);
-const sidecarConnected = ref(false);
+const nodeReady = ref(false);
 const error = ref<string | null>(null);
 const peers = ref<string[]>([]);
 const displayName = ref("");
@@ -72,7 +72,7 @@ export function useCall() {
     peerId,
     nodeId,
     peers,
-    sidecarConnected,
+    nodeReady,
     error,
     displayName,
     peerNames,
@@ -94,7 +94,7 @@ async function initCallListeners() {
         const info = await invoke<{ id: string; ticket: string }>("get_node_info");
         nodeId.value = info.id;
         shareTicket.value = info.ticket;
-        sidecarConnected.value = true;
+        nodeReady.value = true;
       } catch {
         if (++retries < 15) {
           setTimeout(fetchNodeInfo, 2000);
@@ -149,6 +149,6 @@ async function initCallListeners() {
       error.value = event.payload?.message || String(event.payload);
     });
   } catch {
-    sidecarConnected.value = false;
+    nodeReady.value = false;
   }
 }
