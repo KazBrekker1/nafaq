@@ -5,6 +5,12 @@ export default defineNuxtConfig({
   future: { compatibilityVersion: 4 },
   compatibilityDate: "2025-07-01",
 
+  runtimeConfig: {
+    public: {
+      appVersion: process.env.npm_package_version || "0.0.0",
+    },
+  },
+
   app: {
     head: {
       viewport: "width=device-width, initial-scale=1, viewport-fit=cover",

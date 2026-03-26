@@ -216,7 +216,7 @@ function handleSendChat(text: string) {
           <div
             v-for="peer in call.peers.value"
             :key="peer"
-            class="relative min-h-0 bg-[#111] overflow-hidden border border-[var(--color-border)] flex items-center justify-center"
+            class="relative min-h-0 bg-black overflow-hidden border border-[var(--color-border)] flex items-center justify-center"
           >
             <canvas
               :ref="registerPeerCanvasRef(peer)"
@@ -239,7 +239,10 @@ function handleSendChat(text: string) {
         </div>
 
         <!-- Self PiP -->
-        <div class="absolute bottom-3 right-3 sm:bottom-4 sm:right-4 w-[128px] aspect-video sm:w-[208px] bg-[#111] border-2 border-[var(--color-border)] overflow-hidden z-10">
+        <div class="absolute bottom-3 right-3 sm:bottom-4 sm:right-4 w-[128px] aspect-video sm:w-[208px] bg-black border-2 border-[var(--color-border)] overflow-hidden z-10">
+          <div v-if="!media.localStream.value" class="absolute inset-0 flex items-center justify-center bg-black">
+            <UIcon name="i-heroicons-video-camera" class="text-lg text-[var(--color-border-muted)]" />
+          </div>
           <video ref="localVideoEl" autoplay muted playsinline class="w-full h-full object-contain bg-black" />
           <CallSelfVideoOverlay :audio-muted="media.audioMuted.value" :video-muted="media.videoMuted.value" />
           <span class="absolute bottom-0.5 left-1.5 sm:bottom-1 sm:left-2 text-[8px] sm:text-[9px] text-[var(--color-accent)] bg-black/70 px-1.5 sm:px-2 py-0.5 font-bold tracking-wider">You</span>

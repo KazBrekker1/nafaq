@@ -57,6 +57,7 @@ watch(() => modelValue, (name) => {
       @update:model-value="onInput"
     />
     <button
+      v-if="loaded"
       class="w-8 h-8 flex items-center justify-center transition-colors"
       :class="pinned ? 'text-[var(--color-accent)]' : 'text-[var(--color-muted)] hover:text-[var(--color-border)]'"
       :title="pinned ? 'Name pinned — persists across sessions' : 'Pin name to remember it'"

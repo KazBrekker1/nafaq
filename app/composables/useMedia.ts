@@ -38,18 +38,49 @@ export function useMedia() {
 
   async function startPreview() {
     error.value = null;
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: selectedCamera.value ? { deviceId: { exact: selectedCamera.value } } : true,
-        audio: selectedMic.value ? { deviceId: { exact: selectedMic.value } } : true,
-      });
+
+    const videoConstraint = selectedCamera.value
+      ? { deviceId: { exact: selectedCamera.value } }
+      : true;
+    const audioConstraint = selectedMic.value
+      ? { deviceId: { exact: selectedMic.value } }
+      : true;
+
+    // Android WebView holds the camera HAL for ~500ms after release;
+    // retry with backoff to avoid "NotReadableError" during handoff.
+    let stream: MediaStream | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraint,
+          audio: audioConstraint,
+        });
+        break;
+      } catch (e: unknown) {
+        const name = e instanceof DOMException ? e.name : "";
+        if (name === "NotReadableError" && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+        if (attempt === 2 || name !== "NotReadableError") {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: audioConstraint });
+            error.value = "Camera unavailable — audio only.";
+          } catch {
+            error.value = `Camera/mic access failed: ${e instanceof Error ? e.message : String(e)}`;
+            return;
+          }
+          break;
+        }
+      }
+    }
+
+    if (stream) {
       stopPreview();
       localStream.value = stream;
       await enumerateDevices();
       applyMuteState();
       startMicLevelMonitor(stream);
-    } catch (e: unknown) {
-      error.value = `Camera/mic access failed: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
 

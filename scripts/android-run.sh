@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 
 PACKAGE_NAME="${PACKAGE_NAME:-com.nafaq.app}"
 BUILD_TARGET="${BUILD_TARGET:-aarch64}"
-APK_PATH="${APK_PATH:-src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk}"
+APK_PATH="${APK_PATH:-src-tauri/gen/android/app/build/outputs/apk/universal/release/}"
 KEYSTORE_PATH="${KEYSTORE_PATH:-$HOME/.android/debug.keystore}"
 KEYSTORE_PASS="${KEYSTORE_PASS:-android}"
 ALIGNED_APK_PATH="${ALIGNED_APK_PATH:-/tmp/nafaq-release-aligned.apk}"
@@ -70,11 +70,28 @@ if [[ -n "$ADB_SERIAL" ]]; then
   adb() { command adb -s "$ADB_SERIAL" "$@"; }
 fi
 
+: "${ANDROID_HOME:=$HOME/Library/Android/sdk}"
+if [[ -z "${ANDROID_NDK_HOME:-}" ]]; then
+  NDK_DIR="$(ls -d "$ANDROID_HOME/ndk/"* 2>/dev/null | sort -V | tail -1)"
+  if [[ -z "$NDK_DIR" ]]; then
+    echo "error: no NDK found under $ANDROID_HOME/ndk/" >&2
+    exit 1
+  fi
+  export ANDROID_NDK_HOME="$NDK_DIR"
+fi
+
+export CMAKE_TOOLCHAIN_FILE="$(cd "$(dirname "$0")" && pwd)/android-cmake-toolchain.cmake"
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
 echo ":: Building Android release APK..."
 bunx tauri android build --target "$BUILD_TARGET" --apk
 
-if [[ ! -f "$APK_PATH" ]]; then
-  echo "error: build completed but APK is missing at $APK_PATH" >&2
+if [[ -d "$APK_PATH" ]]; then
+  APK_PATH="${APK_PATH%/}/"
+  APK_PATH="$(ls -t "$APK_PATH"*.apk 2>/dev/null | head -1)"
+fi
+if [[ -z "$APK_PATH" || ! -f "$APK_PATH" ]]; then
+  echo "error: build completed but no APK found" >&2
   exit 1
 fi
 
@@ -94,9 +111,13 @@ if [[ "$APK_PATH" == *"-unsigned.apk" ]]; then
   INSTALL_APK_PATH="$SIGNED_APK_PATH"
 fi
 
-echo ":: Installing existing APK..."
+echo ":: Installing APK..."
 echo "   apk: $INSTALL_APK_PATH"
-adb install -r "$INSTALL_APK_PATH"
+if ! adb install -r "$INSTALL_APK_PATH" 2>&1; then
+  echo ":: Signature mismatch — uninstalling old app and retrying..."
+  adb uninstall "$PACKAGE_NAME"
+  adb install "$INSTALL_APK_PATH"
+fi
 
 echo ":: Launching..."
 adb shell monkey -p "$PACKAGE_NAME" -c android.intent.category.LAUNCHER 1

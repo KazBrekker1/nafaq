@@ -2,6 +2,7 @@
 const call = useCall();
 const { state, ticket, nodeId, nodeReady, error, displayName, connectionProgress, showPreCallOverlay, createCall, joinCall, endCall, joinCallFromOverlay } = call;
 const hasName = computed(() => displayName.value.trim().length > 0);
+const { public: { appVersion } } = useRuntimeConfig();
 </script>
 
 <template>
@@ -39,6 +40,7 @@ const hasName = computed(() => displayName.value.trim().length > 0);
       <div class="border-t border-[var(--color-border-muted)] mt-6 sm:mt-8 pt-4 text-center">
         <p class="label">YOUR NODE</p>
         <p class="text-[10px] sm:text-xs text-[var(--color-muted)] mt-1 break-all">{{ nodeId || "Initializing Iroh..." }}</p>
+        <p class="text-[10px] text-[var(--color-muted)]/40 mt-4">v{{ appVersion }}</p>
       </div>
     </div>
 

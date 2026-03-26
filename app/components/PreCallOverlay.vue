@@ -26,11 +26,14 @@ watch(
         <p class="label text-center">READY TO JOIN?</p>
 
         <!-- Camera preview thumbnail -->
-        <div class="relative aspect-video bg-[#111] border border-[var(--color-border)] max-w-[320px] mx-auto overflow-hidden">
+        <div class="relative aspect-video bg-black border border-[var(--color-border)] max-w-[320px] mx-auto overflow-hidden">
           <video ref="videoEl" autoplay muted playsinline class="w-full h-full object-contain bg-black" />
-          <p v-if="!media.localStream.value" class="absolute inset-0 flex items-center justify-center text-[var(--color-muted)] text-xs">
-            {{ media.error.value || "Starting camera..." }}
-          </p>
+          <div v-if="!media.localStream.value" class="absolute inset-0 flex flex-col items-center justify-center bg-black gap-2">
+            <UIcon name="i-heroicons-video-camera" class="text-2xl text-[var(--color-border-muted)]" />
+            <p class="text-[var(--color-muted)] text-xs">
+              {{ media.error.value || "Starting camera..." }}
+            </p>
+          </div>
         </div>
 
         <!-- Quick toggles -->

@@ -84,13 +84,6 @@ pub fn run() {
     // Initialize Iroh synchronously during setup using Tauri's async runtime
     let rt = tauri::async_runtime::handle();
 
-    let video_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("nafaq-video")
-        .enable_all()
-        .build()
-        .expect("Failed to create video runtime");
-
     let (event_tx, _) = broadcast::channel::<Event>(256);
     let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
     let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
@@ -319,44 +312,39 @@ pub fn run() {
             let codec_video = video_codec.clone();
             let video_bridge = media_bridge_ref.clone();
 
-            video_runtime.spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 let mut video_rx = video_media_tx_for_setup.subscribe();
                 loop {
                     match video_rx.recv().await {
                         Ok(packet) => {
-                            let mut decoders = codec_video.decoders.lock().await;
-                            let decoder = decoders
-                                .entry(packet.peer_id.clone())
-                                .or_insert_with(codec::VideoDecoder::new);
-                            if let Some((rgba, width, height)) =
-                                decoder.decode_rgba(&packet.payload)
-                            {
-                                if let Some(jpeg) = codec::encode_jpeg(&rgba, width, height, 70) {
-                                    let registration = video_bridge.lock().await.clone();
-                                    if let Some(registration) = registration {
-                                        if let Some(channel) = registration.video_channel {
-                                            let Some(channel_payload) = pack_video_channel_packet(
-                                                &packet.peer_id,
-                                                packet.timestamp_ms,
-                                                width,
-                                                height,
-                                                &jpeg,
-                                            ) else {
-                                                continue;
-                                            };
-                                            let _ = channel.send(channel_payload);
-                                        } else {
-                                            let _ = app_handle_video.emit(
-                                                "video-received",
-                                                VideoEvent {
-                                                    peer_id: packet.peer_id.clone(),
-                                                    data: B64.encode(jpeg),
-                                                    width,
-                                                    height,
-                                                    timestamp: packet.timestamp_ms,
-                                                },
-                                            );
-                                        }
+                            // Decode + encode is CPU-bound; yield the async
+                            // thread so we don't starve other tasks.
+                            let jpeg_result = {
+                                let mut decoders = codec_video.decoders.lock().await;
+                                let decoder = decoders
+                                    .entry(packet.peer_id.clone())
+                                    .or_insert_with(codec::VideoDecoder::new);
+                                let payload = packet.payload.clone();
+                                tokio::task::block_in_place(|| {
+                                    decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
+                                        codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
+                                    })
+                                })
+                            };
+                            if let Some((jpeg, width, height)) = jpeg_result {
+                                let registration = video_bridge.lock().await.clone();
+                                if let Some(registration) = registration {
+                                    if let Some(channel) = registration.video_channel {
+                                        let Some(channel_payload) = pack_video_channel_packet(
+                                            &packet.peer_id,
+                                            packet.timestamp_ms,
+                                            width,
+                                            height,
+                                            &jpeg,
+                                        ) else {
+                                            continue;
+                                        };
+                                        let _ = channel.send(channel_payload);
                                     } else {
                                         let _ = app_handle_video.emit(
                                             "video-received",
@@ -369,6 +357,17 @@ pub fn run() {
                                             },
                                         );
                                     }
+                                } else {
+                                    let _ = app_handle_video.emit(
+                                        "video-received",
+                                        VideoEvent {
+                                            peer_id: packet.peer_id.clone(),
+                                            data: B64.encode(jpeg),
+                                            width,
+                                            height,
+                                            timestamp: packet.timestamp_ms,
+                                        },
+                                    );
                                 }
                             }
                         }
