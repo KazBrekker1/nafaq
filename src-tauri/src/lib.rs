@@ -84,8 +84,15 @@ pub fn run() {
     // Initialize Iroh synchronously during setup using Tauri's async runtime
     let rt = tauri::async_runtime::handle();
 
+    let video_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("nafaq-video")
+        .enable_all()
+        .build()
+        .expect("Failed to create video runtime");
+
     let (event_tx, _) = broadcast::channel::<Event>(256);
-    let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(64);
+    let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
     let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
 
     let audio_media_tx_for_setup = audio_media_tx.clone();
@@ -309,7 +316,7 @@ pub fn run() {
             let codec_video = video_codec.clone();
             let video_bridge = media_bridge_ref.clone();
 
-            tauri::async_runtime::spawn(async move {
+            video_runtime.spawn(async move {
                 let mut video_rx = video_media_tx_for_setup.subscribe();
                 loop {
                     match video_rx.recv().await {
