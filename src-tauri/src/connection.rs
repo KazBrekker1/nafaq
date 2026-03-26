@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 
+use crate::codec::is_keyframe;
 use crate::messages::{
-    ControlAction, Event, MediaFrame, STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_VIDEO,
+    ControlAction, Event, MediaPacket, STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_VIDEO,
 };
 
 struct PeerConnection {
     connection: Connection,
     audio_send: Arc<Mutex<Option<SendStream>>>,
-    video_send: Arc<Mutex<Option<SendStream>>>,
     chat_send: Arc<Mutex<Option<SendStream>>>,
     control_send: Arc<Mutex<Option<SendStream>>>,
 }
@@ -20,7 +20,8 @@ struct PeerConnection {
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     event_tx: broadcast::Sender<Event>,
-    media_tx: broadcast::Sender<Vec<u8>>,
+    audio_media_tx: broadcast::Sender<MediaPacket>,
+    video_watch_tx: watch::Sender<Option<MediaPacket>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -32,12 +33,14 @@ impl std::fmt::Debug for ConnectionManager {
 impl ConnectionManager {
     pub fn new(
         event_tx: broadcast::Sender<Event>,
-        media_tx: broadcast::Sender<Vec<u8>>,
+        audio_media_tx: broadcast::Sender<MediaPacket>,
+        video_watch_tx: watch::Sender<Option<MediaPacket>>,
     ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
-            media_tx,
+            audio_media_tx,
+            video_watch_tx,
         }
     }
 
@@ -60,22 +63,24 @@ impl ConnectionManager {
     }
 
     async fn setup_connection(&self, peer_id: String, connection: Connection) -> Result<()> {
+        // Audio: long-lived uni-stream with high priority
         let mut audio_send = connection.open_uni().await?;
         audio_send.write_all(&[STREAM_AUDIO]).await?;
+        audio_send.set_priority(90)?;
 
-        let mut video_send = connection.open_uni().await?;
-        video_send.write_all(&[STREAM_VIDEO]).await?;
-
+        // Chat: bi-stream with low priority
         let (mut chat_send, _) = connection.open_bi().await?;
         chat_send.write_all(&[STREAM_CHAT]).await?;
+        chat_send.set_priority(10)?;
 
+        // Control: bi-stream with highest priority
         let (mut control_send, _) = connection.open_bi().await?;
         control_send.write_all(&[STREAM_CONTROL]).await?;
+        control_send.set_priority(100)?;
 
         let peer_conn = PeerConnection {
             connection: connection.clone(),
             audio_send: Arc::new(Mutex::new(Some(audio_send))),
-            video_send: Arc::new(Mutex::new(Some(video_send))),
             chat_send: Arc::new(Mutex::new(Some(chat_send))),
             control_send: Arc::new(Mutex::new(Some(control_send))),
         };
@@ -94,7 +99,8 @@ impl ConnectionManager {
     }
 
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {
-        let media_tx = self.media_tx.clone();
+        let audio_media_tx = self.audio_media_tx.clone();
+        let video_watch_tx = self.video_watch_tx.clone();
         let event_tx_uni = self.event_tx.clone();
         let peers_ref = self.peers.clone();
         let peer_id_uni = peer_id.clone();
@@ -106,18 +112,54 @@ impl ConnectionManager {
                 match connection_uni.accept_uni().await {
                     Ok(mut recv) => {
                         let peer_id = peer_id_uni.clone();
-                        let media_tx = media_tx.clone();
-                        let mut type_buf = [0u8; 1];
-                        if recv.read_exact(&mut type_buf).await.is_err() {
-                            continue;
-                        }
+                        let audio_tx = audio_media_tx.clone();
+                        let video_tx = video_watch_tx.clone();
                         tokio::spawn(async move {
-                            Self::handle_uni_stream(type_buf[0], &peer_id, recv, media_tx).await;
+                            let mut type_buf = [0u8; 1];
+                            if recv.read_exact(&mut type_buf).await.is_err() {
+                                return;
+                            }
+                            match type_buf[0] {
+                                STREAM_AUDIO => {
+                                    // Audio: read all frames from long-lived stream
+                                    loop {
+                                        match crate::messages::read_framed(&mut recv).await {
+                                            Ok(Some(data)) if data.len() >= 8 => {
+                                                let ts = u64::from_be_bytes(
+                                                    data[..8].try_into().unwrap(),
+                                                );
+                                                let payload = data[8..].to_vec();
+                                                let _ = audio_tx
+                                                    .send((peer_id.clone(), ts, payload));
+                                            }
+                                            _ => break,
+                                        }
+                                    }
+                                }
+                                STREAM_VIDEO => {
+                                    // Video: single frame per stream (stream-per-frame)
+                                    if let Ok(Some(data)) =
+                                        crate::messages::read_framed(&mut recv).await
+                                    {
+                                        if data.len() >= 8 {
+                                            let ts = u64::from_be_bytes(
+                                                data[..8].try_into().unwrap(),
+                                            );
+                                            let payload = data[8..].to_vec();
+                                            let _ = video_tx.send(Some((
+                                                peer_id.clone(),
+                                                ts,
+                                                payload,
+                                            )));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         });
                     }
                     Err(_) => {
                         tracing::info!("Connection lost for peer {peer_id_uni}");
-                        // Remove dead peer from map to prevent memory leak
                         peers_ref.lock().await.remove(&peer_id_uni);
                         let _ = event_tx_uni.send(Event::PeerDisconnected {
                             peer_id: peer_id_uni.clone(),
@@ -154,41 +196,6 @@ impl ConnectionManager {
                 }
             }
         });
-    }
-
-    async fn handle_uni_stream(
-        stream_type: u8,
-        peer_id: &str,
-        mut recv: RecvStream,
-        media_tx: broadcast::Sender<Vec<u8>>,
-    ) {
-        // Parse peer ID once, reuse for every frame
-        let peer_id_bytes: [u8; 32] = peer_id
-            .parse::<iroh::EndpointId>()
-            .map(|id| *id.as_bytes())
-            .unwrap_or([0u8; 32]);
-
-        loop {
-            match crate::messages::read_framed(&mut recv).await {
-                Ok(Some(data)) => {
-                    let frame = MediaFrame {
-                        stream_type,
-                        peer_id: peer_id_bytes,
-                        timestamp_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                        payload: data,
-                    };
-                    let _ = media_tx.send(frame.encode());
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::warn!("Error reading {stream_type} stream from {peer_id}: {e}");
-                    break;
-                }
-            }
-        }
     }
 
     async fn handle_bi_stream(
@@ -237,20 +244,40 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub async fn send_audio(&self, peer_id: &str, data: &[u8]) -> Result<()> {
+    /// Send audio on the long-lived audio stream with timestamp prepended
+    pub async fn send_audio(&self, peer_id: &str, data: &[u8], timestamp: u64) -> Result<()> {
         let stream = {
             let peers = self.peers.lock().await;
             peers.get(peer_id).map(|p| p.audio_send.clone())
         };
-        if let Some(s) = stream { Self::send_on_stream(&s, data).await } else { Ok(()) }
+        if let Some(s) = stream {
+            let mut payload = Vec::with_capacity(8 + data.len());
+            payload.extend_from_slice(&timestamp.to_be_bytes());
+            payload.extend_from_slice(data);
+            Self::send_on_stream(&s, &payload).await
+        } else {
+            Ok(())
+        }
     }
 
-    pub async fn send_video(&self, peer_id: &str, data: &[u8]) -> Result<()> {
-        let stream = {
+    /// Send video via stream-per-frame: opens a new uni-stream, sets priority, writes, finishes
+    pub async fn send_video(&self, peer_id: &str, data: &[u8], timestamp: u64) -> Result<()> {
+        let connection = {
             let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.video_send.clone())
+            peers.get(peer_id).map(|p| p.connection.clone())
         };
-        if let Some(s) = stream { Self::send_on_stream(&s, data).await } else { Ok(()) }
+        if let Some(conn) = connection {
+            let mut send = conn.open_uni().await?;
+            let priority = if is_keyframe(data) { 50 } else { 30 };
+            send.set_priority(priority)?;
+            send.write_all(&[STREAM_VIDEO]).await?;
+            let mut payload = Vec::with_capacity(8 + data.len());
+            payload.extend_from_slice(&timestamp.to_be_bytes());
+            payload.extend_from_slice(data);
+            crate::messages::write_framed(&mut send, &payload).await?;
+            send.finish()?;
+        }
+        Ok(())
     }
 
     pub async fn send_chat(&self, peer_id: &str, message: &str) -> Result<()> {

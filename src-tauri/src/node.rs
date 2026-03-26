@@ -7,6 +7,15 @@ use iroh_tickets::endpoint::EndpointTicket;
 pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/1";
 
 pub async fn create_endpoint() -> Result<Endpoint> {
+    // TODO: Configure BBR congestion control once noq-proto dependency is added.
+    // BBR is delay-based and better suited for real-time media than NewReno.
+    // Requires: noq-proto = "0.16" in Cargo.toml, then:
+    //   use noq_proto::congestion::BbrConfig;
+    //   use std::sync::Arc;
+    //   let transport_config = iroh::endpoint::QuicTransportConfig::builder()
+    //       .congestion_controller_factory(Arc::new(BbrConfig::default()))
+    //       .build();
+    //   ... .transport_config(transport_config)
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![NAFAQ_ALPN.to_vec()])
         .bind()

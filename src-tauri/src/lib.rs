@@ -8,24 +8,28 @@ mod state;
 
 use std::sync::Arc;
 
+use base64::Engine;
 use codec::CodecState;
 use connection::ConnectionManager;
 use iroh::protocol::Router;
-use messages::{Event, MediaFrame, STREAM_AUDIO, STREAM_VIDEO};
+use messages::{Event, MediaPacket};
 use protocol::NafaqProtocol;
 use state::AppState;
 use tauri::Emitter;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
+
+const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 #[derive(Clone, serde::Serialize)]
-struct MediaEvent {
-    stream_type: u8,
-    data: Vec<u8>,
+struct VideoEvent {
+    data: String,    // base64-encoded H.264 NALUs
     timestamp: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    width: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<u32>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AudioEvent {
+    data: String,    // base64-encoded PCM Int16 LE
+    timestamp: u64,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -41,9 +45,17 @@ pub fn run() {
     let rt = tauri::async_runtime::handle();
 
     let (event_tx, _) = broadcast::channel::<Event>(256);
-    let (media_tx, _) = broadcast::channel::<Vec<u8>>(1024);
-    let media_tx_for_setup = media_tx.clone();
-    let conn_manager = Arc::new(ConnectionManager::new(event_tx.clone(), media_tx));
+    let (audio_media_tx, _) = broadcast::channel::<MediaPacket>(16);
+    let (video_watch_tx, _) = watch::channel::<Option<MediaPacket>>(None);
+
+    let audio_media_tx_for_setup = audio_media_tx.clone();
+    let video_watch_tx_for_setup = video_watch_tx.clone();
+
+    let conn_manager = Arc::new(ConnectionManager::new(
+        event_tx.clone(),
+        audio_media_tx.clone(),
+        video_watch_tx.clone(),
+    ));
 
     // Create endpoint + router on the async runtime
     let (endpoint, router) = rt.block_on(async {
@@ -64,6 +76,8 @@ pub fn run() {
         router,
         conn_manager: conn_manager.clone(),
         event_tx: event_tx.clone(),
+        audio_media_tx: audio_media_tx.clone(),
+        video_watch_tx: video_watch_tx.clone(),
         codec: codec.clone(),
     };
 
@@ -77,7 +91,7 @@ pub fn run() {
 
     builder
         .setup(move |app| {
-            // Spawn event forwarder (broadcast → Tauri events)
+            // Spawn event forwarder (broadcast -> Tauri events)
             let app_handle = app.handle().clone();
             let mut event_rx = event_tx.subscribe();
 
@@ -104,57 +118,47 @@ pub fn run() {
                 }
             });
 
-            // Spawn media forwarder (binary frames → decode → Tauri events)
-            let app_handle2 = app.handle().clone();
-            let mut media_rx = media_tx_for_setup.subscribe();
-            let codec_for_media = codec.clone();
+            // Spawn audio forwarder (Opus -> PCM -> base64 -> Tauri event)
+            let app_handle_audio = app.handle().clone();
+            let codec_audio = codec.clone();
 
             tauri::async_runtime::spawn(async move {
+                let mut audio_rx = audio_media_tx_for_setup.subscribe();
                 loop {
-                    match media_rx.recv().await {
-                        Ok(raw) => {
-                            if let Some(frame) = MediaFrame::decode(&raw) {
-                                match frame.stream_type {
-                                    STREAM_AUDIO => {
-                                        let mut audio = codec_for_media.audio.lock().await;
-                                        if let Some(ref mut dec) = *audio {
-                                            if let Some(pcm) = dec.decode(&frame.payload) {
-                                                let data: Vec<u8> = pcm.iter()
-                                                    .flat_map(|s| s.to_le_bytes())
-                                                    .collect();
-                                                let _ = app_handle2.emit("audio-received", MediaEvent {
-                                                    stream_type: frame.stream_type,
-                                                    data,
-                                                    timestamp: frame.timestamp_ms,
-                                                    width: None,
-                                                    height: None,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    STREAM_VIDEO => {
-                                        let mut video = codec_for_media.video.lock().await;
-                                        if let Some(ref mut dec) = *video {
-                                            if let Some((rgba, w, h)) = dec.decode(&frame.payload) {
-                                                let jpeg = crate::codec::decoded_to_jpeg(&rgba, w, h);
-                                                let _ = app_handle2.emit("video-received", MediaEvent {
-                                                    stream_type: frame.stream_type,
-                                                    data: jpeg,
-                                                    timestamp: frame.timestamp_ms,
-                                                    width: Some(w),
-                                                    height: Some(h),
-                                                });
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                    match audio_rx.recv().await {
+                        Ok((_peer_id, timestamp, payload)) => {
+                            let mut dec = codec_audio.audio_decoder.lock().await;
+                            if let Some(ref mut d) = *dec {
+                                if let Some(pcm) = d.decode(&payload) {
+                                    let raw: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                                    let _ = app_handle_audio.emit("audio-received", AudioEvent {
+                                        data: B64.encode(&raw),
+                                        timestamp,
+                                    });
                                 }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("Media forwarder lagged by {n} frames");
+                            tracing::warn!("Audio forwarder lagged by {n} frames");
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Spawn video forwarder (H.264 NALUs -> base64 -> Tauri event)
+            let app_handle_video = app.handle().clone();
+            let mut video_rx = video_watch_tx_for_setup.subscribe();
+
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if video_rx.changed().await.is_err() { break; }
+                    let frame = video_rx.borrow_and_update().clone();
+                    if let Some((_peer_id, timestamp, payload)) = frame {
+                        let _ = app_handle_video.emit("video-received", VideoEvent {
+                            data: B64.encode(&payload),
+                            timestamp,
+                        });
                     }
                 }
             });
@@ -172,6 +176,7 @@ pub fn run() {
             commands::send_video,
             commands::init_codecs,
             commands::destroy_codecs,
+            commands::reinit_video_encoder,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");

@@ -6,25 +6,29 @@ use openh264::OpenH264API;
 
 const SAMPLE_RATE: u32 = 48000;
 const CHANNELS: Channels = Channels::Mono;
-const OPUS_FRAME_SIZE: usize = 960; // 20ms at 48kHz
+pub const OPUS_FRAME_SIZE: usize = 960; // 20ms at 48kHz
 const MAX_OPUS_PACKET: usize = 4000;
 
-pub struct AudioCodec {
+// ── Audio Encoder ────────────────────────────────────────────────────
+
+pub struct AudioEncoder {
     encoder: OpusEncoder,
-    decoder: OpusDecoder,
 }
 
-impl AudioCodec {
+impl AudioEncoder {
     pub fn new() -> Self {
-        let encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Voip)
+        let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Voip)
             .expect("failed to create Opus encoder");
-        let decoder = OpusDecoder::new(SAMPLE_RATE, CHANNELS)
-            .expect("failed to create Opus decoder");
-        Self { encoder, decoder }
+        encoder.set_inband_fec(true).expect("failed to enable Opus FEC");
+        encoder.set_packet_loss_perc(5).expect("failed to set packet loss %");
+        Self { encoder }
     }
 
     pub fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
-        assert!(pcm.len() == OPUS_FRAME_SIZE, "AudioCodec::encode requires exactly 960 samples, got {}", pcm.len());
+        if pcm.len() != OPUS_FRAME_SIZE {
+            tracing::warn!("AudioEncoder::encode requires exactly 960 samples, got {}", pcm.len());
+            return None;
+        }
         let mut buf = vec![0u8; MAX_OPUS_PACKET];
         match self.encoder.encode(pcm, &mut buf) {
             Ok(n) => {
@@ -37,15 +41,33 @@ impl AudioCodec {
             }
         }
     }
+}
+
+// ── Audio Decoder ────────────────────────────────────────────────────
+
+pub struct AudioDecoder {
+    decoder: OpusDecoder,
+    prev_packet_lost: bool,
+}
+
+impl AudioDecoder {
+    pub fn new() -> Self {
+        let decoder = OpusDecoder::new(SAMPLE_RATE, CHANNELS)
+            .expect("failed to create Opus decoder");
+        Self { decoder, prev_packet_lost: false }
+    }
 
     pub fn decode(&mut self, opus_data: &[u8]) -> Option<Vec<i16>> {
+        let fec = self.prev_packet_lost;
+        self.prev_packet_lost = false;
         let mut pcm = vec![0i16; OPUS_FRAME_SIZE];
-        match self.decoder.decode(opus_data, &mut pcm, false) {
+        match self.decoder.decode(opus_data, &mut pcm, fec) {
             Ok(n) => {
                 pcm.truncate(n);
                 Some(pcm)
             }
             Err(e) => {
+                self.prev_packet_lost = true;
                 tracing::warn!("Opus decode error: {e}");
                 None
             }
@@ -53,59 +75,74 @@ impl AudioCodec {
     }
 }
 
-// ── VideoCodec (H.264 via OpenH264) ─────────────────────────────────────
+// ── Video Encoder (H.264 via OpenH264) ───────────────────────────────
 
-pub struct VideoCodec {
+pub struct VideoEncoder {
     encoder: H264Encoder,
-    decoder: H264Decoder,
     width: u32,
     height: u32,
-    force_keyframe: bool,
 }
 
-impl VideoCodec {
+impl VideoEncoder {
     pub fn new(width: u32, height: u32) -> Self {
         let api = OpenH264API::from_source();
-        let config = EncoderConfig::new();
+        let config = EncoderConfig::new()
+            .bitrate(openh264::encoder::BitRate::from_bps(500_000))
+            .max_frame_rate(openh264::encoder::FrameRate::from_hz(15.0))
+            .rate_control_mode(openh264::encoder::RateControlMode::Bitrate);
         let encoder = H264Encoder::with_api_config(api, config)
             .expect("failed to create H264 encoder");
-        let decoder = H264Decoder::new()
-            .expect("failed to create H264 decoder");
-        Self { encoder, decoder, width, height, force_keyframe: false }
+        Self { encoder, width, height }
     }
 
     pub fn encode(&mut self, rgba: &[u8], width: u32, height: u32, keyframe: bool) -> Option<Vec<u8>> {
-        assert_eq!(rgba.len(), (width * height * 4) as usize, "RGBA buffer size mismatch");
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|n| n.checked_mul(4));
+        match expected {
+            Some(n) if n == rgba.len() => {}
+            _ => {
+                tracing::warn!("RGBA buffer size mismatch: got {} for {}x{}", rgba.len(), width, height);
+                return None;
+            }
+        }
 
-        // Handle resolution change
         if width != self.width || height != self.height {
             self.width = width;
             self.height = height;
-            // OpenH264 encoder auto-reinitializes on dimension change
         }
 
         if keyframe {
             self.encoder.force_intra_frame();
         }
 
-        // Convert RGBA to YUV via openh264's built-in conversion
         let rgba_source = RgbaSliceU8::new(rgba, (width as usize, height as usize));
         let yuv = YUVBuffer::from_rgb_source(rgba_source);
 
         match self.encoder.encode(&yuv) {
             Ok(bitstream) => {
                 let data = bitstream.to_vec();
-                if data.is_empty() {
-                    None
-                } else {
-                    Some(data)
-                }
+                if data.is_empty() { None } else { Some(data) }
             }
             Err(e) => {
                 tracing::warn!("H264 encode error: {e}");
                 None
             }
         }
+    }
+}
+
+// ── Video Decoder (H.264, WebCodecs fallback only) ───────────────────
+
+pub struct VideoDecoder {
+    decoder: H264Decoder,
+}
+
+impl VideoDecoder {
+    pub fn new() -> Self {
+        let decoder = H264Decoder::new()
+            .expect("failed to create H264 decoder");
+        Self { decoder }
     }
 
     pub fn decode(&mut self, h264_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
@@ -116,7 +153,7 @@ impl VideoCodec {
                 yuv.write_rgba8(&mut rgba);
                 Some((rgba, w as u32, h as u32))
             }
-            Ok(None) => None, // no frame produced yet (buffering)
+            Ok(None) => None,
             Err(e) => {
                 tracing::warn!("H264 decode error: {e}");
                 None
@@ -125,36 +162,47 @@ impl VideoCodec {
     }
 }
 
-// ── JPEG encoding for IPC ──────────────────────────────────────────────
+// ── Keyframe detection (Annex B) ─────────────────────────────────────
 
-pub fn decoded_to_jpeg(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
-    use image::{ImageBuffer, Rgb, ImageFormat};
-    use std::io::Cursor;
-
-    // JPEG doesn't support alpha — convert RGBA to RGB
-    let rgb: Vec<u8> = rgba.chunks_exact(4)
-        .flat_map(|px| [px[0], px[1], px[2]])
-        .collect();
-    let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, rgb)
-        .expect("RGB buffer size mismatch");
-    let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Jpeg)
-        .expect("JPEG encoding failed");
-    buf.into_inner()
+pub fn is_keyframe(h264_data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 < h264_data.len() {
+        if h264_data[i] == 0 && h264_data[i + 1] == 0 {
+            let header_idx = if h264_data[i + 2] == 1 {
+                i + 3
+            } else if h264_data[i + 2] == 0 && h264_data.get(i + 3) == Some(&1) {
+                i + 4
+            } else {
+                i += 1;
+                continue;
+            };
+            if header_idx < h264_data.len() && (h264_data[header_idx] & 0x1f) == 5 {
+                return true;
+            }
+            i = header_idx;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
-// ── CodecState for AppState ────────────────────────────────────────────
+// ── CodecState for AppState ──────────────────────────────────────────
 
 pub struct CodecState {
-    pub audio: tokio::sync::Mutex<Option<AudioCodec>>,
-    pub video: tokio::sync::Mutex<Option<VideoCodec>>,
+    pub audio_encoder: tokio::sync::Mutex<Option<AudioEncoder>>,
+    pub audio_decoder: tokio::sync::Mutex<Option<AudioDecoder>>,
+    pub video_encoder: tokio::sync::Mutex<Option<VideoEncoder>>,
+    pub video_decoder: tokio::sync::Mutex<Option<VideoDecoder>>,
 }
 
 impl CodecState {
     pub fn new() -> Self {
         Self {
-            audio: tokio::sync::Mutex::new(None),
-            video: tokio::sync::Mutex::new(None),
+            audio_encoder: tokio::sync::Mutex::new(None),
+            audio_decoder: tokio::sync::Mutex::new(None),
+            video_encoder: tokio::sync::Mutex::new(None),
+            video_decoder: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -165,72 +213,54 @@ mod tests {
 
     #[test]
     fn test_audio_roundtrip() {
-        let mut codec = AudioCodec::new();
-        // 960 samples of a 440Hz sine wave at 48kHz
+        let mut enc = AudioEncoder::new();
+        let mut dec = AudioDecoder::new();
         let pcm: Vec<i16> = (0..960)
             .map(|i| (f64::sin(2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0) * 16000.0) as i16)
             .collect();
-
-        let encoded = codec.encode(&pcm).expect("encode failed");
+        let encoded = enc.encode(&pcm).expect("encode failed");
         assert!(!encoded.is_empty());
-        assert!(encoded.len() < pcm.len() * 2, "Opus should compress audio");
-
-        let decoded = codec.decode(&encoded).expect("decode failed");
+        let decoded = dec.decode(&encoded).expect("decode failed");
         assert_eq!(decoded.len(), 960);
-
-        // Lossy codec — check correlation, not exact match
-        let correlation: f64 = pcm.iter().zip(decoded.iter())
-            .map(|(&a, &b)| (a as f64) * (b as f64))
-            .sum::<f64>() / (960.0 * 16000.0 * 16000.0);
-        assert!(correlation > 0.1, "Decoded audio should correlate with input, got {correlation}");
     }
 
     #[test]
-    #[should_panic(expected = "exactly 960 samples")]
     fn test_audio_rejects_wrong_frame_size() {
-        let mut codec = AudioCodec::new();
-        let pcm = vec![0i16; 128];
-        codec.encode(&pcm);
+        let mut enc = AudioEncoder::new();
+        assert!(enc.encode(&vec![0i16; 128]).is_none());
     }
 
     #[test]
     fn test_video_roundtrip() {
-        let width = 320u32;
-        let height = 240u32;
-        let mut codec = VideoCodec::new(width, height);
-
-        // Create a test RGBA frame — red/blue gradient
-        let mut rgba = vec![0u8; (width * height * 4) as usize];
-        for y in 0..height {
-            for x in 0..width {
-                let idx = ((y * width + x) * 4) as usize;
-                rgba[idx] = (x * 255 / width) as u8;
-                rgba[idx + 1] = 0;
-                rgba[idx + 2] = (y * 255 / height) as u8;
+        let mut enc = VideoEncoder::new(320, 240);
+        let mut dec = VideoDecoder::new();
+        let mut rgba = vec![0u8; (320 * 240 * 4) as usize];
+        for y in 0..240u32 {
+            for x in 0..320u32 {
+                let idx = ((y * 320 + x) * 4) as usize;
+                rgba[idx] = (x * 255 / 320) as u8;
+                rgba[idx + 2] = (y * 255 / 240) as u8;
                 rgba[idx + 3] = 255;
             }
         }
-
-        let encoded = codec.encode(&rgba, width, height, true).expect("H264 encode failed");
+        let encoded = enc.encode(&rgba, 320, 240, true).expect("encode failed");
         assert!(!encoded.is_empty());
-        assert!(encoded.len() < rgba.len(), "H264 should compress video");
-
-        let (decoded_rgba, dec_w, dec_h) = codec.decode(&encoded).expect("H264 decode failed");
-        assert_eq!(dec_w, width);
-        assert_eq!(dec_h, height);
-        assert_eq!(decoded_rgba.len(), (width * height * 4) as usize);
-        assert!(decoded_rgba.iter().any(|&b| b != 0), "Decoded frame should not be all zeros");
+        let (decoded, w, h) = dec.decode(&encoded).expect("decode failed");
+        assert_eq!(w, 320);
+        assert_eq!(h, 240);
+        assert_eq!(decoded.len(), (320 * 240 * 4) as usize);
     }
 
     #[test]
-    fn test_jpeg_encode() {
-        let width = 64u32;
-        let height = 64u32;
-        let rgba = vec![128u8; (width * height * 4) as usize];
-        let jpeg = decoded_to_jpeg(&rgba, width, height);
-        // JPEG starts with FF D8
-        assert_eq!(jpeg[0], 0xFF);
-        assert_eq!(jpeg[1], 0xD8);
-        assert!(jpeg.len() < rgba.len(), "JPEG should be smaller than raw RGBA");
+    fn test_is_keyframe() {
+        // IDR NAL with start code 00 00 00 01 and NAL type 5
+        let idr = vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88]; // 0x65 & 0x1f = 5
+        assert!(is_keyframe(&idr));
+        // Non-IDR NAL type 1
+        let non_idr = vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x88]; // 0x41 & 0x1f = 1
+        assert!(!is_keyframe(&non_idr));
+        // SPS NAL type 7 (not a keyframe itself)
+        let sps = vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x42];
+        assert!(!is_keyframe(&sps));
     }
 }

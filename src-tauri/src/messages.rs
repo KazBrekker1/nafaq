@@ -6,6 +6,9 @@ pub const STREAM_VIDEO: u8 = 0x02;
 pub const STREAM_CHAT: u8 = 0x03;
 pub const STREAM_CONTROL: u8 = 0x04;
 
+/// (peer_id, timestamp_ms, encoded_payload)
+pub type MediaPacket = (String, u64, Vec<u8>);
+
 /// Commands from frontend → Rust backend (via Tauri invoke)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -61,6 +64,9 @@ pub async fn write_framed(
     Ok(())
 }
 
+/// Maximum frame size (10 MB) — prevents OOM from malicious length prefixes.
+const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+
 /// Read a length-prefixed message from a QUIC stream.
 /// Returns None if the stream is finished.
 pub async fn read_framed(
@@ -74,6 +80,10 @@ pub async fn read_framed(
         }
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        tracing::warn!("Frame too large ({len} bytes), dropping connection");
+        return Ok(None);
+    }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
     Ok(Some(buf))
