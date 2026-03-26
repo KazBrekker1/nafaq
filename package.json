@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "nuxt dev",
     "generate": "nuxt generate",
+    "bump": "bumpp",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2.9.6",
     "@types/qrcode": "^1.5.5",
+    "bumpp": "^10.4.0",
     "typescript": "^5.9.3"
   }
 }
