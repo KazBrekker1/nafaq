@@ -14,25 +14,26 @@
 
 ## File Map
 
-| Action | Path | Responsibility |
-|--------|------|----------------|
-| Create | `src-tauri/src/codec.rs` | Opus + VP8 encode/decode, RGBA↔YUV420 conversion, JPEG re-encode |
-| Modify | `src-tauri/Cargo.toml` | Add `opus`, `libvpx-sys`, `image` deps; move `tauri-plugin-shell` to desktop-only |
-| Modify | `src-tauri/src/state.rs` | Add `CodecState` (Arc<Mutex<Option<AudioCodec/VideoCodec>>>) to `AppState` |
-| Modify | `src-tauri/src/commands.rs` | Encode in `send_audio`/`send_video`; add `init_codecs`/`destroy_codecs` |
-| Modify | `src-tauri/src/connection.rs` | Use `write_framed`/`read_framed` for media uni-streams |
-| Modify | `src-tauri/src/lib.rs` | Decode in media forwarder; `#[cfg(desktop)]` for shell plugin; update `MediaEvent` |
-| Rewrite | `app/composables/useMediaTransport.ts` | Remove WebCodecs; raw PCM + RGBA capture; JPEG video receive |
-| Modify | `package.json` | Add `tauri:android:dev` and `tauri:android:build` scripts |
-| Create | `src-tauri/tauri.android.conf.json` | Android window override |
-| Create | `src-tauri/capabilities/mobile.json` | Android platform capabilities |
-| Modify | `src-tauri/capabilities/main.json` | Add `platforms` filter for desktop |
+| Action  | Path                                   | Responsibility                                                                     |
+| ------- | -------------------------------------- | ---------------------------------------------------------------------------------- |
+| Create  | `src-tauri/src/codec.rs`               | Opus + VP8 encode/decode, RGBA↔YUV420 conversion, JPEG re-encode                   |
+| Modify  | `src-tauri/Cargo.toml`                 | Add `opus`, `libvpx-sys`, `image` deps; move `tauri-plugin-shell` to desktop-only  |
+| Modify  | `src-tauri/src/state.rs`               | Add `CodecState` (Arc<Mutex<Option<AudioCodec/VideoCodec>>>) to `AppState`         |
+| Modify  | `src-tauri/src/commands.rs`            | Encode in `send_audio`/`send_video`; add `init_codecs`/`destroy_codecs`            |
+| Modify  | `src-tauri/src/connection.rs`          | Use `write_framed`/`read_framed` for media uni-streams                             |
+| Modify  | `src-tauri/src/lib.rs`                 | Decode in media forwarder; `#[cfg(desktop)]` for shell plugin; update `MediaEvent` |
+| Rewrite | `app/composables/useMediaTransport.ts` | Remove WebCodecs; raw PCM + RGBA capture; JPEG video receive                       |
+| Modify  | `package.json`                         | Add `tauri:android:dev` and `tauri:android:build` scripts                          |
+| Create  | `src-tauri/tauri.android.conf.json`    | Android window override                                                            |
+| Create  | `src-tauri/capabilities/mobile.json`   | Android platform capabilities                                                      |
+| Modify  | `src-tauri/capabilities/main.json`     | Add `platforms` filter for desktop                                                 |
 
 ---
 
 ## Task 1: Add Codec Dependencies + Validate Cross-Compilation
 
 **Files:**
+
 - Modify: `src-tauri/Cargo.toml`
 
 This is Step 0 from the spec — validate that codec C libraries cross-compile for Android before writing any pipeline code.
@@ -81,6 +82,7 @@ git commit -m "chore: add opus, libvpx-sys, image codec dependencies"
 ## Task 2: Rust AudioCodec — Encode + Decode + Tests
 
 **Files:**
+
 - Create: `src-tauri/src/codec.rs`
 
 - [ ] **Step 1: Write failing audio codec tests**
@@ -215,6 +217,7 @@ git commit -m "feat: add AudioCodec with Opus encode/decode"
 ## Task 3: Rust VideoCodec — RGBA↔YUV420 + VP8 Encode/Decode + Tests
 
 **Files:**
+
 - Modify: `src-tauri/src/codec.rs`
 
 - [ ] **Step 1: Write failing video codec tests**
@@ -582,6 +585,7 @@ git commit -m "feat: add VideoCodec with VP8 encode/decode via libvpx"
 ## Task 4: JPEG Re-encode for Video Receive + Tests
 
 **Files:**
+
 - Modify: `src-tauri/src/codec.rs`
 
 - [ ] **Step 1: Write failing JPEG test**
@@ -648,6 +652,7 @@ git commit -m "feat: add JPEG re-encode for decoded video frames"
 ## Task 5: CodecState + init_codecs/destroy_codecs Commands
 
 **Files:**
+
 - Modify: `src-tauri/src/state.rs`
 - Modify: `src-tauri/src/commands.rs`
 - Modify: `src-tauri/src/lib.rs` (register new commands)
@@ -778,6 +783,7 @@ git commit -m "feat: add CodecState + init_codecs/destroy_codecs commands"
 ## Task 6: Length-Framed Media Streams
 
 **Files:**
+
 - Modify: `src-tauri/src/connection.rs`
 
 - [ ] **Step 1: Update send_on_stream to use write_framed**
@@ -854,13 +860,14 @@ git commit -m "feat: use length-framed protocol for media uni-streams"
 ## Task 7: Wire Codec Encoding into send_audio/send_video Commands
 
 **Files:**
+
 - Modify: `src-tauri/src/commands.rs`
 
 - [ ] **Step 1: Update send_audio to encode via CodecState**
 
 Replace `send_audio` in `commands.rs`:
 
-```rust
+````rust
 #[tauri::command]
 pub async fn send_audio(
     peer_id: String,
@@ -919,7 +926,7 @@ pub async fn send_video(
         Ok(())
     }
 }
-```
+````
 
 - [ ] **Step 3: Verify it compiles**
 
@@ -939,6 +946,7 @@ git commit -m "feat: encode audio/video via Rust codecs in send commands"
 ## Task 8: Decode in Media Forwarder + Conditional Shell Plugin
 
 **Files:**
+
 - Modify: `src-tauri/src/lib.rs`
 
 - [ ] **Step 1: Update MediaEvent struct**
@@ -1082,6 +1090,7 @@ git commit -m "feat: decode media in Rust forwarder, conditional shell plugin"
 ## Task 9: Rewrite Frontend useMediaTransport.ts
 
 **Files:**
+
 - Rewrite: `app/composables/useMediaTransport.ts`
 
 - [ ] **Step 1: Rewrite useMediaTransport.ts**
@@ -1123,8 +1132,13 @@ export function useMediaTransport() {
       ? Math.min(videoTrack.getSettings().width || maxDim, maxDim)
       : maxDim;
     const height = videoTrack
-      ? Math.min(videoTrack.getSettings().height || (isMobile ? 240 : 480), isMobile ? 240 : 480)
-      : (isMobile ? 240 : 480);
+      ? Math.min(
+          videoTrack.getSettings().height || (isMobile ? 240 : 480),
+          isMobile ? 240 : 480,
+        )
+      : isMobile
+        ? 240
+        : 480;
 
     // Initialize Rust codecs BEFORE audio or video setup — needed for both paths
     await invoke("init_codecs", { width, height });
@@ -1145,11 +1159,15 @@ export function useMediaTransport() {
         }
         registerProcessor("capture", CaptureProcessor);
       `;
-      const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+      const blobUrl = URL.createObjectURL(
+        new Blob([WORKLET_CODE], { type: "application/javascript" }),
+      );
       await captureCtx.audioWorklet.addModule(blobUrl);
       URL.revokeObjectURL(blobUrl);
 
-      sourceNode = captureCtx.createMediaStreamSource(new MediaStream([audioTrack]));
+      sourceNode = captureCtx.createMediaStreamSource(
+        new MediaStream([audioTrack]),
+      );
       workletNode = new AudioWorkletNode(captureCtx, "capture");
 
       // Buffer 128-sample worklet chunks into 960-sample Opus frames
@@ -1163,7 +1181,10 @@ export function useMediaTransport() {
         while (srcOffset < samples.length) {
           const remaining = OPUS_FRAME_SAMPLES - bufferOffset;
           const toCopy = Math.min(remaining, samples.length - srcOffset);
-          sampleBuffer.set(samples.subarray(srcOffset, srcOffset + toCopy), bufferOffset);
+          sampleBuffer.set(
+            samples.subarray(srcOffset, srcOffset + toCopy),
+            bufferOffset,
+          );
           bufferOffset += toCopy;
           srcOffset += toCopy;
 
@@ -1171,9 +1192,15 @@ export function useMediaTransport() {
             // Convert Float32 → Int16 LE
             const pcm = new Int16Array(OPUS_FRAME_SAMPLES);
             for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
-              pcm[i] = Math.max(-32768, Math.min(32767, Math.round(sampleBuffer[i] * 32767)));
+              pcm[i] = Math.max(
+                -32768,
+                Math.min(32767, Math.round(sampleBuffer[i] * 32767)),
+              );
             }
-            invoke("send_audio", { peerId, data: new Uint8Array(pcm.buffer) }).catch(() => {});
+            invoke("send_audio", {
+              peerId,
+              data: new Uint8Array(pcm.buffer),
+            }).catch(() => {});
             bufferOffset = 0;
           }
         }
@@ -1185,7 +1212,10 @@ export function useMediaTransport() {
 
     // --- Video ---
     if (videoTrack) {
-      if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; }
+      if (captureVideoEl) {
+        captureVideoEl.pause();
+        captureVideoEl.srcObject = null;
+      }
       captureVideoEl = document.createElement("video");
       captureVideoEl.srcObject = stream;
       captureVideoEl.muted = true;
@@ -1222,14 +1252,28 @@ export function useMediaTransport() {
     // Cache canvas context
     let canvasCtx: CanvasRenderingContext2D | null = null;
 
-    type AudioPayload = { stream_type: number; data: number[]; timestamp: number };
-    type VideoPayload = { stream_type: number; data: number[]; timestamp: number; width: number; height: number };
+    type AudioPayload = {
+      stream_type: number;
+      data: number[];
+      timestamp: number;
+    };
+    type VideoPayload = {
+      stream_type: number;
+      data: number[];
+      timestamp: number;
+      width: number;
+      height: number;
+    };
 
     // Audio receive — PCM Int16 from Rust Opus decoder
     unlistenAudio = await listen<AudioPayload>("audio-received", (event) => {
       if (!playbackCtx) return;
       const bytes = new Uint8Array(event.payload.data);
-      const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+      const int16 = new Int16Array(
+        bytes.buffer,
+        bytes.byteOffset,
+        bytes.byteLength / 2,
+      );
       const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
       const ch = buffer.getChannelData(0);
       for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
@@ -1241,31 +1285,57 @@ export function useMediaTransport() {
       if (!remoteCanvas) return;
       const bytes = new Uint8Array(event.payload.data);
       const blob = new Blob([bytes], { type: "image/jpeg" });
-      createImageBitmap(blob).then((bitmap) => {
-        if (!remoteCanvas) return;
-        if (!canvasCtx) canvasCtx = remoteCanvas.getContext("2d");
-        if (canvasCtx) {
-          if (remoteCanvas.width !== bitmap.width) remoteCanvas.width = bitmap.width;
-          if (remoteCanvas.height !== bitmap.height) remoteCanvas.height = bitmap.height;
-          canvasCtx.drawImage(bitmap, 0, 0);
-          bitmap.close();
-        }
-      }).catch(() => {});
+      createImageBitmap(blob)
+        .then((bitmap) => {
+          if (!remoteCanvas) return;
+          if (!canvasCtx) canvasCtx = remoteCanvas.getContext("2d");
+          if (canvasCtx) {
+            if (remoteCanvas.width !== bitmap.width)
+              remoteCanvas.width = bitmap.width;
+            if (remoteCanvas.height !== bitmap.height)
+              remoteCanvas.height = bitmap.height;
+            canvasCtx.drawImage(bitmap, 0, 0);
+            bitmap.close();
+          }
+        })
+        .catch(() => {});
     });
   }
 
   async function stop() {
     encoding.value = false;
 
-    if (workletNode) { workletNode.port.onmessage = null; workletNode.disconnect(); workletNode = null; }
-    if (sourceNode) { sourceNode.disconnect(); sourceNode = null; }
-    if (captureCtx) { captureCtx.close(); captureCtx = null; }
-    if (captureVideoEl) { captureVideoEl.pause(); captureVideoEl.srcObject = null; captureVideoEl = null; }
-    if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
-    if (playbackCtx) { playbackCtx.close(); playbackCtx = null; }
+    if (workletNode) {
+      workletNode.port.onmessage = null;
+      workletNode.disconnect();
+      workletNode = null;
+    }
+    if (sourceNode) {
+      sourceNode.disconnect();
+      sourceNode = null;
+    }
+    if (captureCtx) {
+      captureCtx.close();
+      captureCtx = null;
+    }
+    if (captureVideoEl) {
+      captureVideoEl.pause();
+      captureVideoEl.srcObject = null;
+      captureVideoEl = null;
+    }
+    if (captureInterval) {
+      clearInterval(captureInterval);
+      captureInterval = null;
+    }
+    if (playbackCtx) {
+      playbackCtx.close();
+      playbackCtx = null;
+    }
 
-    unlistenAudio?.(); unlistenVideo?.();
-    unlistenAudio = null; unlistenVideo = null;
+    unlistenAudio?.();
+    unlistenVideo?.();
+    unlistenAudio = null;
+    unlistenVideo = null;
     remoteCanvas = null;
 
     // Clean up Rust codec state
@@ -1310,6 +1380,7 @@ git commit -m "feat: rewrite media transport to use Rust codec pipeline"
 ## Task 10: Android Tauri Setup
 
 **Files:**
+
 - Create: `src-tauri/tauri.android.conf.json`
 - Create: `src-tauri/capabilities/mobile.json`
 - Modify: `src-tauri/capabilities/main.json`
@@ -1432,6 +1503,7 @@ Open browser devtools in the Tauri window. Check console for any errors.
 Create a call → copy ticket → open a second instance (or use a second terminal with `bun run tauri:dev`) → join with ticket.
 
 Verify:
+
 - Peer connected event fires
 - Audio flows (check console for any codec errors)
 - Video shows on remote canvas
@@ -1454,6 +1526,7 @@ Run: `cd /Users/yousseifelshahawy/coding/personal/nafaq && bun run tauri:android
 Expected: Build succeeds. APK generated at `src-tauri/gen/android/app/build/outputs/apk/`.
 
 If `libvpx-sys` fails to cross-compile for Android:
+
 1. Check error output
 2. Try `LIBVPX_NO_PKG_CONFIG=1 bun run tauri:android:build --target aarch64`
 3. If still fails, swap `libvpx-sys` for `openh264` in `Cargo.toml` and adapt `VideoCodec` in `codec.rs` (spec fallback plan)
