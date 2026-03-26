@@ -166,6 +166,24 @@ function handleSendChat(text: string) {
 
 <template>
   <div class="h-screen flex relative bg-black safe-area-inset overflow-hidden">
+    <!-- Disconnect toast -->
+    <DisconnectToast
+      v-if="call.lastDisconnectedPeer.value"
+      :key="call.lastDisconnectedPeer.value.id"
+      :name="call.lastDisconnectedPeer.value.name"
+    />
+
+    <!-- Last peer left prompt -->
+    <div
+      v-if="call.allPeersLeft.value"
+      class="absolute inset-0 z-30 flex items-center justify-center bg-black/80"
+    >
+      <div class="text-center space-y-4">
+        <p class="text-sm text-[var(--color-muted)] tracking-wider">Everyone has left</p>
+        <UButton class="rounded-none" @click="handleEndCall">Leave Call</UButton>
+      </div>
+    </div>
+
     <div class="flex-1 min-w-0 bg-[var(--color-surface-alt)] relative flex flex-col">
       <!-- Top bar -->
       <div class="absolute top-0 left-0 right-0 flex justify-between px-3 sm:px-4 py-2 sm:py-3 z-20 bg-gradient-to-b from-black/80 to-transparent">

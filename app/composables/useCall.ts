@@ -13,6 +13,8 @@ const displayName = ref("");
 const peerNames = ref<Record<string, string>>({});
 const connectionProgress = ref<"idle" | "starting-node" | "node-ready" | "connecting" | "securing" | "connected">("idle");
 const showPreCallOverlay = ref(false);
+const lastDisconnectedPeer = ref<{ id: string; name: string } | null>(null);
+const allPeersLeft = ref(false);
 
 let initialized = false;
 
@@ -69,6 +71,8 @@ export function useCall() {
     peerNames.value = {};
     ticket.value = null;
     showPreCallOverlay.value = false;
+    allPeersLeft.value = false;
+    lastDisconnectedPeer.value = null;
     navigateTo("/");
   }
 
@@ -90,6 +94,8 @@ export function useCall() {
     peerNames,
     connectionProgress,
     showPreCallOverlay,
+    lastDisconnectedPeer,
+    allPeersLeft,
     createCall,
     joinCall,
     endCall,
@@ -129,6 +135,7 @@ async function initCallListeners() {
       if (pid && !peers.value.includes(pid)) {
         peers.value.push(pid);
       }
+      allPeersLeft.value = false;
       peerId.value = pid;
       state.value = "connected";
       // Send our display name to the new peer
@@ -145,13 +152,20 @@ async function initCallListeners() {
     listen<any>("peer-disconnected", (event) => {
       const data = event.payload;
       const pid = typeof data === "string" ? data : data?.peer_id;
+      const peerName = peerNames.value[pid] || pid?.slice(0, 12) || "Peer";
       const idx = peers.value.indexOf(pid);
       if (idx >= 0) peers.value.splice(idx, 1);
+
+      lastDisconnectedPeer.value = { id: pid, name: peerName };
+      setTimeout(() => {
+        if (lastDisconnectedPeer.value?.id === pid) {
+          lastDisconnectedPeer.value = null;
+        }
+      }, 3500);
+
       if (peers.value.length === 0) {
-        state.value = "idle";
-        peerId.value = null;
-        ticket.value = null;
-        navigateTo("/");
+        allPeersLeft.value = true;
+        // Don't auto-redirect — show "everyone left" prompt
       }
     });
 
