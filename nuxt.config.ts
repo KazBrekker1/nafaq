@@ -5,10 +5,18 @@ export default defineNuxtConfig({
   future: { compatibilityVersion: 4 },
   compatibilityDate: "2025-07-01",
 
+  app: {
+    head: {
+      viewport: "width=device-width, initial-scale=1, viewport-fit=cover",
+    },
+  },
+
   css: ["@/assets/css/main.css"],
 
   icon: {
-    provider: "iconify",
+    clientBundle: {
+      scan: true,
+    },
   },
 
   vite: {

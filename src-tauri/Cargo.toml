@@ -23,7 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 opus = "0.3"
 openh264 = "0.9"
+noq-proto = "0.16"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-shell = "2"

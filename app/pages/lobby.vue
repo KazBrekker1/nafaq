@@ -14,8 +14,9 @@ onMounted(async () => {
 watch(
   () => media.localStream.value,
   (stream) => {
-    if (videoEl.value && stream) videoEl.value.srcObject = stream;
+    if (videoEl.value) videoEl.value.srcObject = stream || null;
   },
+  { immediate: true },
 );
 
 function cancel() {
@@ -25,11 +26,11 @@ function cancel() {
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center p-8">
-    <div class="border-2 border-[var(--color-border)] flex max-w-4xl w-full">
+  <div class="min-h-screen flex items-center justify-center p-4 sm:p-8 safe-area-inset-min">
+    <div class="border-2 border-[var(--color-border)] flex flex-col sm:flex-row max-w-4xl w-full">
       <!-- Camera Preview -->
-      <div class="flex-[1.3] bg-[#111] relative border-r-2 border-[var(--color-border)] min-h-[400px] flex items-center justify-center">
-        <video ref="videoEl" autoplay muted playsinline class="w-full h-full object-cover absolute inset-0" />
+      <div class="flex-[1.3] bg-[#111] relative border-b-2 sm:border-b-0 sm:border-r-2 border-[var(--color-border)] min-h-[240px] sm:min-h-[400px] flex items-center justify-center">
+        <video ref="videoEl" autoplay muted playsinline class="w-full h-full object-contain absolute inset-0 bg-black" />
         <p v-if="!media.localStream.value" class="text-[var(--color-muted)] text-sm tracking-widest relative z-10">
           {{ media.error.value || "Starting camera..." }}
         </p>
@@ -39,7 +40,7 @@ function cancel() {
       </div>
 
       <!-- Controls -->
-      <div class="flex-1 p-8 flex flex-col justify-center gap-5">
+      <div class="flex-1 p-4 sm:p-8 flex flex-col justify-center gap-4 sm:gap-5">
         <div>
           <p class="label mb-2">CAMERA</p>
           <select class="input text-xs p-2 w-full bg-black text-[var(--color-border)] border-2 border-[var(--color-border)] font-mono"

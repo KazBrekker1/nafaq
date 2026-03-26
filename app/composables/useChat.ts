@@ -1,5 +1,3 @@
-import { ref, onMounted, onUnmounted } from "vue";
-
 export interface ChatMessage {
   id: string;
   sender: "you" | "peer";
@@ -46,17 +44,20 @@ export function useChat() {
     }
   }
 
-  async function sendMessageToAll(peerIds: string[], text: string) {
-    if (!text.trim() || peerIds.length === 0) return;
+  async function sendMessageToAll(text: string) {
+    if (!text.trim()) return;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      await Promise.all(peerIds.map((pid) => invoke("send_chat", { peerId: pid, message: text })));
+      const failedPeerIds = await invoke<string[]>("send_chat_all", { message: text });
       messages.value.push({
         id: crypto.randomUUID(),
         sender: "you",
         text,
         timestamp: Date.now(),
       });
+      if (failedPeerIds.length > 0) {
+        console.warn("Chat delivery failed for peers:", failedPeerIds);
+      }
     } catch (e) {
       console.error("Failed to send chat:", e);
     }

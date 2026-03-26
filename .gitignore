@@ -4,3 +4,16 @@ node_modules/
 dist/
 target/
 .DS_Store
+.osgrep
+.nuxt/
+.nitro
+.cache
+.output
+.env
+.cargo
+*.log*
+
+# Android signing
+*.jks
+*.keystore
+keystore.properties

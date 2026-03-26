@@ -27,8 +27,10 @@ export function useMedia() {
       microphones.value = devices
         .filter((d) => d.kind === "audioinput")
         .map((d) => ({ deviceId: d.deviceId, label: d.label || `Mic ${d.deviceId.slice(0, 8)}` }));
-      if (!selectedCamera.value && cameras.value.length > 0) selectedCamera.value = cameras.value[0].deviceId;
-      if (!selectedMic.value && microphones.value.length > 0) selectedMic.value = microphones.value[0].deviceId;
+      const firstCamera = cameras.value[0];
+      const firstMic = microphones.value[0];
+      if (!selectedCamera.value && firstCamera) selectedCamera.value = firstCamera.deviceId;
+      if (!selectedMic.value && firstMic) selectedMic.value = firstMic.deviceId;
     } catch (e: unknown) {
       error.value = `Device enumeration failed: ${e instanceof Error ? e.message : String(e)}`;
     }
@@ -44,6 +46,7 @@ export function useMedia() {
       stopPreview();
       localStream.value = stream;
       await enumerateDevices();
+      applyMuteState();
       startMicLevelMonitor(stream);
     } catch (e: unknown) {
       error.value = `Camera/mic access failed: ${e instanceof Error ? e.message : String(e)}`;
@@ -76,14 +79,19 @@ export function useMedia() {
     micLevel.value = 0;
   }
 
+  function applyMuteState() {
+    localStream.value?.getAudioTracks().forEach((t) => { t.enabled = !audioMuted.value; });
+    localStream.value?.getVideoTracks().forEach((t) => { t.enabled = !videoMuted.value; });
+  }
+
   function toggleAudio() {
     audioMuted.value = !audioMuted.value;
-    localStream.value?.getAudioTracks().forEach((t) => { t.enabled = !audioMuted.value; });
+    applyMuteState();
   }
 
   function toggleVideo() {
     videoMuted.value = !videoMuted.value;
-    localStream.value?.getVideoTracks().forEach((t) => { t.enabled = !videoMuted.value; });
+    applyMuteState();
   }
 
   async function switchCamera(deviceId: string) {

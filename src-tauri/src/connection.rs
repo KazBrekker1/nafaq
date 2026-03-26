@@ -1,29 +1,99 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
-use tokio::sync::{broadcast, watch, Mutex};
+use bytes::Bytes;
+use iroh::{
+    endpoint::{Connection, PathId, RecvStream, SendStream},
+    Watcher,
+};
+use tokio::sync::{broadcast, Mutex, Notify};
+
+#[derive(Clone)]
+struct PendingVideoFrame {
+    timestamp_ms: u64,
+    payload: Vec<u8>,
+    is_keyframe: bool,
+}
+
+#[derive(Clone)]
+struct PeerVideoWriter {
+    pending: Arc<Mutex<Option<PendingVideoFrame>>>,
+    notify: Arc<Notify>,
+}
+
+impl PeerVideoWriter {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    async fn enqueue_latest(&self, frame: PendingVideoFrame) {
+        let mut pending = self.pending.lock().await;
+        let should_replace = match pending.as_ref() {
+            Some(existing) if existing.is_keyframe && !frame.is_keyframe => false,
+            _ => true,
+        };
+        if should_replace {
+            *pending = Some(frame);
+        }
+        self.notify.notify_one();
+    }
+}
 
 use crate::codec::is_keyframe;
 use crate::messages::{
-    ControlAction, Event, MediaPacket, STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_VIDEO,
+    AudioDatagram, AudioPacket, ControlAction, Event, VideoLayerRequest, VideoPacket, STREAM_AUDIO,
+    STREAM_CHAT, STREAM_CONTROL, STREAM_VIDEO,
 };
 
 struct PeerConnection {
     connection: Connection,
-    audio_send: Arc<Mutex<Option<SendStream>>>,
     chat_send: Arc<Mutex<Option<SendStream>>>,
     control_send: Arc<Mutex<Option<SendStream>>>,
+    video_writer: PeerVideoWriter,
+    /// Requested video layer: 0=High, 1=Low, 2=None
+    requested_video_layer: Arc<AtomicU8>,
+    pending_keyframe: Arc<AtomicBool>,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct VideoReceiveState {
+    last_received: std::time::Instant,
+}
+
+impl Default for VideoReceiveState {
+    fn default() -> Self {
+        Self {
+            last_received: std::time::Instant::now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NetworkPeerStats {
+    pub peer_id: String,
+    pub rtt_ms: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub datagram_send_buffer_space: usize,
+    pub latest_video_age_ms: u64,
 }
 
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     peer_tickets: Arc<Mutex<HashMap<String, String>>>,
+    audio_sequences: Arc<Mutex<HashMap<String, u16>>>,
+    video_receive_state: Arc<Mutex<HashMap<String, VideoReceiveState>>>,
     event_tx: broadcast::Sender<Event>,
-    audio_media_tx: broadcast::Sender<MediaPacket>,
-    video_watch_tx: watch::Sender<Option<MediaPacket>>,
+    audio_media_tx: broadcast::Sender<AudioPacket>,
+    video_media_tx: broadcast::Sender<VideoPacket>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -33,22 +103,43 @@ impl std::fmt::Debug for ConnectionManager {
 }
 
 impl ConnectionManager {
+    fn current_timestamp_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    async fn mark_peer_active_internal(
+        peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
+        peer_id: &str,
+    ) {
+        let last_activity = {
+            let peers = peers.lock().await;
+            peers.get(peer_id).map(|p| p.last_activity_ms.clone())
+        };
+        if let Some(last_activity) = last_activity {
+            last_activity.store(Self::current_timestamp_ms(), Ordering::Relaxed);
+        }
+    }
+
     pub fn new(
         event_tx: broadcast::Sender<Event>,
-        audio_media_tx: broadcast::Sender<MediaPacket>,
-        video_watch_tx: watch::Sender<Option<MediaPacket>>,
+        audio_media_tx: broadcast::Sender<AudioPacket>,
+        video_media_tx: broadcast::Sender<VideoPacket>,
     ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             endpoint: Arc::new(Mutex::new(None)),
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
+            audio_sequences: Arc::new(Mutex::new(HashMap::new())),
+            video_receive_state: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audio_media_tx,
-            video_watch_tx,
+            video_media_tx,
         }
     }
 
-    /// Store endpoint reference so we can generate tickets and auto-connect on PeerAnnounce.
     pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
         *self.endpoint.lock().await = Some(endpoint);
     }
@@ -72,32 +163,34 @@ impl ConnectionManager {
     }
 
     async fn setup_connection(&self, peer_id: String, connection: Connection) -> Result<()> {
-        // Audio: long-lived uni-stream with high priority
-        let mut audio_send = connection.open_uni().await?;
-        audio_send.write_all(&[STREAM_AUDIO]).await?;
-        audio_send.set_priority(90)?;
+        connection.set_max_concurrent_uni_streams(2048_u32.into());
 
-        // Chat: bi-stream with low priority
         let (mut chat_send, _) = connection.open_bi().await?;
         chat_send.write_all(&[STREAM_CHAT]).await?;
         chat_send.set_priority(10)?;
 
-        // Control: bi-stream with highest priority
         let (mut control_send, _) = connection.open_bi().await?;
         control_send.write_all(&[STREAM_CONTROL]).await?;
         control_send.set_priority(100)?;
 
         let peer_conn = PeerConnection {
             connection: connection.clone(),
-            audio_send: Arc::new(Mutex::new(Some(audio_send))),
             chat_send: Arc::new(Mutex::new(Some(chat_send))),
             control_send: Arc::new(Mutex::new(Some(control_send))),
+            video_writer: PeerVideoWriter::new(),
+            requested_video_layer: Arc::new(AtomicU8::new(0)),
+            pending_keyframe: Arc::new(AtomicBool::new(false)),
+            last_activity_ms: Arc::new(AtomicU64::new(Self::current_timestamp_ms())),
         };
+
+        let video_writer = peer_conn.video_writer.clone();
 
         {
             let mut peers = self.peers.lock().await;
             peers.insert(peer_id.clone(), peer_conn);
         }
+
+        Self::spawn_video_writer(peer_id.clone(), connection.clone(), video_writer);
 
         let _ = self.event_tx.send(Event::PeerConnected {
             peer_id: peer_id.clone(),
@@ -105,14 +198,11 @@ impl ConnectionManager {
 
         self.spawn_stream_receivers(peer_id.clone(), connection);
 
-        // --- Mesh formation ---
-        // 1. Send our own ticket to the new peer
-        // 2. Send all stored peer tickets to the new peer (so they can connect to everyone)
         let endpoint_guard = self.endpoint.lock().await;
         if let Some(endpoint) = endpoint_guard.as_ref() {
             let own_ticket = crate::node::generate_ticket(endpoint);
             let own_id = endpoint.id().to_string();
-            drop(endpoint_guard); // release lock before async send_control
+            drop(endpoint_guard);
 
             let announce_self = ControlAction::PeerAnnounce {
                 peer_id: own_id,
@@ -120,10 +210,10 @@ impl ConnectionManager {
             };
             let _ = self.send_control(&peer_id, &announce_self).await;
 
-            // Send all known peer tickets to the new peer
             let stored_tickets: Vec<(String, String)> = {
                 let tickets = self.peer_tickets.lock().await;
-                tickets.iter()
+                tickets
+                    .iter()
                     .filter(|(id, _)| **id != peer_id)
                     .map(|(id, t)| (id.clone(), t.clone()))
                     .collect()
@@ -142,16 +232,53 @@ impl ConnectionManager {
         Ok(())
     }
 
-    /// Handle a PeerAnnounce control message: store ticket, auto-connect if needed, relay to others.
-    pub async fn handle_peer_announce(&self, sender_id: &str, announced_peer_id: String, ticket: String) {
-        // Ignore announcements about ourselves
+    async fn cleanup_peer_internal(
+        peer_id: &str,
+        peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
+        peer_tickets: &Arc<Mutex<HashMap<String, String>>>,
+        audio_sequences: &Arc<Mutex<HashMap<String, u16>>>,
+        video_receive_state: &Arc<Mutex<HashMap<String, VideoReceiveState>>>,
+        event_tx: &broadcast::Sender<Event>,
+        close_reason: Option<&'static [u8]>,
+    ) -> bool {
+        let removed = {
+            let mut peers = peers.lock().await;
+            peers.remove(peer_id)
+        };
+
+        let Some(peer) = removed else {
+            return false;
+        };
+
+        if let Some(reason) = close_reason {
+            peer.connection.close(0u32.into(), reason);
+        }
+
+        peer_tickets.lock().await.remove(peer_id);
+        audio_sequences.lock().await.remove(peer_id);
+        video_receive_state.lock().await.remove(peer_id);
+        let _ = event_tx.send(Event::PeerDisconnected {
+            peer_id: peer_id.to_string(),
+        });
+        true
+    }
+
+    pub async fn handle_peer_announce(
+        &self,
+        sender_id: &str,
+        announced_peer_id: String,
+        ticket: String,
+    ) {
         let is_self = {
             let guard = self.endpoint.lock().await;
-            guard.as_ref().map_or(false, |ep| announced_peer_id == ep.id().to_string())
+            guard
+                .as_ref()
+                .is_some_and(|ep| announced_peer_id == ep.id().to_string())
         };
-        if is_self { return; }
+        if is_self {
+            return;
+        }
 
-        // Store ticket — only proceed if this is a NEW peer we didn't know about
         let is_new = {
             let mut tickets = self.peer_tickets.lock().await;
             if tickets.contains_key(&announced_peer_id) {
@@ -161,9 +288,10 @@ impl ConnectionManager {
                 true
             }
         };
-        if !is_new { return; }
+        if !is_new {
+            return;
+        }
 
-        // Auto-connect if not already connected
         let already_connected = self.peers.lock().await.contains_key(&announced_peer_id);
         if !already_connected {
             let endpoint = self.endpoint.lock().await.clone();
@@ -172,8 +300,14 @@ impl ConnectionManager {
                     Ok(endpoint_ticket) => {
                         let addr = endpoint_ticket.endpoint_addr().clone();
                         match self.connect_to_peer(&ep, addr).await {
-                            Ok(_) => tracing::info!("Mesh: auto-connected to announced peer {announced_peer_id}"),
-                            Err(e) => tracing::warn!("Mesh: failed to auto-connect to {announced_peer_id}: {e}"),
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Mesh: auto-connected to announced peer {announced_peer_id}"
+                                )
+                            }
+                            Err(e) => tracing::warn!(
+                                "Mesh: failed to auto-connect to {announced_peer_id}: {e}"
+                            ),
                         }
                     }
                     Err(e) => tracing::warn!("Mesh: invalid ticket for {announced_peer_id}: {e}"),
@@ -181,10 +315,10 @@ impl ConnectionManager {
             }
         }
 
-        // Relay this announcement to all connected peers except sender and the announced peer
         let relay_targets: Vec<String> = {
             let peers = self.peers.lock().await;
-            peers.keys()
+            peers
+                .keys()
                 .filter(|id| *id != sender_id && *id != &announced_peer_id)
                 .cloned()
                 .collect()
@@ -200,57 +334,76 @@ impl ConnectionManager {
 
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {
         let audio_media_tx = self.audio_media_tx.clone();
-        let video_watch_tx = self.video_watch_tx.clone();
-        let event_tx_uni = self.event_tx.clone();
+        let video_media_tx = self.video_media_tx.clone();
         let peers_ref = self.peers.clone();
+        let peer_tickets_ref = self.peer_tickets.clone();
+        let sequences_ref = self.audio_sequences.clone();
+        let video_state_ref = self.video_receive_state.clone();
+        let video_state_ref_uni = video_state_ref.clone();
+        let event_tx_cleanup = self.event_tx.clone();
         let peer_id_uni = peer_id.clone();
         let connection_uni = connection.clone();
+        let peers_ref_uni = peers_ref.clone();
 
-        // Uni stream receiver (audio/video from peer)
         tokio::spawn(async move {
             loop {
                 match connection_uni.accept_uni().await {
                     Ok(mut recv) => {
                         let peer_id = peer_id_uni.clone();
                         let audio_tx = audio_media_tx.clone();
-                        let video_tx = video_watch_tx.clone();
+                        let video_tx = video_media_tx.clone();
+                        let video_state_ref = video_state_ref_uni.clone();
+                        let peers_ref = peers_ref_uni.clone();
                         tokio::spawn(async move {
                             let mut type_buf = [0u8; 1];
                             if recv.read_exact(&mut type_buf).await.is_err() {
                                 return;
                             }
                             match type_buf[0] {
-                                STREAM_AUDIO => {
-                                    // Audio: read all frames from long-lived stream
+                                STREAM_AUDIO => loop {
+                                    match crate::messages::read_framed(&mut recv).await {
+                                        Ok(Some(data)) => {
+                                            if let Some(packet) = AudioDatagram::decode(&data) {
+                                                Self::mark_peer_active_internal(
+                                                    &peers_ref, &peer_id,
+                                                )
+                                                .await;
+                                                let _ = audio_tx.send(AudioPacket {
+                                                    peer_id: peer_id.clone(),
+                                                    timestamp_ms: packet.timestamp_ms,
+                                                    sequence: packet.sequence,
+                                                    payload: packet.payload,
+                                                });
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                },
+                                STREAM_VIDEO => {
                                     loop {
                                         match crate::messages::read_framed(&mut recv).await {
-                                            Ok(Some(data)) if data.len() >= 8 => {
-                                                let ts = u64::from_be_bytes(
-                                                    data[..8].try_into().unwrap(),
-                                                );
+                                            Ok(Some(data)) => {
+                                                if data.len() < 8 {
+                                                    continue;
+                                                }
+                                                Self::mark_peer_active_internal(&peers_ref, &peer_id)
+                                                    .await;
+                                                let timestamp_ms =
+                                                    u64::from_be_bytes(data[..8].try_into().unwrap());
                                                 let payload = data[8..].to_vec();
-                                                let _ = audio_tx
-                                                    .send((peer_id.clone(), ts, payload));
+                                                video_state_ref.lock().await.insert(
+                                                    peer_id.clone(),
+                                                    VideoReceiveState {
+                                                        last_received: std::time::Instant::now(),
+                                                    },
+                                                );
+                                                let _ = video_tx.send(VideoPacket {
+                                                    peer_id: peer_id.clone(),
+                                                    timestamp_ms,
+                                                    payload,
+                                                });
                                             }
                                             _ => break,
-                                        }
-                                    }
-                                }
-                                STREAM_VIDEO => {
-                                    // Video: single frame per stream (stream-per-frame)
-                                    if let Ok(Some(data)) =
-                                        crate::messages::read_framed(&mut recv).await
-                                    {
-                                        if data.len() >= 8 {
-                                            let ts = u64::from_be_bytes(
-                                                data[..8].try_into().unwrap(),
-                                            );
-                                            let payload = data[8..].to_vec();
-                                            let _ = video_tx.send(Some((
-                                                peer_id.clone(),
-                                                ts,
-                                                payload,
-                                            )));
                                         }
                                     }
                                 }
@@ -259,37 +412,88 @@ impl ConnectionManager {
                         });
                     }
                     Err(_) => {
-                        tracing::info!("Connection lost for peer {peer_id_uni}");
-                        peers_ref.lock().await.remove(&peer_id_uni);
-                        let _ = event_tx_uni.send(Event::PeerDisconnected {
-                            peer_id: peer_id_uni.clone(),
-                        });
+                        tracing::info!("Uni stream accept ended for peer {peer_id_uni}");
                         break;
                     }
                 }
             }
         });
 
+        let audio_media_tx = self.audio_media_tx.clone();
+        let peer_id_datagram = peer_id.clone();
+        let connection_datagram = connection.clone();
+        let peers_ref_datagram = peers_ref.clone();
+        tokio::spawn(async move {
+            loop {
+                match connection_datagram.read_datagram().await {
+                    Ok(data) => {
+                        if let Some(packet) = AudioDatagram::decode(&data) {
+                            Self::mark_peer_active_internal(&peers_ref_datagram, &peer_id_datagram)
+                                .await;
+                            let _ = audio_media_tx.send(AudioPacket {
+                                peer_id: peer_id_datagram.clone(),
+                                timestamp_ms: packet.timestamp_ms,
+                                sequence: packet.sequence,
+                                payload: packet.payload,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Datagram receive ended for peer {peer_id_datagram}: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let peers_ref_closed = peers_ref.clone();
+        let peer_tickets_ref = peer_tickets_ref.clone();
+        let sequences_ref = sequences_ref.clone();
+        let video_state_ref = video_state_ref.clone();
+        let event_tx_cleanup_closed = event_tx_cleanup.clone();
+        let peer_id_closed = peer_id.clone();
+        let connection_closed = connection.clone();
+        tokio::spawn(async move {
+            let close_reason = connection_closed.closed().await;
+            tracing::info!("Connection closed for peer {peer_id_closed}: {close_reason}");
+            Self::cleanup_peer_internal(
+                &peer_id_closed,
+                &peers_ref_closed,
+                &peer_tickets_ref,
+                &sequences_ref,
+                &video_state_ref,
+                &event_tx_cleanup_closed,
+                None,
+            )
+            .await;
+        });
+
         let event_tx = self.event_tx.clone();
         let peer_id_bi = peer_id.clone();
-
-        // Bi stream receiver (chat/control from peer)
+        let peers_ref_bi = peers_ref.clone();
         tokio::spawn(async move {
             loop {
                 match connection.accept_bi().await {
                     Ok((_, mut recv)) => {
                         let peer_id = peer_id_bi.clone();
                         let event_tx = event_tx.clone();
+                        let peers_ref = peers_ref_bi.clone();
                         let mut type_buf = [0u8; 1];
                         if recv.read_exact(&mut type_buf).await.is_err() {
                             continue;
                         }
                         tokio::spawn(async move {
-                            Self::handle_bi_stream(type_buf[0], &peer_id, recv, event_tx).await;
+                            Self::handle_bi_stream(
+                                type_buf[0],
+                                &peer_id,
+                                recv,
+                                event_tx,
+                                peers_ref,
+                            )
+                            .await;
                         });
                     }
                     Err(_) => {
-                        // Don't double-emit — uni receiver handles disconnect
                         tracing::info!("Bi stream accept ended for peer {peer_id_bi}");
                         break;
                     }
@@ -303,11 +507,13 @@ impl ConnectionManager {
         peer_id: &str,
         mut recv: RecvStream,
         event_tx: broadcast::Sender<Event>,
+        peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     ) {
         loop {
             match crate::messages::read_framed(&mut recv).await {
                 Ok(Some(data)) => match stream_type {
                     STREAM_CHAT => {
+                        Self::mark_peer_active_internal(&peers, peer_id).await;
                         if let Ok(message) = String::from_utf8(data) {
                             let _ = event_tx.send(Event::ChatReceived {
                                 peer_id: peer_id.to_string(),
@@ -316,16 +522,18 @@ impl ConnectionManager {
                         }
                     }
                     STREAM_CONTROL => {
+                        Self::mark_peer_active_internal(&peers, peer_id).await;
                         if let Ok(action) = serde_json::from_slice::<ControlAction>(&data) {
+                            if matches!(action, ControlAction::Heartbeat) {
+                                continue;
+                            }
                             let _ = event_tx.send(Event::ControlReceived {
                                 peer_id: peer_id.to_string(),
                                 action,
                             });
                         }
                     }
-                    _ => {
-                        tracing::warn!("Unknown bi stream type: {stream_type}");
-                    }
+                    _ => tracing::warn!("Unknown bi stream type: {stream_type}"),
                 },
                 Ok(None) => break,
                 Err(e) => {
@@ -336,48 +544,173 @@ impl ConnectionManager {
         }
     }
 
-    async fn send_on_stream(stream: &Arc<Mutex<Option<SendStream>>>, data: &[u8]) -> Result<()> {
-        let mut guard = stream.lock().await;
-        if let Some(ref mut send) = *guard {
-            crate::messages::write_framed(send, data).await?;
+    fn timestamped_payload(data: &[u8], timestamp: u64) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(8 + data.len());
+        payload.extend_from_slice(&timestamp.to_be_bytes());
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    fn spawn_video_writer(peer_id: String, connection: Connection, writer: PeerVideoWriter) {
+        tokio::spawn(async move {
+            let mut send: Option<SendStream> = None;
+            loop {
+                tokio::select! {
+                    _ = writer.notify.notified() => {}
+                    _ = connection.closed() => {
+                        tracing::info!("Video writer closed for peer {peer_id}");
+                        break;
+                    }
+                }
+
+                while let Some(frame) = writer.pending.lock().await.take() {
+                    let payload = Self::timestamped_payload(&frame.payload, frame.timestamp_ms);
+                    let mut attempt = 0usize;
+
+                    loop {
+                        if send.is_none() {
+                            match connection.open_uni().await {
+                                Ok(mut stream) => {
+                                    if stream.write_all(&[STREAM_VIDEO]).await.is_ok() {
+                                        send = Some(stream);
+                                    } else {
+                                        tracing::warn!("Failed to prime video stream for peer {peer_id}");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to open video stream for peer {peer_id}: {e}");
+                                    break;
+                                }
+                            }
+                        }
+
+                        let result = if let Some(stream) = send.as_mut() {
+                            let _ = stream.set_priority(if is_keyframe(&frame.payload) { 50 } else { 30 });
+                            crate::messages::write_framed(stream, &payload).await
+                        } else {
+                            break;
+                        };
+
+                        match result {
+                            Ok(()) => break,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Video stream write failed for peer {peer_id}, attempt {}: {e}",
+                                    attempt + 1
+                                );
+                                send = None;
+                                attempt += 1;
+                                if attempt >= 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn send_audio_datagram(
+        conn: &Connection,
+        sequence: u16,
+        data: &[u8],
+        timestamp: u64,
+    ) -> Result<()> {
+        let payload = AudioDatagram::encode(sequence, timestamp, data);
+        if let Some(max_size) = conn.max_datagram_size() {
+            if payload.len() > max_size {
+                tracing::warn!(
+                    "Audio datagram too large for peer {} > {}",
+                    payload.len(),
+                    max_size
+                );
+                return Ok(());
+            }
+        }
+        conn.send_datagram(Bytes::from(payload))?;
+        Ok(())
+    }
+
+    pub async fn send_audio_to_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
+        let peers: Vec<(String, Connection)> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .map(|(peer_id, peer)| (peer_id.clone(), peer.connection.clone()))
+                .collect()
+        };
+        let mut sequences = self.audio_sequences.lock().await;
+        for (peer_id, conn) in peers {
+            let entry = sequences.entry(peer_id.clone()).or_insert(0);
+            let sequence = *entry;
+            *entry = entry.wrapping_add(1);
+            if let Err(e) = Self::send_audio_datagram(&conn, sequence, data, timestamp) {
+                tracing::warn!("Audio datagram send failed for {peer_id}: {e}");
+            }
         }
         Ok(())
     }
 
-    /// Send audio on the long-lived audio stream with timestamp prepended
-    pub async fn send_audio(&self, peer_id: &str, data: &[u8], timestamp: u64) -> Result<()> {
-        let stream = {
-            let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.audio_send.clone())
+    pub async fn send_video_frame_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
+        let peers: Vec<PeerVideoWriter> = {
+            let peers_guard = self.peers.lock().await;
+            peers_guard
+                .values()
+                .map(|p| p.video_writer.clone())
+                .collect()
         };
-        if let Some(s) = stream {
-            let mut payload = Vec::with_capacity(8 + data.len());
-            payload.extend_from_slice(&timestamp.to_be_bytes());
-            payload.extend_from_slice(data);
-            Self::send_on_stream(&s, &payload).await
-        } else {
-            Ok(())
+
+        for writer in peers {
+            writer
+                .enqueue_latest(PendingVideoFrame {
+                    timestamp_ms: timestamp,
+                    payload: data.to_vec(),
+                    is_keyframe: is_keyframe(data),
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn has_peers(&self) -> bool {
+        !self.peers.lock().await.is_empty()
+    }
+
+    pub async fn consume_pending_keyframe_requests(&self) -> bool {
+        let peers = self.peers.lock().await;
+        let mut force_keyframe = false;
+        for peer in peers.values() {
+            if peer.pending_keyframe.swap(false, Ordering::Relaxed) {
+                force_keyframe = true;
+            }
+        }
+        force_keyframe
+    }
+
+    pub async fn set_peer_video_layer(&self, peer_id: &str, layer: VideoLayerRequest) {
+        let peers = self.peers.lock().await;
+        if let Some(peer) = peers.get(peer_id) {
+            let new_val = layer.to_u8();
+            let current = peer.requested_video_layer.load(Ordering::Relaxed);
+            if current != new_val {
+                peer.requested_video_layer.store(new_val, Ordering::Relaxed);
+                if new_val < 2 {
+                    peer.pending_keyframe.store(true, Ordering::Relaxed);
+                }
+            }
         }
     }
 
-    /// Send video via stream-per-frame: opens a new uni-stream, sets priority, writes, finishes
-    pub async fn send_video(&self, peer_id: &str, data: &[u8], timestamp: u64) -> Result<()> {
-        let connection = {
-            let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.connection.clone())
-        };
-        if let Some(conn) = connection {
-            let mut send = conn.open_uni().await?;
-            let priority = if is_keyframe(data) { 50 } else { 30 };
-            send.set_priority(priority)?;
-            send.write_all(&[STREAM_VIDEO]).await?;
-            let mut payload = Vec::with_capacity(8 + data.len());
-            payload.extend_from_slice(&timestamp.to_be_bytes());
-            payload.extend_from_slice(data);
-            crate::messages::write_framed(&mut send, &payload).await?;
-            send.finish()?;
+    pub async fn request_peer_keyframe(&self, peer_id: &str, layer: VideoLayerRequest) {
+        let peers = self.peers.lock().await;
+        if let Some(peer) = peers.get(peer_id) {
+            let requested = layer.to_u8();
+            if requested < 2 {
+                peer.pending_keyframe.store(true, Ordering::Relaxed);
+            }
         }
-        Ok(())
     }
 
     pub async fn send_chat(&self, peer_id: &str, message: &str) -> Result<()> {
@@ -385,13 +718,87 @@ impl ConnectionManager {
             let peers = self.peers.lock().await;
             peers.get(peer_id).map(|p| p.chat_send.clone())
         };
-        if let Some(s) = stream {
-            let mut guard = s.lock().await;
-            if let Some(ref mut send) = *guard {
-                crate::messages::write_framed(send, message.as_bytes()).await?;
-            }
+        let Some(s) = stream else {
+            anyhow::bail!("Peer {peer_id} is not connected");
+        };
+
+        let mut guard = s.lock().await;
+        if let Some(ref mut send) = *guard {
+            crate::messages::write_framed(send, message.as_bytes()).await?;
+        } else {
+            anyhow::bail!("Chat stream for peer {peer_id} is unavailable");
         }
         Ok(())
+    }
+
+    pub async fn send_chat_to_all(&self, message: &str) -> Vec<String> {
+        let streams: Vec<(String, Arc<Mutex<Option<SendStream>>>)> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .map(|(peer_id, peer)| (peer_id.clone(), peer.chat_send.clone()))
+                .collect()
+        };
+
+        let mut failed = Vec::new();
+        for (peer_id, stream) in streams {
+            let mut guard = stream.lock().await;
+            let result = if let Some(ref mut send) = *guard {
+                crate::messages::write_framed(send, message.as_bytes()).await
+            } else {
+                failed.push(peer_id);
+                continue;
+            };
+
+            if result.is_err() {
+                failed.push(peer_id);
+            }
+        }
+
+        failed
+    }
+
+    pub async fn send_heartbeat_to_all(&self) {
+        let peer_ids: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers.keys().cloned().collect()
+        };
+
+        for peer_id in peer_ids {
+            let _ = self.send_control(&peer_id, &ControlAction::Heartbeat).await;
+        }
+    }
+
+    pub async fn prune_stale_peers(&self, max_idle_ms: u64) {
+        let now = Self::current_timestamp_ms();
+        let stale_peer_ids: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .filter_map(|(peer_id, peer)| {
+                    let idle_ms = now.saturating_sub(peer.last_activity_ms.load(Ordering::Relaxed));
+                    if idle_ms > max_idle_ms {
+                        Some(peer_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        for peer_id in stale_peer_ids {
+            tracing::info!("Pruning stale peer {peer_id} after inactivity timeout");
+            Self::cleanup_peer_internal(
+                &peer_id,
+                &self.peers,
+                &self.peer_tickets,
+                &self.audio_sequences,
+                &self.video_receive_state,
+                &self.event_tx,
+                Some(b"peer timeout"),
+            )
+            .await;
+        }
     }
 
     pub async fn send_control(&self, peer_id: &str, action: &ControlAction) -> Result<()> {
@@ -400,28 +807,196 @@ impl ConnectionManager {
             let peers = self.peers.lock().await;
             peers.get(peer_id).map(|p| p.control_send.clone())
         };
-        if let Some(s) = stream {
-            let mut guard = s.lock().await;
-            if let Some(ref mut send) = *guard {
-                crate::messages::write_framed(send, &data).await?;
-            }
+        let Some(s) = stream else {
+            anyhow::bail!("Peer {peer_id} is not connected");
+        };
+
+        let mut guard = s.lock().await;
+        if let Some(ref mut send) = *guard {
+            crate::messages::write_framed(send, &data).await?;
+        } else {
+            anyhow::bail!("Control stream for peer {peer_id} is unavailable");
         }
         Ok(())
+    }
+
+    pub async fn snapshot_network_stats(&self) -> Vec<NetworkPeerStats> {
+        let peers = self.peers.lock().await;
+        let video_state = self.video_receive_state.lock().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        peers
+            .iter()
+            .map(|(peer_id, peer)| {
+                let mut paths = peer.connection.paths();
+                let _ = paths.update();
+                let path_list = paths.peek().clone();
+                let path_stats = path_list
+                    .iter()
+                    .find(|path| path.is_selected() && !path.is_closed())
+                    .or_else(|| path_list.iter().find(|path| !path.is_closed()))
+                    .and_then(|path| path.stats());
+
+                let rtt_ms = path_stats
+                    .map(|path| path.rtt.as_millis() as u64)
+                    .or_else(|| {
+                        peer.connection
+                            .rtt(PathId::ZERO)
+                            .map(|rtt| rtt.as_millis() as u64)
+                    })
+                    .unwrap_or_default();
+                let lost_packets = path_stats.map(|path| path.lost_packets).unwrap_or_default();
+                let lost_bytes = path_stats.map(|path| path.lost_bytes).unwrap_or_default();
+                let latest_video_age_ms = video_state
+                    .get(peer_id)
+                    .map(|state| state.last_received.elapsed().as_millis() as u64)
+                    .unwrap_or_default();
+
+                NetworkPeerStats {
+                    peer_id: peer_id.clone(),
+                    rtt_ms,
+                    lost_packets,
+                    lost_bytes,
+                    datagram_send_buffer_space: peer.connection.datagram_send_buffer_space(),
+                    latest_video_age_ms,
+                }
+            })
+            .collect()
     }
 
     pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
-        let mut peers = self.peers.lock().await;
-        if let Some(peer) = peers.remove(peer_id) {
-            peer.connection.close(0u32.into(), b"call ended");
-            let _ = self.event_tx.send(Event::PeerDisconnected {
-                peer_id: peer_id.to_string(),
-            });
-        }
+        Self::cleanup_peer_internal(
+            peer_id,
+            &self.peers,
+            &self.peer_tickets,
+            &self.audio_sequences,
+            &self.video_receive_state,
+            &self.event_tx,
+            Some(b"call ended"),
+        )
+        .await;
         Ok(())
     }
+}
 
-    pub async fn connected_peers(&self) -> Vec<String> {
-        let peers = self.peers.lock().await;
-        peers.keys().cloned().collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use iroh::protocol::Router;
+    use tokio::time::timeout;
+
+    use crate::node;
+    use crate::protocol::NafaqProtocol;
+
+    #[tokio::test]
+    async fn emits_single_disconnect_when_remote_endpoint_closes() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(ConnectionManager::new(
+            event_tx_a.clone(),
+            audio_tx_a,
+            video_tx_a,
+        ));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = Arc::new(ConnectionManager::new(event_tx_b, audio_tx_b, video_tx_b));
+
+        let endpoint_a = node::create_endpoint().await.unwrap();
+        let endpoint_b = node::create_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        let mut rx_a = event_tx_a.subscribe();
+        let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
+            .unwrap()
+            .endpoint_addr()
+            .clone();
+
+        mgr_b.connect_to_peer(&endpoint_b, addr_a).await.unwrap();
+
+        let connected_peer = timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::PeerConnected { peer_id }) => break peer_id,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        endpoint_b.close().await;
+
+        let disconnected_peer = timeout(Duration::from_secs(15), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id }) => break peer_id,
+                    Ok(_) => {}
+                    Err(_) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(disconnected_peer, connected_peer);
+
+        let second_disconnect = timeout(Duration::from_millis(750), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id }) => break Some(peer_id),
+                    Ok(_) => {}
+                    Err(_) => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            second_disconnect.is_err(),
+            "received duplicate disconnect event"
+        );
+
+        router_a.shutdown().await.ok();
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn video_queue_keeps_pending_keyframe_over_newer_delta_frame() {
+        let writer = PeerVideoWriter::new();
+
+        writer
+            .enqueue_latest(PendingVideoFrame {
+                timestamp_ms: 1,
+                payload: vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88],
+                is_keyframe: true,
+            })
+            .await;
+
+        writer
+            .enqueue_latest(PendingVideoFrame {
+                timestamp_ms: 2,
+                payload: vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x88],
+                is_keyframe: false,
+            })
+            .await;
+
+        let pending = writer.pending.lock().await.clone().expect("pending frame");
+        assert!(pending.is_keyframe);
+        assert_eq!(pending.timestamp_ms, 1);
     }
 }
