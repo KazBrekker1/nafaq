@@ -11,6 +11,7 @@ const error = ref<string | null>(null);
 const peers = ref<string[]>([]);
 const displayName = ref("");
 const peerNames = ref<Record<string, string>>({});
+const connectionProgress = ref<"idle" | "starting-node" | "node-ready" | "connecting" | "securing" | "connected">("idle");
 
 let initialized = false;
 
@@ -40,13 +41,17 @@ export function useCall() {
     error.value = null;
     state.value = "joining";
     ticket.value = t;
+    connectionProgress.value = "connecting";
     try {
       const { invoke } = await import("@tauri-apps/api/core");
+      connectionProgress.value = "securing";
       await invoke("join_call", { ticket: t });
-      navigateTo("/lobby");
+      connectionProgress.value = "connected";
+      // Don't navigate — show pre-call overlay on index page (Task 6 will handle this)
     } catch (e) {
       error.value = `Failed to join: ${e}`;
       state.value = "idle";
+      connectionProgress.value = "node-ready";
     }
   }
 
@@ -76,6 +81,7 @@ export function useCall() {
     error,
     displayName,
     peerNames,
+    connectionProgress,
     createCall,
     joinCall,
     endCall,
@@ -90,16 +96,19 @@ async function initCallListeners() {
     // Get initial node info (retry if Iroh still initializing)
     let retries = 0;
     async function fetchNodeInfo() {
+      connectionProgress.value = "starting-node";
       try {
         const info = await invoke<{ id: string; ticket: string }>("get_node_info");
         nodeId.value = info.id;
         shareTicket.value = info.ticket;
         nodeReady.value = true;
+        connectionProgress.value = "node-ready";
       } catch {
         if (++retries < 15) {
           setTimeout(fetchNodeInfo, 2000);
         } else {
-          error.value = "Failed to connect to Iroh after 30s";
+          error.value = "Could not start — check your network";
+          connectionProgress.value = "idle";
         }
       }
     }

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const call = useCall();
-const { state, ticket, nodeId, nodeReady, error, displayName, createCall, joinCall } = call;
+const { state, ticket, nodeId, nodeReady, error, displayName, connectionProgress, createCall, joinCall } = call;
 const hasName = computed(() => displayName.value.trim().length > 0);
 </script>
 
@@ -13,11 +13,8 @@ const hasName = computed(() => displayName.value.trim().length > 0);
       </div>
 
       <div class="flex items-center justify-center gap-2 mb-6 sm:mb-8">
-        <div class="w-2 h-2" :style="{ background: nodeReady ? 'var(--color-accent)' : 'var(--color-danger)' }" />
-        <span class="text-xs text-[var(--color-muted)]">
-          {{ nodeReady ? "Connected" : "Connecting..." }}
-        </span>
-        <span v-if="nodeId" class="text-xs text-[var(--color-muted)]">
+        <ConnectionProgress :step="connectionProgress" />
+        <span v-if="nodeId && connectionProgress === 'node-ready'" class="text-xs text-[var(--color-muted)]">
           · {{ nodeId.slice(0, 12) }}...
         </span>
       </div>
