@@ -157,6 +157,26 @@ impl ConnectionManager {
         }
     }
 
+    fn emit_quality_profile_if_changed(
+        old_count: usize,
+        new_count: usize,
+        event_tx: &broadcast::Sender<Event>,
+    ) {
+        let old_profile = Self::quality_profile_for_peers(old_count);
+        let new_profile = Self::quality_profile_for_peers(new_count);
+        if old_profile == new_profile {
+            return;
+        }
+        let (bitrate, fps, w, h) = new_profile;
+        let _ = event_tx.send(Event::QualityProfileChanged {
+            peer_count: new_count,
+            bitrate_bps: bitrate,
+            fps,
+            max_width: w,
+            max_height: h,
+        });
+    }
+
     pub async fn handle_incoming(&self, connection: Connection) -> Result<()> {
         let peer_id = connection.remote_id().to_string();
         tracing::info!("Setting up incoming connection from {peer_id}");
@@ -198,10 +218,12 @@ impl ConnectionManager {
 
         let video_writer = peer_conn.video_writer.clone();
 
-        {
+        let (old_count, new_count) = {
             let mut peers = self.peers.lock().await;
+            let old = peers.len();
             peers.insert(peer_id.clone(), peer_conn);
-        }
+            (old, peers.len())
+        };
 
         Self::spawn_video_writer(peer_id.clone(), connection.clone(), video_writer);
 
@@ -209,18 +231,7 @@ impl ConnectionManager {
             peer_id: peer_id.clone(),
         });
 
-        // Emit quality profile after peer count changes
-        {
-            let count = self.peers.lock().await.len();
-            let (bitrate, fps, w, h) = Self::quality_profile_for_peers(count);
-            let _ = self.event_tx.send(Event::QualityProfileChanged {
-                peer_count: count,
-                bitrate_bps: bitrate,
-                fps,
-                max_width: w,
-                max_height: h,
-            });
-        }
+        Self::emit_quality_profile_if_changed(old_count, new_count, &self.event_tx);
 
         self.spawn_stream_receivers(peer_id.clone(), connection);
 
@@ -267,9 +278,11 @@ impl ConnectionManager {
         event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
     ) -> bool {
-        let removed = {
+        let (removed, old_count, new_count) = {
             let mut peers = peers.lock().await;
-            peers.remove(peer_id)
+            let old = peers.len();
+            let removed = peers.remove(peer_id);
+            (removed, old, peers.len())
         };
 
         let Some(peer) = removed else {
@@ -287,16 +300,7 @@ impl ConnectionManager {
             peer_id: peer_id.to_string(),
         });
 
-        // Emit quality profile after peer count changes
-        let count = peers.lock().await.len();
-        let (bitrate, fps, w, h) = ConnectionManager::quality_profile_for_peers(count);
-        let _ = event_tx.send(Event::QualityProfileChanged {
-            peer_count: count,
-            bitrate_bps: bitrate,
-            fps,
-            max_width: w,
-            max_height: h,
-        });
+        ConnectionManager::emit_quality_profile_if_changed(old_count, new_count, event_tx);
 
         true
     }

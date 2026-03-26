@@ -34,13 +34,17 @@ function onInput(value: string) {
   emit("update:modelValue", value);
 }
 
-// Persist name when it changes and pin is active
-watch(() => modelValue, async (name) => {
+// Debounced persist — avoids an IPC call on every keystroke
+let persistTimer: ReturnType<typeof setTimeout>;
+watch(() => modelValue, (name) => {
   if (!pinned.value || !loaded.value) return;
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_pinned_name", { name, pinned: true });
-  } catch {}
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("set_pinned_name", { name, pinned: true });
+    } catch {}
+  }, 400);
 });
 </script>
 

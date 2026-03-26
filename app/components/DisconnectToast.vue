@@ -1,10 +1,13 @@
 <script setup lang="ts">
 const { name } = defineProps<{ name: string }>();
 const visible = ref(true);
+let timer: ReturnType<typeof setTimeout>;
 
 onMounted(() => {
-  setTimeout(() => { visible.value = false; }, 3000);
+  timer = setTimeout(() => { visible.value = false; }, 3000);
 });
+
+onUnmounted(() => clearTimeout(timer));
 </script>
 
 <template>

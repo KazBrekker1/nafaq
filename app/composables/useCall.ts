@@ -50,7 +50,6 @@ export function useCall() {
       connectionProgress.value = "securing";
       await invoke("join_call", { ticket: t });
       connectionProgress.value = "connected";
-      // Don't navigate — show pre-call overlay on index page (Task 6 will handle this)
     } catch (e) {
       error.value = `Failed to join: ${e}`;
       state.value = "idle";
