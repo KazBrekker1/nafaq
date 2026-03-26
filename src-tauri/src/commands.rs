@@ -330,6 +330,23 @@ pub async fn reinit_video_encoder(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn reinit_video_encoder_with_config(
+    width: u32,
+    height: u32,
+    bitrate_bps: u32,
+    fps: f32,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_resolution(width, height)?;
+    *state.video_codec.encoder.lock().await =
+        Some(VideoEncoder::new_with_config(width, height, bitrate_bps, fps));
+    tracing::info!(
+        "Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps"
+    );
+    Ok(())
+}
+
 // ── Encode-once broadcast commands ──────────────────────────────────
 
 async fn encode_and_send_audio_all(

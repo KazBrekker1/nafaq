@@ -133,6 +133,7 @@ let unlistenAudio: (() => void) | null = null;
 let unlistenVideo: (() => void) | null = null;
 let unlistenDisconnect: (() => void) | null = null;
 let unlistenStats: (() => void) | null = null;
+let unlistenQuality: (() => void) | null = null;
 let stopQualityWatch: (() => void) | null = null;
 let activeSpeakerInterval: ReturnType<typeof setInterval> | null = null;
 let currentWidth = 640;
@@ -1060,6 +1061,31 @@ export function useMediaTransport() {
       updateConnectionQualityFromStats();
     });
 
+    unlistenQuality = await listen<{
+      peer_count: number;
+      bitrate_bps: number;
+      fps: number;
+      max_width: number;
+      max_height: number;
+    }>("quality-profile-changed", async (event) => {
+      const { bitrate_bps, fps, max_width, max_height } = event.payload;
+      targetFps = fps;
+      const { width, height } = resolveCaptureDimensions(activeCaptureStream, {
+        maxWidth: max_width,
+        maxHeight: max_height,
+      });
+      currentWidth = width;
+      currentHeight = height;
+      clearCaptureSurface();
+      const invoke = await invokePromise;
+      await invoke("reinit_video_encoder_with_config", {
+        width,
+        height,
+        bitrateBps: bitrate_bps,
+        fps: fps as number,
+      });
+    });
+
     stopQualityWatch = watch(connectionQuality, async (quality) => {
       targetFps = quality === "poor" ? 6 : quality === "degraded" ? 8 : (isAndroid ? 8 : 12);
       const { width, height } = resolveCaptureDimensions(activeCaptureStream);
@@ -1198,8 +1224,10 @@ export function useMediaTransport() {
 
     unlistenDisconnect?.();
     unlistenStats?.();
+    unlistenQuality?.();
     unlistenDisconnect = null;
     unlistenStats = null;
+    unlistenQuality = null;
     connectionQuality.value = "good";
 
     transportStatus.value = {

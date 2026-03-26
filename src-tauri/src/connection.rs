@@ -144,6 +144,19 @@ impl ConnectionManager {
         *self.endpoint.lock().await = Some(endpoint);
     }
 
+    pub async fn peer_count(&self) -> usize {
+        self.peers.lock().await.len()
+    }
+
+    pub fn quality_profile_for_peers(count: usize) -> (u32, u32, u32, u32) {
+        // Returns (bitrate_bps, fps, max_width, max_height)
+        match count {
+            0..=2 => (400_000, 12, 640, 360),
+            3 => (250_000, 10, 480, 270),
+            _ => (150_000, 8, 320, 180),
+        }
+    }
+
     pub async fn handle_incoming(&self, connection: Connection) -> Result<()> {
         let peer_id = connection.remote_id().to_string();
         tracing::info!("Setting up incoming connection from {peer_id}");
@@ -195,6 +208,19 @@ impl ConnectionManager {
         let _ = self.event_tx.send(Event::PeerConnected {
             peer_id: peer_id.clone(),
         });
+
+        // Emit quality profile after peer count changes
+        {
+            let count = self.peers.lock().await.len();
+            let (bitrate, fps, w, h) = Self::quality_profile_for_peers(count);
+            let _ = self.event_tx.send(Event::QualityProfileChanged {
+                peer_count: count,
+                bitrate_bps: bitrate,
+                fps,
+                max_width: w,
+                max_height: h,
+            });
+        }
 
         self.spawn_stream_receivers(peer_id.clone(), connection);
 
@@ -260,6 +286,18 @@ impl ConnectionManager {
         let _ = event_tx.send(Event::PeerDisconnected {
             peer_id: peer_id.to_string(),
         });
+
+        // Emit quality profile after peer count changes
+        let count = peers.lock().await.len();
+        let (bitrate, fps, w, h) = ConnectionManager::quality_profile_for_peers(count);
+        let _ = event_tx.send(Event::QualityProfileChanged {
+            peer_count: count,
+            bitrate_bps: bitrate,
+            fps,
+            max_width: w,
+            max_height: h,
+        });
+
         true
     }
 

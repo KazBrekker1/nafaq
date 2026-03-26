@@ -161,6 +161,13 @@ pub enum Event {
     Error {
         message: String,
     },
+    QualityProfileChanged {
+        peer_count: usize,
+        bitrate_bps: u32,
+        fps: u32,
+        max_width: u32,
+        max_height: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

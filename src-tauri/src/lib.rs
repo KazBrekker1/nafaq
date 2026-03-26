@@ -162,6 +162,7 @@ pub fn run() {
                                 Event::ControlReceived { .. } => "control-received",
                                 Event::ConnectionStatus { .. } => "connection-status",
                                 Event::Error { .. } => "nafaq-error",
+                                Event::QualityProfileChanged { .. } => "quality-profile-changed",
                                 Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);
@@ -440,6 +441,7 @@ pub fn run() {
             commands::init_codecs,
             commands::destroy_codecs,
             commands::reinit_video_encoder,
+            commands::reinit_video_encoder_with_config,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
