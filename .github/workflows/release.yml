@@ -119,6 +119,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "-"
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         with:
           tagName: ${{ needs.create-release.outputs.tag }}
           releaseName: Nafaq v${{ needs.create-release.outputs.version }}
@@ -206,6 +207,8 @@ jobs:
 
       - name: Build Android APK (release)
         run: bun run tauri android build
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
       - name: Upload Android artifacts to release
         env:
