@@ -47,12 +47,10 @@ export function useChat() {
   }
 
   async function sendMessageToAll(peerIds: string[], text: string) {
-    if (!text.trim()) return;
+    if (!text.trim() || peerIds.length === 0) return;
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      for (const peerId of peerIds) {
-        await invoke("send_chat", { peerId, message: text });
-      }
+      await Promise.all(peerIds.map((pid) => invoke("send_chat", { peerId: pid, message: text })));
       messages.value.push({
         id: crypto.randomUUID(),
         sender: "you",

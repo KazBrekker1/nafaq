@@ -105,10 +105,9 @@ function detectKeyframe(nalus: Uint8Array): boolean {
 }
 
 function resolveCaptureDimensions(stream?: MediaStream | null) {
-  const isMobile = /android/i.test(navigator.userAgent);
   const videoTrack = stream?.getVideoTracks()[0];
-  const maxW = isMobile ? 320 : 640;
-  const maxH = isMobile ? 240 : 480;
+  const maxW = isAndroid ? 320 : 640;
+  const maxH = isAndroid ? 240 : 480;
   return {
     width: videoTrack
       ? Math.min(videoTrack.getSettings().width || maxW, maxW)
@@ -212,19 +211,17 @@ export function useMediaTransport() {
             }
             const pcmBytes = new Uint8Array(pcm.buffer);
             const ts = Date.now();
-            for (const pid of getPeerIds()) {
-              if (isAndroid) {
-                invoke("send_audio", {
-                  peerId: pid,
-                  data: toBase64(pcmBytes),
-                  timestamp: ts,
-                }).catch(() => {});
+            const b64 = isAndroid ? toBase64(pcmBytes) : null;
+            const pids = getPeerIds();
+            pids.forEach((pid) => {
+              if (b64) {
+                invoke("send_audio", { peerId: pid, data: b64, timestamp: ts }).catch(() => {});
               } else {
                 invoke("send_audio", packAudioPayload(pid, ts, pcmBytes), {
                   headers: { "Content-Type": "application/octet-stream" },
                 }).catch(() => {});
               }
-            }
+            });
             bufferOffset = 0;
           }
         }
@@ -265,17 +262,19 @@ export function useMediaTransport() {
           vFrameCount++;
           const rgba = new Uint8Array(imageData.data.buffer);
           const ts = Date.now();
-          for (const pid of getPeerIds()) {
-            if (isAndroid) {
+          const b64 = isAndroid ? toBase64(rgba) : null;
+          const pids = getPeerIds();
+          pids.forEach((pid) => {
+            if (b64) {
               invoke("send_video", {
-                peerId: pid, data: toBase64(rgba), width, height, keyframe, timestamp: ts,
+                peerId: pid, data: b64, width, height, keyframe, timestamp: ts,
               }).catch(() => {});
             } else {
               invoke("send_video", packVideoPayload(pid, width, height, keyframe, ts, rgba), {
                 headers: { "Content-Type": "application/octet-stream" },
               }).catch(() => {});
             }
-          }
+          });
         }
         if (captureVideoEl && "requestVideoFrameCallback" in captureVideoEl) {
           captureVideoEl.requestVideoFrameCallback(captureLoop);
