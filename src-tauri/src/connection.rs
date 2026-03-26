@@ -19,6 +19,8 @@ struct PeerConnection {
 
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
+    endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
+    peer_tickets: Arc<Mutex<HashMap<String, String>>>,
     event_tx: broadcast::Sender<Event>,
     audio_media_tx: broadcast::Sender<MediaPacket>,
     video_watch_tx: watch::Sender<Option<MediaPacket>>,
@@ -38,10 +40,17 @@ impl ConnectionManager {
     ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
+            endpoint: Arc::new(Mutex::new(None)),
+            peer_tickets: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audio_media_tx,
             video_watch_tx,
         }
+    }
+
+    /// Store endpoint reference so we can generate tickets and auto-connect on PeerAnnounce.
+    pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
+        *self.endpoint.lock().await = Some(endpoint);
     }
 
     pub async fn handle_incoming(&self, connection: Connection) -> Result<()> {
@@ -94,8 +103,99 @@ impl ConnectionManager {
             peer_id: peer_id.clone(),
         });
 
-        self.spawn_stream_receivers(peer_id, connection);
+        self.spawn_stream_receivers(peer_id.clone(), connection);
+
+        // --- Mesh formation ---
+        // 1. Send our own ticket to the new peer
+        // 2. Send all stored peer tickets to the new peer (so they can connect to everyone)
+        let endpoint_guard = self.endpoint.lock().await;
+        if let Some(endpoint) = endpoint_guard.as_ref() {
+            let own_ticket = crate::node::generate_ticket(endpoint);
+            let own_id = endpoint.id().to_string();
+            drop(endpoint_guard); // release lock before async send_control
+
+            let announce_self = ControlAction::PeerAnnounce {
+                peer_id: own_id,
+                ticket: own_ticket,
+            };
+            let _ = self.send_control(&peer_id, &announce_self).await;
+
+            // Send all known peer tickets to the new peer
+            let stored_tickets: Vec<(String, String)> = {
+                let tickets = self.peer_tickets.lock().await;
+                tickets.iter()
+                    .filter(|(id, _)| **id != peer_id)
+                    .map(|(id, t)| (id.clone(), t.clone()))
+                    .collect()
+            };
+            for (stored_id, stored_ticket) in stored_tickets {
+                let announce = ControlAction::PeerAnnounce {
+                    peer_id: stored_id,
+                    ticket: stored_ticket,
+                };
+                let _ = self.send_control(&peer_id, &announce).await;
+            }
+        } else {
+            drop(endpoint_guard);
+        }
+
         Ok(())
+    }
+
+    /// Handle a PeerAnnounce control message: store ticket, auto-connect if needed, relay to others.
+    pub async fn handle_peer_announce(&self, sender_id: &str, announced_peer_id: String, ticket: String) {
+        // Ignore announcements about ourselves
+        let is_self = {
+            let guard = self.endpoint.lock().await;
+            guard.as_ref().map_or(false, |ep| announced_peer_id == ep.id().to_string())
+        };
+        if is_self { return; }
+
+        // Store ticket — only proceed if this is a NEW peer we didn't know about
+        let is_new = {
+            let mut tickets = self.peer_tickets.lock().await;
+            if tickets.contains_key(&announced_peer_id) {
+                false
+            } else {
+                tickets.insert(announced_peer_id.clone(), ticket.clone());
+                true
+            }
+        };
+        if !is_new { return; }
+
+        // Auto-connect if not already connected
+        let already_connected = self.peers.lock().await.contains_key(&announced_peer_id);
+        if !already_connected {
+            let endpoint = self.endpoint.lock().await.clone();
+            if let Some(ep) = endpoint {
+                match crate::node::parse_ticket(&ticket) {
+                    Ok(endpoint_ticket) => {
+                        let addr = endpoint_ticket.endpoint_addr().clone();
+                        match self.connect_to_peer(&ep, addr).await {
+                            Ok(_) => tracing::info!("Mesh: auto-connected to announced peer {announced_peer_id}"),
+                            Err(e) => tracing::warn!("Mesh: failed to auto-connect to {announced_peer_id}: {e}"),
+                        }
+                    }
+                    Err(e) => tracing::warn!("Mesh: invalid ticket for {announced_peer_id}: {e}"),
+                }
+            }
+        }
+
+        // Relay this announcement to all connected peers except sender and the announced peer
+        let relay_targets: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers.keys()
+                .filter(|id| *id != sender_id && *id != &announced_peer_id)
+                .cloned()
+                .collect()
+        };
+        for target_id in relay_targets {
+            let announce = ControlAction::PeerAnnounce {
+                peer_id: announced_peer_id.clone(),
+                ticket: ticket.clone(),
+            };
+            let _ = self.send_control(&target_id, &announce).await;
+        }
     }
 
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {

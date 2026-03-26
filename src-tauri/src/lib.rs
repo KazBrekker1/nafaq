@@ -62,6 +62,9 @@ pub fn run() {
         let endpoint = node::create_endpoint().await.expect("Failed to create Iroh endpoint");
         tracing::info!("Node ID: {}", endpoint.id());
 
+        // Give connection manager a reference to the endpoint for mesh formation
+        conn_manager.set_endpoint(endpoint.clone()).await;
+
         let router = Router::builder(endpoint.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(conn_manager.clone()))
             .spawn();
@@ -112,6 +115,25 @@ pub fn run() {
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Event forwarder lagged by {n} messages");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            // Spawn PeerAnnounce handler for automatic mesh formation
+            let conn_manager_for_mesh = conn_manager.clone();
+            let mut mesh_rx = event_tx.subscribe();
+
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    match mesh_rx.recv().await {
+                        Ok(Event::ControlReceived { peer_id, action: messages::ControlAction::PeerAnnounce { peer_id: announced_id, ticket } }) => {
+                            conn_manager_for_mesh.handle_peer_announce(&peer_id, announced_id, ticket).await;
+                        }
+                        Ok(_) => {} // ignore other events
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("Mesh handler lagged by {n} events");
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
