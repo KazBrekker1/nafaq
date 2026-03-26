@@ -70,7 +70,7 @@ defineShortcuts({
 });
 
 onMounted(async () => {
-  if (call.state.value !== "connected") {
+  if (call.state.value !== "connected" || call.peers.value.length === 0) {
     navigateTo("/");
     return;
   }

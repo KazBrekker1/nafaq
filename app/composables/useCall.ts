@@ -12,6 +12,7 @@ const peers = ref<string[]>([]);
 const displayName = ref("");
 const peerNames = ref<Record<string, string>>({});
 const connectionProgress = ref<"idle" | "starting-node" | "node-ready" | "connecting" | "securing" | "connected">("idle");
+const showPreCallOverlay = ref(false);
 
 let initialized = false;
 
@@ -67,7 +68,13 @@ export function useCall() {
     peers.value = [];
     peerNames.value = {};
     ticket.value = null;
+    showPreCallOverlay.value = false;
     navigateTo("/");
+  }
+
+  function joinCallFromOverlay() {
+    showPreCallOverlay.value = false;
+    navigateTo("/call");
   }
 
   return {
@@ -82,9 +89,11 @@ export function useCall() {
     displayName,
     peerNames,
     connectionProgress,
+    showPreCallOverlay,
     createCall,
     joinCall,
     endCall,
+    joinCallFromOverlay,
   };
 }
 
@@ -129,7 +138,8 @@ async function initCallListeners() {
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
       }
-      navigateTo("/call");
+      // Show pre-call overlay instead of auto-navigating
+      showPreCallOverlay.value = true;
     });
 
     listen<any>("peer-disconnected", (event) => {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const call = useCall();
-const { state, ticket, nodeId, nodeReady, error, displayName, connectionProgress, createCall, joinCall } = call;
+const { state, ticket, nodeId, nodeReady, error, displayName, connectionProgress, showPreCallOverlay, createCall, joinCall, endCall, joinCallFromOverlay } = call;
 const hasName = computed(() => displayName.value.trim().length > 0);
 </script>
 
@@ -41,5 +41,11 @@ const hasName = computed(() => displayName.value.trim().length > 0);
         <p class="text-[10px] sm:text-xs text-[var(--color-muted)] mt-1 break-all">{{ nodeId || "Initializing Iroh..." }}</p>
       </div>
     </div>
+
+    <PreCallOverlay
+      v-model:open="showPreCallOverlay"
+      @join="joinCallFromOverlay"
+      @cancel="endCall"
+    />
   </div>
 </template>
