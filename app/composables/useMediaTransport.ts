@@ -149,7 +149,7 @@ export function useMediaTransport() {
     });
   }
 
-  async function startSending(stream: MediaStream, peerId: string) {
+  async function startSending(stream: MediaStream, getPeerIds: () => string[]) {
     if (encoding.value) return;
     encoding.value = true;
 
@@ -211,16 +211,19 @@ export function useMediaTransport() {
               );
             }
             const pcmBytes = new Uint8Array(pcm.buffer);
-            if (isAndroid) {
-              invoke("send_audio", {
-                peerId,
-                data: toBase64(pcmBytes),
-                timestamp: Date.now(),
-              }).catch(() => {});
-            } else {
-              invoke("send_audio", packAudioPayload(peerId, Date.now(), pcmBytes), {
-                headers: { "Content-Type": "application/octet-stream" },
-              }).catch(() => {});
+            const ts = Date.now();
+            for (const pid of getPeerIds()) {
+              if (isAndroid) {
+                invoke("send_audio", {
+                  peerId: pid,
+                  data: toBase64(pcmBytes),
+                  timestamp: ts,
+                }).catch(() => {});
+              } else {
+                invoke("send_audio", packAudioPayload(pid, ts, pcmBytes), {
+                  headers: { "Content-Type": "application/octet-stream" },
+                }).catch(() => {});
+              }
             }
             bufferOffset = 0;
           }
@@ -261,14 +264,17 @@ export function useMediaTransport() {
           const keyframe = vFrameCount === 0 || vFrameCount % 30 === 0;
           vFrameCount++;
           const rgba = new Uint8Array(imageData.data.buffer);
-          if (isAndroid) {
-            invoke("send_video", {
-              peerId, data: toBase64(rgba), width, height, keyframe, timestamp: Date.now(),
-            }).catch(() => {});
-          } else {
-            invoke("send_video", packVideoPayload(peerId, width, height, keyframe, Date.now(), rgba), {
-              headers: { "Content-Type": "application/octet-stream" },
-            }).catch(() => {});
+          const ts = Date.now();
+          for (const pid of getPeerIds()) {
+            if (isAndroid) {
+              invoke("send_video", {
+                peerId: pid, data: toBase64(rgba), width, height, keyframe, timestamp: ts,
+              }).catch(() => {});
+            } else {
+              invoke("send_video", packVideoPayload(pid, width, height, keyframe, ts, rgba), {
+                headers: { "Content-Type": "application/octet-stream" },
+              }).catch(() => {});
+            }
           }
         }
         if (captureVideoEl && "requestVideoFrameCallback" in captureVideoEl) {
@@ -340,7 +346,7 @@ export function useMediaTransport() {
       if (videoDecoder && videoDecoder.state === "configured") {
         const bytes = fromBase64(event.payload.data);
         const isKf = detectKeyframe(bytes);
-        if (videoDecoder.decodeQueueSize > 2) return;
+        if (videoDecoder.decodeQueueSize > 10) return;
         const chunk = new EncodedVideoChunk({
           type: isKf ? "key" : "delta",
           timestamp: event.payload.timestamp * 1000,
@@ -391,10 +397,10 @@ export function useMediaTransport() {
     if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
   }
 
-  async function restartSending(newStream: MediaStream, peerId: string) {
+  async function restartSending(newStream: MediaStream, getPeerIds: () => string[]) {
     teardownCapture();
     await initCodecs(newStream);
-    await startSending(newStream, peerId);
+    await startSending(newStream, getPeerIds);
   }
 
   // Adaptive jitter buffer

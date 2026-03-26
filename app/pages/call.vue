@@ -8,6 +8,8 @@ const chatOpen = ref(true);
 const callDuration = ref("0:00");
 const localVideoEl = ref<HTMLVideoElement | null>(null);
 const remoteCanvasEl = ref<HTMLCanvasElement | null>(null);
+const videoContainer = ref<HTMLElement | null>(null);
+const isFullscreen = ref(false);
 let durationInterval: ReturnType<typeof setInterval> | null = null;
 let cleaned = false;
 
@@ -19,6 +21,26 @@ async function cleanup() {
   media.stopPreview();
 }
 
+function toggleFullscreen() {
+  if (!videoContainer.value) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    videoContainer.value.requestFullscreen();
+  }
+}
+
+function onFullscreenChange() {
+  isFullscreen.value = !!document.fullscreenElement;
+}
+
+defineShortcuts({
+  m: () => media.toggleAudio(),
+  v: () => media.toggleVideo(),
+  c: () => { chatOpen.value = !chatOpen.value; },
+  f: () => toggleFullscreen(),
+});
+
 onMounted(async () => {
   if (call.state.value !== "connected") {
     navigateTo("/");
@@ -27,9 +49,13 @@ onMounted(async () => {
 
   if (!media.localStream.value) await media.startPreview();
 
-  // Start sending media to peer
-  if (media.localStream.value && call.peerId.value) {
-    transport.startSending(media.localStream.value, call.peerId.value);
+  // Always initialize codecs — the decoder is needed for incoming media
+  // even when the local camera is unavailable
+  await transport.initCodecs(media.localStream.value);
+
+  // Start sending media to all connected peers
+  if (media.localStream.value && call.peers.value.length > 0) {
+    transport.startSending(media.localStream.value, () => call.peers.value);
   }
 
   const startTime = Date.now();
@@ -39,19 +65,37 @@ onMounted(async () => {
     const secs = elapsed % 60;
     callDuration.value = `${mins}:${secs.toString().padStart(2, "0")}`;
   }, 1000);
+
+  document.addEventListener("fullscreenchange", onFullscreenChange);
 });
 
-// Bind local video when stream or element becomes available
 watch([() => media.localStream.value, localVideoEl], ([stream, el]) => {
   if (el) el.srcObject = stream || null;
 }, { immediate: true });
 
-// Start receiving when remote canvas is available
 watch(remoteCanvasEl, (canvas) => {
   if (canvas) transport.startReceiving(canvas);
 });
 
-onUnmounted(() => { cleanup(); });
+// Restart transport when device is switched mid-call.
+// stopPreview() nullifies the stream before startPreview() sets the new one,
+// so we can't rely on oldStream — just check if we were actively encoding.
+let wasEncoding = false;
+watch(() => media.localStream.value, async (newStream) => {
+  if (!newStream) {
+    wasEncoding = transport.encoding.value;
+    return;
+  }
+  if (wasEncoding && call.peers.value.length > 0) {
+    wasEncoding = false;
+    await transport.restartSending(newStream, () => call.peers.value);
+  }
+});
+
+onUnmounted(() => {
+  cleanup();
+  document.removeEventListener("fullscreenchange", onFullscreenChange);
+});
 
 function handleEndCall() {
   cleanup();
@@ -60,7 +104,7 @@ function handleEndCall() {
 }
 
 function handleSendChat(text: string) {
-  if (call.peerId.value) chat.sendMessage(call.peerId.value, text);
+  if (call.peers.value.length > 0) chat.sendMessageToAll(call.peers.value, text);
 }
 </script>
 
@@ -75,16 +119,29 @@ function handleSendChat(text: string) {
             {{ call.peers.value.length }} peer{{ call.peers.value.length !== 1 ? "s" : "" }}
           </span>
         </div>
-        <div class="flex items-center gap-2">
-          <div class="w-2 h-2 bg-[var(--color-accent)]" />
-          <span class="text-[10px] text-[var(--color-accent)] tracking-widest font-bold">P2P Direct</span>
+        <div class="flex items-center gap-3">
+          <CallConnectionQuality :quality="transport.connectionQuality.value" />
+          <span class="text-[10px] text-[var(--color-accent)] tracking-widest font-bold">P2P</span>
+          <UTooltip text="Fullscreen" :kbds="['F']">
+            <button class="text-[var(--color-muted)] hover:text-white transition-colors" @click="toggleFullscreen">
+              <UIcon
+                :name="isFullscreen ? 'i-heroicons-arrows-pointing-in' : 'i-heroicons-arrows-pointing-out'"
+                class="text-sm"
+              />
+            </button>
+          </UTooltip>
         </div>
       </div>
 
       <!-- Video area -->
-      <div class="flex-1 relative flex items-center justify-center">
+      <div ref="videoContainer" class="flex-1 relative flex items-center justify-center">
         <!-- Remote video -->
-        <canvas ref="remoteCanvasEl" class="w-full h-full object-contain absolute inset-0" />
+        <canvas
+          ref="remoteCanvasEl"
+          class="w-full h-full object-contain absolute inset-0 border-2 border-transparent transition-all duration-200"
+          :class="{ 'speaking-glow': transport.peerSpeaking.value }"
+          @dblclick="toggleFullscreen"
+        />
 
         <!-- Peer info overlay (shown when no remote video) -->
         <div class="text-center z-10">
@@ -98,6 +155,7 @@ function handleSendChat(text: string) {
         <!-- Self PiP -->
         <div class="absolute bottom-20 right-4 w-[200px] h-[130px] bg-[#111] border-2 border-[var(--color-border)] overflow-hidden z-10">
           <video ref="localVideoEl" autoplay muted playsinline class="w-full h-full object-cover" />
+          <CallSelfVideoOverlay :audio-muted="media.audioMuted.value" :video-muted="media.videoMuted.value" />
           <span class="absolute bottom-1 left-2 text-[9px] text-[var(--color-accent)] bg-black/70 px-2 py-0.5 font-bold tracking-wider">You</span>
         </div>
       </div>
@@ -118,10 +176,16 @@ function handleSendChat(text: string) {
           :audio-muted="media.audioMuted.value"
           :video-muted="media.videoMuted.value"
           :chat-open="chatOpen"
+          :microphones="media.microphones.value"
+          :cameras="media.cameras.value"
+          :selected-mic="media.selectedMic.value"
+          :selected-camera="media.selectedCamera.value"
           @toggle-audio="media.toggleAudio()"
           @toggle-video="media.toggleVideo()"
           @toggle-chat="chatOpen = !chatOpen"
           @end-call="handleEndCall"
+          @switch-mic="media.switchMic($event)"
+          @switch-camera="media.switchCamera($event)"
         />
       </div>
     </div>

@@ -46,7 +46,25 @@ export function useChat() {
     }
   }
 
+  async function sendMessageToAll(peerIds: string[], text: string) {
+    if (!text.trim()) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      for (const peerId of peerIds) {
+        await invoke("send_chat", { peerId, message: text });
+      }
+      messages.value.push({
+        id: crypto.randomUUID(),
+        sender: "you",
+        text,
+        timestamp: Date.now(),
+      });
+    } catch (e) {
+      console.error("Failed to send chat:", e);
+    }
+  }
+
   function clearMessages() { messages.value = []; }
 
-  return { messages, sendMessage, clearMessages };
+  return { messages, sendMessage, sendMessageToAll, clearMessages };
 }
