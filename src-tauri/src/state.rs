@@ -5,7 +5,7 @@ use tauri::ipc::Channel;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
-use crate::codec::CodecState;
+use crate::codec::{AudioCodecState, VideoCodecState};
 use crate::connection::ConnectionManager;
 use crate::messages::{AudioPacket, Event, MediaSessionProfile, VideoPacket};
 
@@ -29,5 +29,6 @@ pub struct AppState {
     pub event_tx: broadcast::Sender<Event>,
     pub audio_media_tx: broadcast::Sender<AudioPacket>,
     pub video_media_tx: broadcast::Sender<VideoPacket>,
-    pub codec: Arc<CodecState>,
+    pub audio_codec: Arc<AudioCodecState>,
+    pub video_codec: Arc<VideoCodecState>,
 }

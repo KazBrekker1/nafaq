@@ -301,19 +301,19 @@ pub async fn init_codecs(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.codec.audio_encoder.lock().await = Some(AudioEncoder::new());
+    *state.audio_codec.encoder.lock().await = Some(AudioEncoder::new());
     // Audio decoders are created per-peer on demand — no init needed
-    *state.codec.video_encoder.lock().await = Some(VideoEncoder::new(width, height));
+    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new(width, height));
     tracing::info!("Codecs initialized: {width}x{height}");
     Ok(())
 }
 
 #[tauri::command]
 pub async fn destroy_codecs(state: State<'_, AppState>) -> Result<(), String> {
-    *state.codec.audio_encoder.lock().await = None;
-    state.codec.audio_decoders.lock().await.clear();
-    *state.codec.video_encoder.lock().await = None;
-    state.codec.video_decoders.lock().await.clear();
+    *state.audio_codec.encoder.lock().await = None;
+    state.audio_codec.decoders.lock().await.clear();
+    *state.video_codec.encoder.lock().await = None;
+    state.video_codec.decoders.lock().await.clear();
     tracing::info!("Codecs destroyed");
     Ok(())
 }
@@ -325,7 +325,7 @@ pub async fn reinit_video_encoder(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.codec.video_encoder.lock().await = Some(VideoEncoder::new(width, height));
+    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new(width, height));
     tracing::info!("Video encoder reinitialized: {width}x{height}");
     Ok(())
 }
@@ -342,7 +342,7 @@ async fn encode_and_send_audio_all(
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
 
-    let mut codec = state.codec.audio_encoder.lock().await;
+    let mut codec = state.audio_codec.encoder.lock().await;
     let encoded = match codec.as_mut() {
         Some(c) => c.encode(&pcm),
         None => return Ok(()),
@@ -461,7 +461,7 @@ async fn encode_and_send_video_all(
     let force_keyframe = state.conn_manager.consume_pending_keyframe_requests().await;
 
     let encoded = {
-        let mut video = state.codec.video_encoder.lock().await;
+        let mut video = state.video_codec.encoder.lock().await;
         let encoder = match video.as_mut() {
             Some(encoder) => encoder,
             None => return Ok(()),

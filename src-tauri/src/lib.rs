@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine;
-use codec::{AudioDecoder, CodecState};
+use codec::{AudioDecoder, AudioCodecState, VideoCodecState};
 use connection::ConnectionManager;
 use iroh::protocol::Router;
 use messages::{AudioPacket, ControlAction, Event, VideoPacket};
@@ -114,7 +114,8 @@ pub fn run() {
         (endpoint, router)
     });
 
-    let codec = Arc::new(CodecState::new());
+    let audio_codec = Arc::new(AudioCodecState::new());
+    let video_codec = Arc::new(VideoCodecState::new());
     let media_bridge = MediaBridgeState::default();
 
     let app_state = AppState {
@@ -124,7 +125,8 @@ pub fn run() {
         event_tx: event_tx.clone(),
         audio_media_tx: audio_media_tx.clone(),
         video_media_tx: video_media_tx.clone(),
-        codec: codec.clone(),
+        audio_codec: audio_codec.clone(),
+        video_codec: video_codec.clone(),
     };
 
     let media_bridge_ref = media_bridge.current.clone();
@@ -215,7 +217,7 @@ pub fn run() {
 
             // Spawn audio forwarder with per-peer decoders.
             let app_handle_audio = app.handle().clone();
-            let codec_audio = codec.clone();
+            let codec_audio = audio_codec.clone();
             let audio_bridge = media_bridge_ref.clone();
 
             tauri::async_runtime::spawn(async move {
@@ -255,7 +257,7 @@ pub fn run() {
                                     None => false,
                                 };
 
-                            let mut decoders = codec_audio.audio_decoders.lock().await;
+                            let mut decoders = codec_audio.decoders.lock().await;
                             let decoder = decoders
                                 .entry(peer_id.clone())
                                 .or_insert_with(AudioDecoder::new);
@@ -304,7 +306,7 @@ pub fn run() {
 
             // Spawn video forwarder (H.264 NALUs -> binary channel)
             let app_handle_video = app.handle().clone();
-            let codec_video = codec.clone();
+            let codec_video = video_codec.clone();
             let video_bridge = media_bridge_ref.clone();
 
             tauri::async_runtime::spawn(async move {
@@ -312,7 +314,7 @@ pub fn run() {
                 loop {
                     match video_rx.recv().await {
                         Ok(packet) => {
-                            let mut decoders = codec_video.video_decoders.lock().await;
+                            let mut decoders = codec_video.decoders.lock().await;
                             let decoder = decoders
                                 .entry(packet.peer_id.clone())
                                 .or_insert_with(codec::VideoDecoder::new);
@@ -368,13 +370,15 @@ pub fn run() {
                 }
             });
 
-            let codec_cleanup = codec.clone();
+            let audio_cleanup = audio_codec.clone();
+            let video_cleanup = video_codec.clone();
             let mut disconnect_rx = event_tx.subscribe();
             tauri::async_runtime::spawn(async move {
                 loop {
                     match disconnect_rx.recv().await {
                         Ok(Event::PeerDisconnected { peer_id }) => {
-                            codec_cleanup.remove_peer_decoders(&peer_id).await;
+                            audio_cleanup.remove_peer_decoders(&peer_id).await;
+                            video_cleanup.remove_peer_decoders(&peer_id).await;
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(n)) => {

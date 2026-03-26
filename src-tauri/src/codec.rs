@@ -250,28 +250,43 @@ pub fn is_keyframe(h264_data: &[u8]) -> bool {
     false
 }
 
-// ── CodecState for AppState ──────────────────────────────────────────
+// ── AudioCodecState ─────────────────────────────────────────────────
 
-pub struct CodecState {
-    pub audio_encoder: tokio::sync::Mutex<Option<AudioEncoder>>,
-    pub audio_decoders: tokio::sync::Mutex<HashMap<String, AudioDecoder>>,
-    pub video_encoder: tokio::sync::Mutex<Option<VideoEncoder>>,
-    pub video_decoders: tokio::sync::Mutex<HashMap<String, VideoDecoder>>,
+pub struct AudioCodecState {
+    pub encoder: tokio::sync::Mutex<Option<AudioEncoder>>,
+    pub decoders: tokio::sync::Mutex<HashMap<String, AudioDecoder>>,
 }
 
-impl CodecState {
+impl AudioCodecState {
     pub fn new() -> Self {
         Self {
-            audio_encoder: tokio::sync::Mutex::new(None),
-            audio_decoders: tokio::sync::Mutex::new(HashMap::new()),
-            video_encoder: tokio::sync::Mutex::new(None),
-            video_decoders: tokio::sync::Mutex::new(HashMap::new()),
+            encoder: tokio::sync::Mutex::new(None),
+            decoders: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn remove_peer_decoders(&self, peer_id: &str) {
-        self.audio_decoders.lock().await.remove(peer_id);
-        self.video_decoders.lock().await.remove(peer_id);
+        self.decoders.lock().await.remove(peer_id);
+    }
+}
+
+// ── VideoCodecState ─────────────────────────────────────────────────
+
+pub struct VideoCodecState {
+    pub encoder: tokio::sync::Mutex<Option<VideoEncoder>>,
+    pub decoders: tokio::sync::Mutex<HashMap<String, VideoDecoder>>,
+}
+
+impl VideoCodecState {
+    pub fn new() -> Self {
+        Self {
+            encoder: tokio::sync::Mutex::new(None),
+            decoders: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn remove_peer_decoders(&self, peer_id: &str) {
+        self.decoders.lock().await.remove(peer_id);
     }
 }
 
