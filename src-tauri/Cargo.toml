@@ -27,6 +27,7 @@ noq-proto = "0.16"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tauri-plugin-store = "2"
+tauri-plugin-deep-link = "2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-shell = "2"
