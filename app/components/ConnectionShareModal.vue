@@ -41,7 +41,7 @@ watch(
 
 async function copyTicket() {
   if (!props.ticket) return;
-  await navigator.clipboard.writeText(props.ticket);
+  await navigator.clipboard.writeText(wrapTicketUrl(props.ticket));
   copied.value = true;
   setTimeout(() => {
     copied.value = false;

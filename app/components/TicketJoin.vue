@@ -5,14 +5,15 @@ const ticketInput = ref("");
 const showScanner = ref(false);
 
 function submit() {
-  const t = ticketInput.value.trim();
+  const t = unwrapTicket(ticketInput.value.trim());
   if (t) emit("join", t);
 }
 
 function onScan(ticket: string) {
   showScanner.value = false;
-  ticketInput.value = ticket;
-  emit("join", ticket);
+  const t = unwrapTicket(ticket);
+  ticketInput.value = t;
+  emit("join", t);
 }
 </script>
 

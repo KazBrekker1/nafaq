@@ -7,7 +7,7 @@ const showShareModal = ref(false);
 
 function copyTicket() {
   if (!ticket) return;
-  navigator.clipboard.writeText(ticket);
+  navigator.clipboard.writeText(wrapTicketUrl(ticket));
   copied.value = true;
   setTimeout(() => (copied.value = false), 2000);
 }
