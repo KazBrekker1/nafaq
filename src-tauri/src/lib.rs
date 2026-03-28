@@ -139,6 +139,7 @@ pub fn run() {
     }
 
     builder = builder.plugin(tauri_plugin_store::Builder::new().build());
+    builder = builder.plugin(tauri_plugin_deep_link::init());
 
     builder
         .setup(move |app| {
