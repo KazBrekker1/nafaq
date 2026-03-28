@@ -60,9 +60,7 @@ export function useCall() {
   async function endCall() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      for (const p of peers.value) {
-        await invoke("end_call", { peerId: p });
-      }
+      await Promise.all(peers.value.map((p) => invoke("end_call", { peerId: p })));
     } catch {}
     state.value = "idle";
     peerId.value = null;
@@ -131,16 +129,17 @@ async function initCallListeners() {
     // Deep link: auto-join when app is opened via nafaq:// URL
     try {
       const { onOpenUrl, getCurrent } = await import("@tauri-apps/plugin-deep-link");
-      const { unwrapTicket: unwrap } = await import("./useTicketUrl");
 
       const handleDeepLink = (urls: string[]) => {
         if (state.value !== "idle" && state.value !== "waiting") return;
-        for (const url of urls) {
-          const t = unwrap(url);
-          if (t !== url) {
-            joinCall(t);
-            return;
-          }
+        for (const raw of urls) {
+          try {
+            const parsed = new URL(raw);
+            if (parsed.protocol === "nafaq:" && parsed.pathname === "//join") {
+              const t = parsed.searchParams.get("ticket");
+              if (t) { joinCall(t); return; }
+            }
+          } catch { /* not a URL */ }
         }
       };
 
@@ -149,7 +148,7 @@ async function initCallListeners() {
       const pending = await getCurrent();
       if (pending) handleDeepLink(pending);
     } catch {
-      // Deep link plugin not available (e.g., dev mode in browser)
+      // Expected in browser dev mode — plugin only loads in Tauri
     }
 
     listen<any>("peer-connected", async (event) => {
