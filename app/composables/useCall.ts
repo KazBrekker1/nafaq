@@ -18,10 +18,27 @@ const allPeersLeft = ref(false);
 
 let initialized = false;
 
+async function joinCall(t: string) {
+  error.value = null;
+  state.value = "joining";
+  ticket.value = t;
+  connectionProgress.value = "connecting";
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    connectionProgress.value = "securing";
+    await invoke("join_call", { ticket: t });
+    connectionProgress.value = "connected";
+  } catch (e) {
+    error.value = `Failed to join: ${e}`;
+    state.value = "idle";
+    connectionProgress.value = "node-ready";
+  }
+}
+
 export function useCall() {
   if (!initialized) {
     initialized = true;
-    initCallListeners();
+    initCallListeners(joinCall);
   }
 
   async function createCall() {
@@ -37,23 +54,6 @@ export function useCall() {
     } catch (e) {
       error.value = `Failed to create call: ${e}`;
       state.value = "idle";
-    }
-  }
-
-  async function joinCall(t: string) {
-    error.value = null;
-    state.value = "joining";
-    ticket.value = t;
-    connectionProgress.value = "connecting";
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      connectionProgress.value = "securing";
-      await invoke("join_call", { ticket: t });
-      connectionProgress.value = "connected";
-    } catch (e) {
-      error.value = `Failed to join: ${e}`;
-      state.value = "idle";
-      connectionProgress.value = "node-ready";
     }
   }
 
@@ -102,7 +102,7 @@ export function useCall() {
   };
 }
 
-async function initCallListeners() {
+async function initCallListeners(joinCall: (t: string) => Promise<void>) {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const { listen } = await import("@tauri-apps/api/event");
@@ -127,6 +127,29 @@ async function initCallListeners() {
       }
     }
     fetchNodeInfo();
+
+    // Deep link: auto-join when app is opened via nafaq:// URL
+    try {
+      const { onOpenUrl, getCurrent } = await import("@tauri-apps/plugin-deep-link");
+
+      const handleDeepLink = (urls: string[]) => {
+        if (state.value !== "idle" && state.value !== "waiting") return;
+        for (const url of urls) {
+          const t = unwrapTicket(url);
+          if (t !== url) {
+            joinCall(t);
+            return;
+          }
+        }
+      };
+
+      onOpenUrl(handleDeepLink);
+
+      const pending = await getCurrent();
+      if (pending) handleDeepLink(pending);
+    } catch {
+      // Deep link plugin not available (e.g., dev mode in browser)
+    }
 
     listen<any>("peer-connected", async (event) => {
       const data = event.payload;
