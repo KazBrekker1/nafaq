@@ -38,7 +38,7 @@ async function joinCall(t: string) {
 export function useCall() {
   if (!initialized) {
     initialized = true;
-    initCallListeners(joinCall);
+    initCallListeners();
   }
 
   async function createCall() {
@@ -102,7 +102,7 @@ export function useCall() {
   };
 }
 
-async function initCallListeners(joinCall: (t: string) => Promise<void>) {
+async function initCallListeners() {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const { listen } = await import("@tauri-apps/api/event");
@@ -131,11 +131,12 @@ async function initCallListeners(joinCall: (t: string) => Promise<void>) {
     // Deep link: auto-join when app is opened via nafaq:// URL
     try {
       const { onOpenUrl, getCurrent } = await import("@tauri-apps/plugin-deep-link");
+      const { unwrapTicket: unwrap } = await import("./useTicketUrl");
 
       const handleDeepLink = (urls: string[]) => {
         if (state.value !== "idle" && state.value !== "waiting") return;
         for (const url of urls) {
-          const t = unwrapTicket(url);
+          const t = unwrap(url);
           if (t !== url) {
             joinCall(t);
             return;
