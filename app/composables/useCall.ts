@@ -196,7 +196,7 @@ async function initCallListeners() {
       const pid = data?.peer_id;
       const action = data?.action;
       if (pid && action?.action === "set_display_name" && typeof action.name === "string") {
-        peerNames.value = { ...peerNames.value, [pid]: action.name };
+        peerNames.value[pid] = action.name;
       }
     });
 

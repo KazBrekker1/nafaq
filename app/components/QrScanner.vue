@@ -3,6 +3,7 @@ import QrScanner from "qr-scanner";
 
 const emit = defineEmits<{ scan: [ticket: string]; close: [] }>();
 
+const INITIAL_CAMERA = "environment";
 const videoRef = ref<HTMLVideoElement | null>(null);
 const scanner = ref<QrScanner | null>(null);
 const error = ref<string | null>(null);
@@ -20,7 +21,7 @@ onMounted(async () => {
       }
     },
     {
-      preferredCamera: "environment",
+      preferredCamera: INITIAL_CAMERA,
       highlightScanRegion: true,
       highlightCodeOutline: true,
     },
@@ -33,6 +34,14 @@ onMounted(async () => {
     error.value = "Camera access denied.";
   }
 });
+
+const facingUser = ref(false);
+
+async function flipCamera() {
+  if (!scanner.value) return;
+  facingUser.value = !facingUser.value;
+  await scanner.value.setCamera(facingUser.value ? "user" : "environment");
+}
 
 onBeforeUnmount(() => {
   scanner.value?.destroy();
@@ -67,6 +76,13 @@ onBeforeUnmount(() => {
             <p class="text-xs text-[var(--color-muted)]">Opening camera...</p>
           </div>
           <video ref="videoRef" class="h-full w-full object-cover" />
+          <button
+            v-if="streaming"
+            class="absolute top-2 right-2 z-10 w-8 h-8 flex items-center justify-center bg-black/60 text-white rounded-full"
+            @click="flipCamera"
+          >
+            <UIcon name="i-heroicons-arrow-path" class="text-sm" />
+          </button>
         </div>
 
         <UButton variant="outline" class="w-full rounded-none mt-3" @click="emit('close')">
