@@ -9,7 +9,7 @@ type TransportLifecycleState = "idle" | "starting" | "running" | "degraded" | "s
 interface MediaSessionProfile {
   sessionId: string;
   receiveBridgeMode: MediaBridgeMode;
-  receiveVideoMode: "decoded_jpeg";
+  receiveVideoMode: "decoded_jpeg" | "raw_h264_nalu";
   receiveAudioMode: "decoded_pcm";
   sendIngressMode: "invoke_raw" | "invoke_json_fallback";
   playbackReady: boolean;
@@ -20,6 +20,7 @@ interface MediaBridgeRegistration {
   sessionId: string;
   preferredBridgeModes: MediaBridgeMode[];
   playbackReady: boolean;
+  webcodecs_active: boolean;
 }
 
 interface MediaPlaybackStatus {
@@ -148,6 +149,7 @@ let bridgeProbeReceived = false;
 let bridgeFallbackUsed = false;
 
 const isAndroid = /android/i.test(navigator.userAgent);
+const hasWebCodecs = typeof VideoDecoder !== "undefined";
 const sharedTextDecoder = new TextDecoder();
 let preferJsonAudioInvoke = isAndroid;
 let preferJsonVideoInvoke = isAndroid;
@@ -157,6 +159,40 @@ let loggedVideoInvokeFallback = false;
 const peerMediaStates = new Map<string, PeerMediaState>();
 const peerNetworkStats = new Map<string, PeerNetworkStats>();
 const initialKeyframeRequests = new Set<string>();
+
+const peerVideoDecoders = new Map<string, VideoDecoder>();
+
+function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): VideoDecoder {
+  let decoder = peerVideoDecoders.get(peerId);
+  if (decoder) return decoder;
+
+  const ctx = canvas.getContext("2d")!;
+  decoder = new VideoDecoder({
+    output(frame: VideoFrame) {
+      canvas.width = frame.displayWidth;
+      canvas.height = frame.displayHeight;
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      frame.close();
+    },
+    error(e: DOMException) {
+      console.warn(`VideoDecoder error for ${peerId}:`, e);
+    },
+  });
+  decoder.configure({
+    codec: "avc1.42001E", // H.264 Constrained Baseline Level 3.0
+    optimizeForLatency: true,
+  });
+  peerVideoDecoders.set(peerId, decoder);
+  return decoder;
+}
+
+function destroyVideoDecoder(peerId: string) {
+  const decoder = peerVideoDecoders.get(peerId);
+  if (decoder && decoder.state !== "closed") {
+    decoder.close();
+  }
+  peerVideoDecoders.delete(peerId);
+}
 
 const corePromise = import("@tauri-apps/api/core");
 const invokePromise = corePromise.then((m) => m.invoke);
@@ -398,6 +434,18 @@ function unpackVideoChannelPacket(packet: ArrayBuffer) {
     height,
     jpegBytes,
   };
+}
+
+function parseRawNaluPacket(buf: ArrayBuffer) {
+  const view = new DataView(buf);
+  let offset = 0;
+  const peerIdLen = view.getUint16(offset, true); offset += 2;
+  const peerId = sharedTextDecoder.decode(new Uint8Array(buf, offset, peerIdLen)); offset += peerIdLen;
+  const timestamp = Number(view.getBigUint64(offset, true)); offset += 8;
+  const isKeyframe = view.getUint8(offset) === 1; offset += 1;
+  const dataLen = view.getUint32(offset, true); offset += 4;
+  const h264Data = new Uint8Array(buf, offset, dataLen);
+  return { peerId, timestamp, isKeyframe, h264Data };
 }
 
 function setTransportFailure(message: string) {
@@ -649,6 +697,7 @@ async function setupReceiveBridge(forceEventMode = false) {
     sessionId,
     preferredBridgeModes,
     playbackReady: playbackCtx?.state === "running",
+    webcodecs_active: hasWebCodecs,
   };
 
   const profile = await invoke<MediaSessionProfile>("register_media_bridge", {
@@ -689,6 +738,23 @@ async function setupReceiveBridge(forceEventMode = false) {
     videoChannel.onmessage = (raw) => {
       const packet = toArrayBuffer(raw);
       if (packet.byteLength === 0) return;
+      if (hasWebCodecs) {
+        const { peerId, timestamp, isKeyframe, h264Data } = parseRawNaluPacket(packet);
+        const peerState = peerMediaStates.get(peerId);
+        if (!peerState?.canvas) return;
+        const decoder = getOrCreateVideoDecoder(peerId, peerState.canvas);
+        if (decoder.state === "closed") return;
+        try {
+          decoder.decode(new EncodedVideoChunk({
+            type: isKeyframe ? "key" : "delta",
+            timestamp,
+            data: h264Data,
+          }));
+        } catch (e) {
+          console.warn("WebCodecs decode error:", e);
+        }
+        return; // Skip JPEG path
+      }
       const { peerId, timestamp, width, height, jpegBytes } = unpackVideoChannelPacket(packet);
       handleIncomingVideoFrame(peerId, timestamp, width, height, jpegBytes).catch(() => {});
     };
@@ -1049,6 +1115,7 @@ export function useMediaTransport() {
       if (state?.audioGainNode) {
         try { state.audioGainNode.disconnect(); } catch {}
       }
+      destroyVideoDecoder(pid);
       peerMediaStates.delete(pid);
       peerNetworkStats.delete(pid);
       initialKeyframeRequests.delete(pid);
@@ -1213,6 +1280,10 @@ export function useMediaTransport() {
       if (state.audioGainNode) {
         try { state.audioGainNode.disconnect(); } catch {}
       }
+    }
+
+    for (const peerId of peerVideoDecoders.keys()) {
+      destroyVideoDecoder(peerId);
     }
 
     peerMediaStates.clear();
