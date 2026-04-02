@@ -137,6 +137,16 @@ pub fn run() {
     let video_codec = Arc::new(VideoCodecState::new());
     let media_bridge = MediaBridgeState::default();
 
+    let video_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("nafaq-video")
+        .enable_all()
+        .build()
+        .expect("Failed to create video runtime");
+    let video_runtime_handle = video_runtime.handle().clone();
+    // Keep runtime alive for the app's lifetime
+    std::mem::forget(video_runtime);
+
     let app_state = AppState {
         endpoint,
         router,
@@ -146,6 +156,7 @@ pub fn run() {
         video_media_tx: video_media_tx.clone(),
         audio_codec: audio_codec.clone(),
         video_codec: video_codec.clone(),
+        video_runtime: video_runtime_handle.clone(),
     };
 
     let media_bridge_ref = media_bridge.current.clone();
@@ -330,6 +341,7 @@ pub fn run() {
             let app_handle_video = app.handle().clone();
             let codec_video = video_codec.clone();
             let video_bridge = media_bridge_ref.clone();
+            let video_runtime_handle = video_runtime_handle.clone();
 
             tauri::async_runtime::spawn(async move {
                 let mut video_rx = video_media_tx_for_setup.subscribe();
@@ -356,20 +368,20 @@ pub fn run() {
                                 }
                             }
 
-                            // Decode + encode is CPU-bound; yield the async
-                            // thread so we don't starve other tasks.
-                            let jpeg_result = {
-                                let mut decoders = codec_video.decoders.lock().await;
+                            // Decode + encode is CPU-bound; run on the dedicated
+                            // video runtime so the main runtime isn't starved.
+                            let codec_video_clone = codec_video.clone();
+                            let peer_id_clone = packet.peer_id.clone();
+                            let payload = packet.payload.clone();
+                            let jpeg_result = video_runtime_handle.spawn(async move {
+                                let mut decoders = codec_video_clone.decoders.lock().await;
                                 let decoder = decoders
-                                    .entry(packet.peer_id.clone())
+                                    .entry(peer_id_clone)
                                     .or_insert_with(codec::VideoDecoder::new);
-                                let payload = packet.payload.clone();
-                                tokio::task::block_in_place(|| {
-                                    decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
-                                        codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
-                                    })
+                                decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
+                                    codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
                                 })
-                            };
+                            }).await.ok().flatten();
                             if let Some((jpeg, width, height)) = jpeg_result {
                                 let registration = video_bridge.lock().await.clone();
                                 if let Some(registration) = registration {

@@ -32,4 +32,5 @@ pub struct AppState {
     pub video_media_tx: broadcast::Sender<VideoPacket>,
     pub audio_codec: Arc<AudioCodecState>,
     pub video_codec: Arc<VideoCodecState>,
+    pub video_runtime: tokio::runtime::Handle,
 }
