@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Contact {
+    pub node_id: String,
+    pub display_name: String,
+    pub added_at: u64,
+    pub last_seen: u64,
+    pub source: ContactSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactSource {
+    Call,
+    Manual,
+}
+
 /// Stream type identifiers for binary frame protocol
 pub const STREAM_AUDIO: u8 = 0x01;
 pub const STREAM_VIDEO: u8 = 0x02;

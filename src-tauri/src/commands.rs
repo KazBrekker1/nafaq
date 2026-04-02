@@ -4,9 +4,9 @@ use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::messages::{
-    ControlAction, MediaBridgeMode, MediaBridgeRegistration as MediaBridgeRegistrationRequest,
-    MediaPlaybackStatus, MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode,
-    MediaSessionProfile,
+    Contact, ControlAction, MediaBridgeMode,
+    MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
+    MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode, MediaSessionProfile,
 };
 use crate::node;
 use crate::state::{AppState, MediaBridgeRegistration, MediaBridgeState};
@@ -377,6 +377,50 @@ pub async fn update_settings(
         }
     }
     store.set("app_settings", current);
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ── Contacts commands ───────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_contacts(app: tauri::AppHandle) -> Result<Vec<Contact>, String> {
+    let store = app.store("contacts.json").map_err(|e| e.to_string())?;
+    let contacts: Vec<Contact> = store
+        .get("contacts")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    Ok(contacts)
+}
+
+#[tauri::command]
+pub async fn add_contact(contact: Contact, app: tauri::AppHandle) -> Result<(), String> {
+    let store = app.store("contacts.json").map_err(|e| e.to_string())?;
+    let mut contacts: Vec<Contact> = store
+        .get("contacts")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    // Upsert by node_id
+    if let Some(existing) = contacts.iter_mut().find(|c| c.node_id == contact.node_id) {
+        existing.display_name = contact.display_name;
+        existing.last_seen = contact.last_seen;
+    } else {
+        contacts.push(contact);
+    }
+    store.set("contacts", serde_json::to_value(&contacts).map_err(|e| e.to_string())?);
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_contact(node_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    let store = app.store("contacts.json").map_err(|e| e.to_string())?;
+    let mut contacts: Vec<Contact> = store
+        .get("contacts")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    contacts.retain(|c| c.node_id != node_id);
+    store.set("contacts", serde_json::to_value(&contacts).map_err(|e| e.to_string())?);
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }

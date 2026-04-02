@@ -570,6 +570,9 @@ pub fn run() {
             commands::toggle_persistent_identity,
             commands::get_settings,
             commands::update_settings,
+            commands::get_contacts,
+            commands::add_contact,
+            commands::remove_contact,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
