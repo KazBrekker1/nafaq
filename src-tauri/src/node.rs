@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint};
+use iroh::{endpoint::presets, Endpoint, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
 
@@ -7,6 +7,10 @@ use iroh_tickets::Ticket;
 pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/1";
 
 pub async fn create_endpoint() -> Result<Endpoint> {
+    create_endpoint_with_key(None).await
+}
+
+pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<Endpoint> {
     use noq_proto::congestion::BbrConfig;
     use std::sync::Arc;
     use std::time::Duration;
@@ -23,11 +27,15 @@ pub async fn create_endpoint() -> Result<Endpoint> {
         .datagram_send_buffer_size(2 * 1024 * 1024)
         .build();
 
-    let endpoint = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![NAFAQ_ALPN.to_vec()])
-        .transport_config(transport_config)
-        .bind()
-        .await?;
+        .transport_config(transport_config);
+
+    if let Some(key) = secret_key {
+        builder = builder.secret_key(key);
+    }
+
+    let endpoint = builder.bind().await?;
 
     // Wait until we're connected to a relay so our address is reachable
     endpoint.online().await;

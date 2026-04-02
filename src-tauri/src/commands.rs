@@ -355,6 +355,33 @@ pub async fn reinit_video_encoder_with_config(
     Ok(())
 }
 
+// ── Identity persistence commands ───────────────────────────────────
+
+#[tauri::command]
+pub async fn toggle_persistent_identity(
+    enabled: bool,
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    if enabled {
+        let key = state.endpoint.secret_key();
+        // SecretKey doesn't implement Display; encode bytes as lowercase hex
+        let hex: String = key
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        store.set("secret_key", serde_json::Value::String(hex));
+        store.set("persistent_identity", serde_json::Value::Bool(true));
+    } else {
+        store.delete("secret_key");
+        store.set("persistent_identity", serde_json::Value::Bool(false));
+    }
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ── Name persistence commands ───────────────────────────────────────
 
 #[tauri::command]

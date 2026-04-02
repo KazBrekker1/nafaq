@@ -93,6 +93,8 @@ fn pack_video_channel_packet(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri_plugin_store::StoreExt;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -100,68 +102,7 @@ pub fn run() {
         )
         .init();
 
-    // Initialize Iroh synchronously during setup using Tauri's async runtime
-    let rt = tauri::async_runtime::handle();
-
-    let (event_tx, _) = broadcast::channel::<Event>(256);
-    let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
-    let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
-
-    let audio_media_tx_for_setup = audio_media_tx.clone();
-    let video_media_tx_for_setup = video_media_tx.clone();
-
-    let conn_manager = Arc::new(ConnectionManager::new(
-        event_tx.clone(),
-        audio_media_tx.clone(),
-        video_media_tx.clone(),
-    ));
-
-    // Create endpoint + router on the async runtime
-    let (endpoint, router) = rt.block_on(async {
-        let endpoint = node::create_endpoint()
-            .await
-            .expect("Failed to create Iroh endpoint");
-        tracing::info!("Node ID: {}", endpoint.id());
-
-        // Give connection manager a reference to the endpoint for mesh formation
-        conn_manager.set_endpoint(endpoint.clone()).await;
-
-        let router = Router::builder(endpoint.clone())
-            .accept(node::NAFAQ_ALPN, NafaqProtocol::new(conn_manager.clone()))
-            .spawn();
-
-        (endpoint, router)
-    });
-
-    let audio_codec = Arc::new(AudioCodecState::new());
-    let video_codec = Arc::new(VideoCodecState::new());
-    let media_bridge = MediaBridgeState::default();
-
-    let video_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("nafaq-video")
-        .enable_all()
-        .build()
-        .expect("Failed to create video runtime");
-    let video_runtime_handle = video_runtime.handle().clone();
-    // Keep runtime alive for the app's lifetime
-    std::mem::forget(video_runtime);
-
-    let app_state = AppState {
-        endpoint,
-        router,
-        conn_manager: conn_manager.clone(),
-        event_tx: event_tx.clone(),
-        audio_media_tx: audio_media_tx.clone(),
-        video_media_tx: video_media_tx.clone(),
-        audio_codec: audio_codec.clone(),
-        video_codec: video_codec.clone(),
-        video_runtime: video_runtime_handle.clone(),
-    };
-
-    let media_bridge_ref = media_bridge.current.clone();
-
-    let mut builder = tauri::Builder::default().manage(app_state).manage(media_bridge);
+    let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
     {
@@ -172,6 +113,97 @@ pub fn run() {
 
     builder
         .setup(move |app| {
+            // Load optional persisted secret key from store
+            let secret_key = {
+                let store = app
+                    .handle()
+                    .store("settings.json")?;
+                let persistent = store
+                    .get("persistent_identity")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if persistent {
+                    store
+                        .get("secret_key")
+                        .and_then(|v| v.as_str().map(String::from))
+                        .and_then(|hex| {
+                            hex.parse::<iroh::SecretKey>().ok().or_else(|| {
+                                // Fallback: try base64 decode
+                                use base64::Engine;
+                                B64.decode(&hex).ok().and_then(|bytes| {
+                                    bytes.as_slice().try_into().ok().map(|arr: [u8; 32]| {
+                                        iroh::SecretKey::from_bytes(&arr)
+                                    })
+                                })
+                            })
+                        })
+                } else {
+                    None
+                }
+            };
+
+            // Initialize Iroh synchronously on the async runtime
+            let (event_tx, _) = broadcast::channel::<Event>(256);
+            let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
+            let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
+
+            let audio_media_tx_for_setup = audio_media_tx.clone();
+            let video_media_tx_for_setup = video_media_tx.clone();
+
+            let conn_manager = Arc::new(ConnectionManager::new(
+                event_tx.clone(),
+                audio_media_tx.clone(),
+                video_media_tx.clone(),
+            ));
+
+            let conn_manager_for_rt = conn_manager.clone();
+            let (endpoint, router) = tauri::async_runtime::handle().block_on(async {
+                let endpoint = node::create_endpoint_with_key(secret_key)
+                    .await
+                    .expect("Failed to create Iroh endpoint");
+                tracing::info!("Node ID: {}", endpoint.id());
+
+                // Give connection manager a reference to the endpoint for mesh formation
+                conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
+
+                let router = Router::builder(endpoint.clone())
+                    .accept(node::NAFAQ_ALPN, NafaqProtocol::new(conn_manager_for_rt.clone()))
+                    .spawn();
+
+                (endpoint, router)
+            });
+
+            let audio_codec = Arc::new(AudioCodecState::new());
+            let video_codec = Arc::new(VideoCodecState::new());
+            let media_bridge = MediaBridgeState::default();
+
+            let video_runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("nafaq-video")
+                .enable_all()
+                .build()
+                .expect("Failed to create video runtime");
+            let video_runtime_handle = video_runtime.handle().clone();
+            // Keep runtime alive for the app's lifetime
+            std::mem::forget(video_runtime);
+
+            let app_state = AppState {
+                endpoint,
+                router,
+                conn_manager: conn_manager.clone(),
+                event_tx: event_tx.clone(),
+                audio_media_tx: audio_media_tx.clone(),
+                video_media_tx: video_media_tx.clone(),
+                audio_codec: audio_codec.clone(),
+                video_codec: video_codec.clone(),
+                video_runtime: video_runtime_handle.clone(),
+            };
+
+            let media_bridge_ref = media_bridge.current.clone();
+
+            app.manage(app_state);
+            app.manage(media_bridge);
+
             // Spawn event forwarder (broadcast -> Tauri events)
             let app_handle = app.handle().clone();
             let mut event_rx = event_tx.subscribe();
@@ -535,6 +567,7 @@ pub fn run() {
             commands::reinit_video_encoder_with_config,
             commands::get_pinned_name,
             commands::set_pinned_name,
+            commands::toggle_persistent_identity,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
