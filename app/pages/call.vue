@@ -237,7 +237,7 @@ function handleSendChat(text: string) {
         <div class="flex items-center gap-2 sm:gap-3">
           <CallConnectionQuality :quality="transport.connectionQuality.value" />
           <span class="text-[9px] sm:text-[10px] text-[var(--color-accent)] tracking-widest font-bold">P2P</span>
-          <button class="text-[var(--color-muted)] hover:text-white transition-colors hidden sm:block" @click="toggleFullscreen">
+          <button class="text-[var(--color-muted)] hover:text-white transition-colors flex items-center justify-center w-11 h-11 sm:w-auto sm:h-auto" @click="toggleFullscreen">
             <UIcon
               :name="isFullscreen ? 'i-heroicons-arrows-pointing-in' : 'i-heroicons-arrows-pointing-out'"
               class="text-sm"

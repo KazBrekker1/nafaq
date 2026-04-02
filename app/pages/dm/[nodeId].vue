@@ -86,7 +86,8 @@ async function initiateCall() {
 // ── Timestamp formatting ──────────────────────────────────
 
 function formatTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 // ── Lifecycle ─────────────────────────────────────────────

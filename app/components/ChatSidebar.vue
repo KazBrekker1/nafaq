@@ -12,6 +12,11 @@ const emit = defineEmits<{ send: [text: string]; close: [] }>();
 const input = ref("");
 const messagesEl = ref<HTMLElement | null>(null);
 
+function formatTime(ts: number): string {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
 function submit() {
   const text = input.value.trim();
   if (!text) return;
@@ -23,11 +28,27 @@ watch(() => messages.length, async () => {
   await nextTick();
   if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight;
 });
+
+onMounted(() => {
+  if (window.visualViewport) {
+    const handler = () => {
+      const vh = window.visualViewport!.height;
+      document.documentElement.style.setProperty("--vh", `${vh}px`);
+    };
+    window.visualViewport.addEventListener("resize", handler);
+    handler(); // Initial set
+    onUnmounted(() => {
+      window.visualViewport?.removeEventListener("resize", handler);
+      document.documentElement.style.removeProperty("--vh");
+    });
+  }
+});
 </script>
 
 <template>
   <div
     class="fixed inset-0 sm:static sm:inset-auto w-full sm:w-[260px] bg-black border-l-0 sm:border-l-2 border-[var(--color-border)] flex flex-col z-30 safe-area-inset"
+    :style="{ height: 'var(--vh, 100dvh)' }"
   >
     <div class="px-4 py-4 border-b-2 border-[var(--color-border-muted)] flex items-center justify-between">
       <span class="label">MESSAGES</span>
@@ -42,7 +63,7 @@ watch(() => messages.length, async () => {
         :class="msg.sender === 'you' ? 'bg-[var(--color-surface-alt)]' : ''">
         <span class="text-[9px] tracking-widest"
           :style="{ color: msg.sender === 'you' ? 'var(--color-accent)' : 'var(--color-muted)' }">
-          {{ msg.sender === "you" ? (displayName || "You") : (peerNames[msg.peerId || ""] || "Peer") }} · {{ new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }}
+          {{ msg.sender === "you" ? (displayName || "You") : (peerNames[msg.peerId || ""] || "Peer") }} · {{ formatTime(msg.timestamp) }}
         </span><br />
         <span class="text-xs mt-1 block">{{ msg.text }}</span>
       </div>

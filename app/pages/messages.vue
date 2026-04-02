@@ -35,7 +35,7 @@ function lastMessageTime(nodeId: string): string {
   const diffHours = Math.floor(diffMins / 60);
   if (diffMins < 1) return "now";
   if (diffMins < 60) return `${diffMins}m`;
-  if (diffHours < 24) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (diffHours < 24) return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
