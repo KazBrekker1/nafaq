@@ -457,6 +457,16 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     for stats in conn_manager_stats.snapshot_network_stats().await {
+                        // Per-peer quality adaptation
+                        let target = if stats.rtt_ms > 200 || stats.lost_packets > 50 {
+                            100_000 // 100kbps for degraded peers
+                        } else {
+                            0 // Use global profile (no override)
+                        };
+                        let current = conn_manager_stats.get_peer_outbound_bitrate(&stats.peer_id).await;
+                        if current != target {
+                            conn_manager_stats.set_peer_outbound_bitrate(&stats.peer_id, target).await;
+                        }
                         let _ = app_handle_stats.emit("network-stats", &stats);
                     }
                 }

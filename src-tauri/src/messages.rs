@@ -112,6 +112,7 @@ pub enum ControlAction {
     VideoQualityRequest { layer: VideoLayerRequest },
     KeyframeRequest { layer: VideoLayerRequest },
     SetDisplayName { name: String },
+    PerPeerQualityBps { bitrate_bps: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

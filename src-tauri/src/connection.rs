@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,6 +60,8 @@ struct PeerConnection {
     requested_video_layer: Arc<AtomicU8>,
     pending_keyframe: Arc<AtomicBool>,
     last_activity_ms: Arc<AtomicU64>,
+    /// Per-peer outbound bitrate override (0 = use global profile)
+    outbound_bitrate_bps: Arc<AtomicU32>,
 }
 
 #[derive(Clone)]
@@ -214,6 +216,7 @@ impl ConnectionManager {
             requested_video_layer: Arc::new(AtomicU8::new(0)),
             pending_keyframe: Arc::new(AtomicBool::new(false)),
             last_activity_ms: Arc::new(AtomicU64::new(Self::current_timestamp_ms())),
+            outbound_bitrate_bps: Arc::new(AtomicU32::new(0)),
         };
 
         let video_writer = peer_conn.video_writer.clone();
@@ -907,6 +910,21 @@ impl ConnectionManager {
                 }
             })
             .collect()
+    }
+
+    pub async fn get_peer_outbound_bitrate(&self, peer_id: &str) -> u32 {
+        let peers = self.peers.lock().await;
+        peers
+            .get(peer_id)
+            .map(|p| p.outbound_bitrate_bps.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub async fn set_peer_outbound_bitrate(&self, peer_id: &str, bitrate_bps: u32) {
+        let peers = self.peers.lock().await;
+        if let Some(peer) = peers.get(peer_id) {
+            peer.outbound_bitrate_bps.store(bitrate_bps, Ordering::Relaxed);
+        }
     }
 
     pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
