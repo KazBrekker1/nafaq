@@ -4,6 +4,19 @@ const media = useMedia();
 const chat = useChat();
 const transport = useMediaTransport();
 const { playPeerConnected, playPeerLeft, playMessageReceived } = useNotificationSounds();
+const { starFromCall, contacts } = useContacts();
+
+const starredPeers = ref<Set<string>>(new Set());
+
+async function handleStar(peerId: string) {
+  const name = call.peerNames.value[peerId] || peerId.slice(0, 12);
+  await starFromCall(peerId, name);
+  starredPeers.value = new Set([...starredPeers.value, peerId]);
+}
+
+function isPeerStarred(peerId: string): boolean {
+  return starredPeers.value.has(peerId) || contacts.value.some(c => c.node_id === peerId);
+}
 
 const chatOpen = ref(false);
 const shareModalOpen = ref(false);
@@ -257,8 +270,15 @@ function handleSendChat(text: string) {
             <span class="absolute bottom-1 left-2 text-[9px] text-[var(--color-muted)] bg-black/70 px-2 py-0.5 font-mono">
               {{ peer.slice(0, 12) }}...
             </span>
-            <div v-if="transport.activeSpeaker.value === peer" class="absolute top-1 right-1">
-              <span class="text-[8px] text-[var(--color-accent)] bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
+            <div class="absolute top-1 right-1 flex items-center gap-1">
+              <span v-if="transport.activeSpeaker.value === peer" class="text-[8px] text-[var(--color-accent)] bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
+              <!-- Star / save as contact -->
+              <button
+                class="text-base leading-none bg-black/70 px-1.5 py-0.5 transition-colors"
+                :class="isPeerStarred(peer) ? 'text-yellow-400' : 'text-[var(--color-muted)] hover:text-yellow-400'"
+                :title="isPeerStarred(peer) ? 'Saved as contact' : 'Save as contact'"
+                @click.stop="handleStar(peer)"
+              >★</button>
             </div>
           </div>
         </div>
