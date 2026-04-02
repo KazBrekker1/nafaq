@@ -54,7 +54,7 @@ function handleCall(nodeId: string) {
 const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
 
 watch(contactNodeIds, (ids) => {
-  if (ids.length > 0) startProbing(ids);
+  if (ids.length > 0) startProbing(contactNodeIds);
 }, { immediate: true });
 
 onUnmounted(() => {

@@ -330,6 +330,10 @@ pub fn run() {
                                     None => false,
                                 };
 
+                            // Lightweight energy proxy from Opus payload size (no decode needed)
+                            let energy_proxy = payload.len() as f32;
+                            peer_energy.insert(peer_id.clone(), energy_proxy);
+
                             // Selective decode at 5+ peers: skip quiet speakers
                             let peer_count = last_active.len();
                             if peer_count >= 5 {
@@ -362,14 +366,6 @@ pub fn run() {
                                 .or_insert_with(AudioDecoder::new);
 
                             if let Some(pcm) = decoder.decode(&payload, packet_lost) {
-                                let rms = (pcm
-                                    .iter()
-                                    .map(|&s| (s as f32).powi(2))
-                                    .sum::<f32>()
-                                    / pcm.len() as f32)
-                                    .sqrt();
-                                peer_energy.insert(peer_id.clone(), rms);
-
                                 let raw: Vec<u8> =
                                     pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
                                 let registration = audio_bridge.lock().await.clone();

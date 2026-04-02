@@ -1,17 +1,15 @@
-import type { Contact } from "./useContacts";
 import type { Ref } from "vue";
 
 const onlineStatus = ref<Record<string, boolean>>({});
+let probeInterval: ReturnType<typeof setInterval> | null = null;
 
 export function usePresence() {
-  let probeInterval: ReturnType<typeof setInterval> | null = null;
-
-  async function probeAll(contacts: Contact[]) {
+  async function probeAllByIds(nodeIds: string[]) {
     const { invoke } = await import("@tauri-apps/api/core");
     const results = await Promise.allSettled(
-      contacts.map(async (contact) => {
-        const online = await invoke<boolean>("check_presence", { nodeId: contact.node_id }).catch(() => false);
-        return { nodeId: contact.node_id, online };
+      nodeIds.map(async (nodeId) => {
+        const online = await invoke<boolean>("check_presence", { nodeId }).catch(() => false);
+        return { nodeId, online };
       })
     );
     const newStatus: Record<string, boolean> = {};
@@ -23,9 +21,10 @@ export function usePresence() {
     onlineStatus.value = newStatus;
   }
 
-  function startProbing(contacts: Ref<Contact[]>) {
-    probeAll(contacts.value);
-    probeInterval = setInterval(() => probeAll(contacts.value), 30_000);
+  function startProbing(nodeIds: Ref<string[]>) {
+    stopProbing(); // Clear any existing interval
+    probeAllByIds(nodeIds.value);
+    probeInterval = setInterval(() => probeAllByIds(nodeIds.value), 30_000);
   }
 
   function stopProbing() {

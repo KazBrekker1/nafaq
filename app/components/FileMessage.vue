@@ -9,16 +9,6 @@ const props = defineProps<{
   from: "self" | "peer";
 }>();
 
-async function saveFile() {
-  if (!props.localPath) return;
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("reveal_file", { path: props.localPath }).catch(() => {});
-  } catch {
-    // Silently fail — file reveal is best-effort
-  }
-}
-
 const isComplete = computed(() => props.progress >= 1);
 const progressPct = computed(() => Math.round(props.progress * 100));
 </script>
@@ -51,17 +41,14 @@ const progressPct = computed(() => Math.round(props.progress * 100));
       <p class="text-[9px] text-[var(--color-muted)] font-mono mt-1">{{ progressPct }}%</p>
     </div>
 
-    <!-- Save button when complete -->
+    <!-- Completion status badge -->
     <div
-      v-if="isComplete && localPath"
-      class="border-t border-[var(--color-accent)]/40"
+      v-if="isComplete"
+      class="border-t border-[var(--color-accent)]/40 px-3 py-1.5"
     >
-      <button
-        class="w-full px-3 py-1.5 text-[10px] font-bold tracking-widest text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-black transition-colors"
-        @click="saveFile"
-      >
-        SAVE
-      </button>
+      <p class="text-[10px] font-bold tracking-widest text-[var(--color-accent)] font-mono">
+        {{ from === 'self' ? 'SENT' : 'RECEIVED' }}
+      </p>
     </div>
   </div>
 </template>
