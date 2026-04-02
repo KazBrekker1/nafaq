@@ -379,6 +379,67 @@ pub async fn check_presence(
 // ── DM commands ────────────────────────────────────────────────────
 
 #[tauri::command]
+pub async fn send_file(
+    peer_id: String,
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    validate_peer_id(&peer_id)?;
+    let path = std::path::PathBuf::from(&file_path);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Invalid file name")?
+        .to_string();
+    let metadata = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?;
+    let size = metadata.len();
+    let id = uuid::Uuid::new_v4().to_string();
+
+    // Send FileStart
+    state
+        .conn_manager
+        .send_dm(&peer_id, &DmMessage::FileStart {
+            name,
+            size,
+            id: id.clone(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Stream file in 64KB chunks
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(&path).await.map_err(|e| e.to_string())?;
+    let mut offset = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        state
+            .conn_manager
+            .send_dm(&peer_id, &DmMessage::FileChunk {
+                id: id.clone(),
+                offset,
+                data: buf[..n].to_vec(),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        offset += n as u64;
+    }
+
+    // Send FileEnd
+    state
+        .conn_manager
+        .send_dm(&peer_id, &DmMessage::FileEnd { id: id.clone() })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tracing::info!("Sent file to {peer_id}: {offset} bytes, transfer_id={id}");
+    Ok(id)
+}
+
+#[tauri::command]
 pub async fn connect_dm(
     node_id: String,
     state: State<'_, AppState>,

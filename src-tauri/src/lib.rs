@@ -580,6 +580,7 @@ pub fn run() {
             commands::check_presence,
             commands::connect_dm,
             commands::send_dm,
+            commands::send_file,
             commands::disconnect_dm,
         ])
         .run(tauri::generate_context!())
