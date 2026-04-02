@@ -50,6 +50,25 @@ fn pack_audio_channel_packet(peer_id: &str, timestamp: u64, pcm: &[u8]) -> Optio
     Some(packet)
 }
 
+fn pack_video_channel_raw_nalu(
+    peer_id: &str,
+    timestamp: u64,
+    h264_data: &[u8],
+    is_keyframe: bool,
+) -> Option<Vec<u8>> {
+    let peer_id_bytes = peer_id.as_bytes();
+    let peer_id_len = u16::try_from(peer_id_bytes.len()).ok()?;
+    let data_len = u32::try_from(h264_data.len()).ok()?;
+    let mut packet = Vec::with_capacity(2 + peer_id_bytes.len() + 8 + 1 + 4 + h264_data.len());
+    packet.extend_from_slice(&peer_id_len.to_le_bytes());
+    packet.extend_from_slice(peer_id_bytes);
+    packet.extend_from_slice(&timestamp.to_le_bytes());
+    packet.push(if is_keyframe { 1 } else { 0 });
+    packet.extend_from_slice(&data_len.to_le_bytes());
+    packet.extend_from_slice(h264_data);
+    Some(packet)
+}
+
 fn pack_video_channel_packet(
     peer_id: &str,
     timestamp: u64,
@@ -317,6 +336,26 @@ pub fn run() {
                 loop {
                     match video_rx.recv().await {
                         Ok(packet) => {
+                            // Check bridge registration first — if WebCodecs is active,
+                            // forward raw NALUs and skip the decode+JPEG path entirely.
+                            let registration = video_bridge.lock().await.clone();
+                            if let Some(ref reg) = registration {
+                                if reg.webcodecs_active {
+                                    let kf = codec::is_keyframe(&packet.payload);
+                                    if let Some(channel) = &reg.video_channel {
+                                        if let Some(raw_packet) = pack_video_channel_raw_nalu(
+                                            &packet.peer_id,
+                                            packet.timestamp_ms,
+                                            &packet.payload,
+                                            kf,
+                                        ) {
+                                            let _ = channel.send(raw_packet);
+                                        }
+                                    }
+                                    continue; // Skip the decode+JPEG path
+                                }
+                            }
+
                             // Decode + encode is CPU-bound; yield the async
                             // thread so we don't starve other tasks.
                             let jpeg_result = {

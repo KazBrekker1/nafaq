@@ -14,6 +14,7 @@ pub struct MediaBridgeRegistration {
     pub profile: MediaSessionProfile,
     pub audio_channel: Option<Channel<Vec<u8>>>,
     pub video_channel: Option<Channel<Vec<u8>>>,
+    pub webcodecs_active: bool,
 }
 
 #[derive(Default)]

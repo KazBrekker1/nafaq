@@ -162,10 +162,16 @@ pub async fn register_media_bridge(
         MediaBridgeMode::EventBase64
     };
 
+    let receive_video_mode = if registration.webcodecs_active {
+        MediaReceiveVideoMode::RawH264Nalu
+    } else {
+        MediaReceiveVideoMode::DecodedJpeg
+    };
+
     let profile = MediaSessionProfile {
         session_id: registration.session_id.clone(),
         receive_bridge_mode: selected_mode,
-        receive_video_mode: MediaReceiveVideoMode::DecodedJpeg,
+        receive_video_mode,
         receive_audio_mode: MediaReceiveAudioMode::DecodedPcm,
         send_ingress_mode: MediaSendIngressMode::InvokeRaw,
         playback_ready: registration.playback_ready,
@@ -184,6 +190,7 @@ pub async fn register_media_bridge(
         } else {
             None
         },
+        webcodecs_active: registration.webcodecs_active,
     });
 
     tracing::info!(

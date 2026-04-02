@@ -38,6 +38,7 @@ pub enum MediaReceiveAudioMode {
 #[serde(rename_all = "snake_case")]
 pub enum MediaReceiveVideoMode {
     DecodedJpeg,
+    RawH264Nalu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +54,8 @@ pub struct MediaBridgeRegistration {
     pub session_id: String,
     pub preferred_bridge_modes: Vec<MediaBridgeMode>,
     pub playback_ready: bool,
+    #[serde(default)]
+    pub webcodecs_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
