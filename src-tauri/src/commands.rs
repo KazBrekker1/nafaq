@@ -355,6 +355,32 @@ pub async fn reinit_video_encoder_with_config(
     Ok(())
 }
 
+// ── Settings commands ───────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let settings = store.get("app_settings").cloned().unwrap_or(serde_json::json!({}));
+    Ok(settings)
+}
+
+#[tauri::command]
+pub async fn update_settings(
+    settings: serde_json::Value,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let mut current = store.get("app_settings").cloned().unwrap_or(serde_json::json!({}));
+    if let (Some(current_obj), Some(patch)) = (current.as_object_mut(), settings.as_object()) {
+        for (k, v) in patch {
+            current_obj.insert(k.clone(), v.clone());
+        }
+    }
+    store.set("app_settings", current);
+    store.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ── Identity persistence commands ───────────────────────────────────
 
 #[tauri::command]

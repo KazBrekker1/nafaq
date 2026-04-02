@@ -568,6 +568,8 @@ pub fn run() {
             commands::get_pinned_name,
             commands::set_pinned_name,
             commands::toggle_persistent_identity,
+            commands::get_settings,
+            commands::update_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
