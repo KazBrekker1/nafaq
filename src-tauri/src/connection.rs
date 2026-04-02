@@ -47,8 +47,8 @@ impl PeerVideoWriter {
 
 use crate::codec::is_keyframe;
 use crate::messages::{
-    AudioDatagram, AudioPacket, ControlAction, Event, VideoLayerRequest, VideoPacket, STREAM_AUDIO,
-    STREAM_CHAT, STREAM_CONTROL, STREAM_VIDEO,
+    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, VideoLayerRequest, VideoPacket,
+    STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO,
 };
 
 struct PeerConnection {
@@ -62,6 +62,11 @@ struct PeerConnection {
     last_activity_ms: Arc<AtomicU64>,
     /// Per-peer outbound bitrate override (0 = use global profile)
     outbound_bitrate_bps: Arc<AtomicU32>,
+}
+
+struct DmPeerConnection {
+    connection: Connection,
+    dm_send: Arc<Mutex<Option<SendStream>>>,
 }
 
 #[derive(Clone)]
@@ -89,6 +94,7 @@ pub struct NetworkPeerStats {
 
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
+    dm_peers: Arc<Mutex<HashMap<String, DmPeerConnection>>>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     peer_tickets: Arc<Mutex<HashMap<String, String>>>,
     audio_sequences: Arc<Mutex<HashMap<String, u16>>>,
@@ -132,6 +138,7 @@ impl ConnectionManager {
     ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
+            dm_peers: Arc::new(Mutex::new(HashMap::new())),
             endpoint: Arc::new(Mutex::new(None)),
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
             audio_sequences: Arc::new(Mutex::new(HashMap::new())),
@@ -516,16 +523,38 @@ impl ConnectionManager {
         let event_tx = self.event_tx.clone();
         let peer_id_bi = peer_id.clone();
         let peers_ref_bi = peers_ref.clone();
+        let dm_peers_ref_bi = self.dm_peers.clone();
+        let connection_bi = connection.clone();
         tokio::spawn(async move {
             loop {
                 match connection.accept_bi().await {
-                    Ok((_, mut recv)) => {
+                    Ok((send, mut recv)) => {
                         let peer_id = peer_id_bi.clone();
                         let event_tx = event_tx.clone();
                         let peers_ref = peers_ref_bi.clone();
                         let mut type_buf = [0u8; 1];
                         if recv.read_exact(&mut type_buf).await.is_err() {
                             continue;
+                        }
+                        // For incoming DM streams, store the send side so we
+                        // can reply, and emit DmConnected if this is a new
+                        // DM peer.
+                        if type_buf[0] == STREAM_DM {
+                            let dm_peers_ref = dm_peers_ref_bi.clone();
+                            let mut dm_peers = dm_peers_ref.lock().await;
+                            if !dm_peers.contains_key(&peer_id) {
+                                dm_peers.insert(
+                                    peer_id.clone(),
+                                    DmPeerConnection {
+                                        connection: connection_bi.clone(),
+                                        dm_send: Arc::new(Mutex::new(Some(send))),
+                                    },
+                                );
+                                let _ = event_tx.send(Event::DmConnected {
+                                    peer_id: peer_id.clone(),
+                                });
+                            }
+                            drop(dm_peers);
                         }
                         tokio::spawn(async move {
                             Self::handle_bi_stream(
@@ -575,6 +604,22 @@ impl ConnectionManager {
                             let _ = event_tx.send(Event::ControlReceived {
                                 peer_id: peer_id.to_string(),
                                 action,
+                            });
+                        }
+                    }
+                    STREAM_DM => {
+                        if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(&data) {
+                            if matches!(dm_msg, DmMessage::Heartbeat) {
+                                continue;
+                            }
+                            if matches!(dm_msg, DmMessage::CallInvite) {
+                                let _ = event_tx.send(Event::CallInviteReceived {
+                                    peer_id: peer_id.to_string(),
+                                });
+                            }
+                            let _ = event_tx.send(Event::DmReceived {
+                                peer_id: peer_id.to_string(),
+                                message: dm_msg,
                             });
                         }
                     }
@@ -924,6 +969,148 @@ impl ConnectionManager {
         let peers = self.peers.lock().await;
         if let Some(peer) = peers.get(peer_id) {
             peer.outbound_bitrate_bps.store(bitrate_bps, Ordering::Relaxed);
+        }
+    }
+
+    // ── DM connection management ────────────────────────────────────────
+
+    pub async fn connect_dm(&self, node_id_str: &str) -> Result<()> {
+        let node_public_key: iroh::NodeId = node_id_str
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid node ID: {node_id_str}"))?;
+        let addr = iroh::EndpointAddr::from_node_id(node_public_key);
+
+        let endpoint = {
+            let guard = self.endpoint.lock().await;
+            guard
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
+        };
+
+        let connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
+        let peer_id = connection.remote_id().to_string();
+
+        let (mut dm_send, _) = connection.open_bi().await?;
+        dm_send.write_all(&[STREAM_DM]).await?;
+
+        let dm_peer = DmPeerConnection {
+            connection: connection.clone(),
+            dm_send: Arc::new(Mutex::new(Some(dm_send))),
+        };
+
+        self.dm_peers
+            .lock()
+            .await
+            .insert(peer_id.clone(), dm_peer);
+
+        // Spawn a reader task for incoming DM messages on this connection
+        let event_tx = self.event_tx.clone();
+        let dm_peers_ref = self.dm_peers.clone();
+        let peer_id_reader = peer_id.clone();
+        let connection_reader = connection.clone();
+        tokio::spawn(async move {
+            loop {
+                match connection_reader.accept_bi().await {
+                    Ok((_, mut recv)) => {
+                        let mut type_buf = [0u8; 1];
+                        if recv.read_exact(&mut type_buf).await.is_err() {
+                            continue;
+                        }
+                        if type_buf[0] != STREAM_DM {
+                            continue;
+                        }
+                        let event_tx = event_tx.clone();
+                        let peer_id = peer_id_reader.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match crate::messages::read_framed(&mut recv).await {
+                                    Ok(Some(data)) => {
+                                        if let Ok(dm_msg) =
+                                            serde_json::from_slice::<DmMessage>(&data)
+                                        {
+                                            if matches!(dm_msg, DmMessage::Heartbeat) {
+                                                continue;
+                                            }
+                                            if matches!(dm_msg, DmMessage::CallInvite) {
+                                                let _ =
+                                                    event_tx.send(Event::CallInviteReceived {
+                                                        peer_id: peer_id.clone(),
+                                                    });
+                                            }
+                                            let _ = event_tx.send(Event::DmReceived {
+                                                peer_id: peer_id.clone(),
+                                                message: dm_msg,
+                                            });
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(_) => break,
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Connection closed — clean up
+            dm_peers_ref
+                .lock()
+                .await
+                .remove(&peer_id_reader);
+        });
+
+        // Spawn a task to detect connection closure
+        let event_tx_closed = self.event_tx.clone();
+        let dm_peers_closed = self.dm_peers.clone();
+        let peer_id_closed = peer_id.clone();
+        tokio::spawn(async move {
+            connection.closed().await;
+            if dm_peers_closed
+                .lock()
+                .await
+                .remove(&peer_id_closed)
+                .is_some()
+            {
+                let _ = event_tx_closed.send(Event::DmDisconnected {
+                    peer_id: peer_id_closed,
+                });
+            }
+        });
+
+        let _ = self.event_tx.send(Event::DmConnected {
+            peer_id,
+        });
+
+        Ok(())
+    }
+
+    pub async fn send_dm(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
+        let stream = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|p| p.dm_send.clone())
+        };
+        let Some(s) = stream else {
+            anyhow::bail!("DM peer {peer_id} is not connected");
+        };
+
+        let data = serde_json::to_vec(message)?;
+        let mut guard = s.lock().await;
+        if let Some(ref mut send) = *guard {
+            crate::messages::write_framed(send, &data).await?;
+        } else {
+            anyhow::bail!("DM stream for peer {peer_id} is unavailable");
+        }
+        Ok(())
+    }
+
+    pub async fn disconnect_dm(&self, peer_id: &str) {
+        let removed = self.dm_peers.lock().await.remove(peer_id);
+        if let Some(dm_peer) = removed {
+            dm_peer.connection.close(0u32.into(), b"dm_closed");
+            let _ = self.event_tx.send(Event::DmDisconnected {
+                peer_id: peer_id.to_string(),
+            });
         }
     }
 

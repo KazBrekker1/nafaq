@@ -16,11 +16,25 @@ pub enum ContactSource {
     Manual,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DmMessage {
+    Text { content: String, timestamp: u64 },
+    FileStart { name: String, size: u64, id: String },
+    FileChunk { id: String, offset: u64, data: Vec<u8> },
+    FileEnd { id: String },
+    CallInvite,
+    CallAccept,
+    CallDecline,
+    Heartbeat,
+}
+
 /// Stream type identifiers for binary frame protocol
 pub const STREAM_AUDIO: u8 = 0x01;
 pub const STREAM_VIDEO: u8 = 0x02;
 pub const STREAM_CHAT: u8 = 0x03;
 pub const STREAM_CONTROL: u8 = 0x04;
+pub const STREAM_DM: u8 = 0x05;
 
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
@@ -187,6 +201,19 @@ pub enum Event {
         fps: u32,
         max_width: u32,
         max_height: u32,
+    },
+    DmReceived {
+        peer_id: String,
+        message: DmMessage,
+    },
+    DmConnected {
+        peer_id: String,
+    },
+    DmDisconnected {
+        peer_id: String,
+    },
+    CallInviteReceived {
+        peer_id: String,
     },
 }
 

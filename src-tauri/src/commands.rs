@@ -4,7 +4,7 @@ use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::messages::{
-    Contact, ControlAction, MediaBridgeMode,
+    Contact, ControlAction, DmMessage, MediaBridgeMode,
     MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
     MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode, MediaSessionProfile,
 };
@@ -374,6 +374,44 @@ pub async fn check_presence(
         }
         _ => Ok(false),
     }
+}
+
+// ── DM commands ────────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn connect_dm(
+    node_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .conn_manager
+        .connect_dm(&node_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn send_dm(
+    peer_id: String,
+    message: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let dm_msg: DmMessage =
+        serde_json::from_value(message).map_err(|e| e.to_string())?;
+    state
+        .conn_manager
+        .send_dm(&peer_id, &dm_msg)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn disconnect_dm(
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.conn_manager.disconnect_dm(&peer_id).await;
+    Ok(())
 }
 
 // ── Settings commands ───────────────────────────────────────────────

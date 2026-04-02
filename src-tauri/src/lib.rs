@@ -220,6 +220,10 @@ pub fn run() {
                                 Event::ConnectionStatus { .. } => "connection-status",
                                 Event::Error { .. } => "nafaq-error",
                                 Event::QualityProfileChanged { .. } => "quality-profile-changed",
+                                Event::DmReceived { .. } => "dm-received",
+                                Event::DmConnected { .. } => "dm-connected",
+                                Event::DmDisconnected { .. } => "dm-disconnected",
+                                Event::CallInviteReceived { .. } => "call-invite-received",
                                 Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);
@@ -574,6 +578,9 @@ pub fn run() {
             commands::add_contact,
             commands::remove_contact,
             commands::check_presence,
+            commands::connect_dm,
+            commands::send_dm,
+            commands::disconnect_dm,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
