@@ -330,7 +330,9 @@ pub fn run() {
                                     None => false,
                                 };
 
-                            // Lightweight energy proxy from Opus payload size (no decode needed)
+                            // Lightweight energy proxy from Opus payload size (no decode needed).
+                            // Updated after the sequence guard so out-of-order/duplicate packets
+                            // don't skew the energy estimate.
                             let energy_proxy = payload.len() as f32;
                             peer_energy.insert(peer_id.clone(), energy_proxy);
 

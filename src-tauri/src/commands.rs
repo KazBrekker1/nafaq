@@ -377,14 +377,29 @@ pub async fn check_presence(
     }
 }
 
+// ── Contacts helpers ────────────────────────────────────────────────
+
+fn load_contacts(store: &tauri_plugin_store::Store<tauri::Wry>) -> Vec<Contact> {
+    store
+        .get("contacts")
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
 // ── DM commands ────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct FileTransferResult {
+    pub id: String,
+    pub size: u64,
+}
 
 #[tauri::command]
 pub async fn send_file(
     peer_id: String,
     file_path: String,
     state: State<'_, AppState>,
-) -> Result<String, String> {
+) -> Result<FileTransferResult, String> {
     validate_peer_id(&peer_id)?;
     let path = std::path::PathBuf::from(&file_path);
     let name = path
@@ -437,7 +452,7 @@ pub async fn send_file(
         .map_err(|e| e.to_string())?;
 
     tracing::info!("Sent file to {peer_id}: {offset} bytes, transfer_id={id}");
-    Ok(id)
+    Ok(FileTransferResult { id, size })
 }
 
 #[tauri::command]
@@ -507,20 +522,13 @@ pub async fn update_settings(
 #[tauri::command]
 pub async fn get_contacts(app: tauri::AppHandle) -> Result<Vec<Contact>, String> {
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
-    let contacts: Vec<Contact> = store
-        .get("contacts")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    Ok(contacts)
+    Ok(load_contacts(&store))
 }
 
 #[tauri::command]
 pub async fn add_contact(contact: Contact, app: tauri::AppHandle) -> Result<(), String> {
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
-    let mut contacts: Vec<Contact> = store
-        .get("contacts")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let mut contacts = load_contacts(&store);
     // Upsert by node_id
     if let Some(existing) = contacts.iter_mut().find(|c| c.node_id == contact.node_id) {
         existing.display_name = contact.display_name;
@@ -536,10 +544,7 @@ pub async fn add_contact(contact: Contact, app: tauri::AppHandle) -> Result<(), 
 #[tauri::command]
 pub async fn remove_contact(node_id: String, app: tauri::AppHandle) -> Result<(), String> {
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
-    let mut contacts: Vec<Contact> = store
-        .get("contacts")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
+    let mut contacts = load_contacts(&store);
     contacts.retain(|c| c.node_id != node_id);
     store.set("contacts", serde_json::to_value(&contacts).map_err(|e| e.to_string())?);
     store.save().map_err(|e| e.to_string())?;

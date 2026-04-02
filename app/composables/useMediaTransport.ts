@@ -1092,7 +1092,10 @@ export function useMediaTransport() {
             const keyframe = frameCount === 0 || frameCount % 48 === 0;
             frameCount += 1;
             const frameSize = currentWidth * currentHeight * 4;
-            const rgba = videoFrameBufferPool?.acquire() ?? new Uint8Array(frameSize);
+            if (!videoFrameBufferPool) {
+              videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
+            }
+            const rgba = videoFrameBufferPool.acquire();
             rgba.set(new Uint8Array(imageData.data.buffer));
             const sendPromise = mediaUploader?.sendVideo(
               rgba,
@@ -1190,6 +1193,7 @@ export function useMediaTransport() {
       });
       currentWidth = width;
       currentHeight = height;
+      videoFrameBufferPool = null; // Will be lazily recreated with correct dimensions
       clearCaptureSurface();
       const invoke = await invokePromise;
       await invoke("reinit_video_encoder_with_config", {
@@ -1261,6 +1265,7 @@ export function useMediaTransport() {
     if (width === currentWidth && height === currentHeight) return;
     currentWidth = width;
     currentHeight = height;
+    videoFrameBufferPool = null; // Will be lazily recreated with correct dimensions
     clearCaptureSurface();
     const invoke = await invokePromise;
     await invoke("reinit_video_encoder", { width, height });

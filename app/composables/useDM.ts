@@ -24,6 +24,12 @@ const unreadCounts = ref<Record<string, number>>({});
 
 let dmListenerInitialized = false;
 
+function findFileMsg(peerId: string, fileId: string): DmFileMessage | undefined {
+  const msgs = conversations.value[peerId];
+  if (!msgs) return undefined;
+  return msgs.find(m => m.type === "file" && (m as DmFileMessage).id === fileId) as DmFileMessage | undefined;
+}
+
 export function useDM() {
   async function initListener() {
     if (dmListenerInitialized) return;
@@ -52,20 +58,14 @@ export function useDM() {
         });
       } else if (message.type === "file_chunk") {
         // Update progress for the matching file message
-        const msgs = conversations.value[peer_id];
-        if (msgs) {
-          const fileMsg = msgs.find(m => m.type === "file" && m.id === message.id) as DmFileMessage | undefined;
-          if (fileMsg && fileMsg.size > 0) {
-            fileMsg.progress = Math.min(1, (message.offset + (message.data?.length || 0)) / fileMsg.size);
-          }
+        const fileMsg = findFileMsg(peer_id, message.id);
+        if (fileMsg && fileMsg.size > 0) {
+          fileMsg.progress = Math.min(1, (message.offset + (message.data?.length || 0)) / fileMsg.size);
         }
       } else if (message.type === "file_end") {
-        const msgs = conversations.value[peer_id];
-        if (msgs) {
-          const fileMsg = msgs.find(m => m.type === "file" && m.id === message.id) as DmFileMessage | undefined;
-          if (fileMsg) {
-            fileMsg.progress = 1;
-          }
+        const fileMsg = findFileMsg(peer_id, message.id);
+        if (fileMsg) {
+          fileMsg.progress = 1;
         }
       }
     });
@@ -98,9 +98,9 @@ export function useDM() {
   async function sendFile(nodeId: string, filePath: string) {
     const { invoke } = await import("@tauri-apps/api/core");
     const name = filePath.split(/[/\\]/).pop() || "file";
-    const id = await invoke<string>("send_file", { peerId: nodeId, filePath });
+    const result = await invoke<{ id: string; size: number }>("send_file", { peerId: nodeId, filePath });
     pushMessage(nodeId, {
-      type: "file", name, size: 0, id, progress: 0,
+      type: "file", name, size: result.size, id: result.id, progress: 1,
       localPath: filePath, from: "self", timestamp: Date.now(),
     });
   }
