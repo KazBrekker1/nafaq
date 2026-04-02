@@ -295,6 +295,8 @@ pub fn run() {
                 let mut last_sequence: HashMap<String, u16> = HashMap::new();
                 let mut last_prune = std::time::Instant::now();
                 let mut peer_energy: HashMap<String, f32> = HashMap::new();
+                let mut top_speakers: HashSet<String> = HashSet::new();
+                let mut last_speaker_update = std::time::Instant::now();
                 loop {
                     match audio_rx.recv().await {
                         Ok(packet) => {
@@ -331,16 +333,23 @@ pub fn run() {
                             // Selective decode at 5+ peers: skip quiet speakers
                             let peer_count = last_active.len();
                             if peer_count >= 5 {
-                                let mut energies: Vec<(&String, &f32)> =
-                                    peer_energy.iter().collect();
-                                energies.sort_by(|a, b| {
-                                    b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                let top_speakers: HashSet<&String> =
-                                    energies.iter().take(3).map(|(id, _)| *id).collect();
-
-                                // Allow new peers (not yet in energy map) through for initial decode
-                                if peer_energy.contains_key(&peer_id)
+                                // Recompute top speakers at most every 200ms
+                                let now = std::time::Instant::now();
+                                if now.duration_since(last_speaker_update).as_millis() >= 200 {
+                                    last_speaker_update = now;
+                                    let mut energies: Vec<(String, f32)> = peer_energy
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), *v))
+                                        .collect();
+                                    energies.sort_by(|a, b| {
+                                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                    });
+                                    top_speakers =
+                                        energies.iter().take(3).map(|(id, _)| id.clone()).collect();
+                                }
+                                // Allow new peers through, skip quiet peers
+                                if !top_speakers.is_empty()
+                                    && peer_energy.contains_key(&peer_id)
                                     && !top_speakers.contains(&peer_id)
                                 {
                                     continue;
