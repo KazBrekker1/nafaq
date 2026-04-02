@@ -14,7 +14,7 @@ const audioMuted = ref(false);
 const videoMuted = ref(false);
 const error = ref<string | null>(null);
 
-let analyserInterval: ReturnType<typeof setInterval> | null = null;
+let micLevelRafId: number | null = null;
 let audioContext: AudioContext | null = null;
 
 export function useMedia() {
@@ -92,22 +92,32 @@ export function useMedia() {
       analyser.fftSize = 256;
       source.connect(analyser);
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
-      analyserInterval = setInterval(() => {
+      function update() {
         analyser.getByteFrequencyData(dataArray);
-        const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-        micLevel.value = Math.min(100, Math.round((avg / 128) * 100));
-      }, 100);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        micLevel.value = sum / (dataArray.length * 255);
+        micLevelRafId = requestAnimationFrame(update);
+      }
+      update();
     } catch (e) {
       console.warn("[media] Mic level monitor failed:", e);
     }
   }
 
+  function stopMicLevelMonitor() {
+    if (micLevelRafId !== null) {
+      cancelAnimationFrame(micLevelRafId);
+      micLevelRafId = null;
+    }
+    micLevel.value = 0;
+  }
+
   function stopPreview() {
     localStream.value?.getTracks().forEach((t) => t.stop());
     localStream.value = null;
-    if (analyserInterval) { clearInterval(analyserInterval); analyserInterval = null; }
+    stopMicLevelMonitor();
     if (audioContext) { audioContext.close(); audioContext = null; }
-    micLevel.value = 0;
   }
 
   function applyMuteState() {

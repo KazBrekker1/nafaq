@@ -3,6 +3,7 @@ const open = defineModel<boolean>('open', { required: true });
 const emit = defineEmits<{ join: []; cancel: [] }>();
 
 const media = useMedia();
+const { micLevel } = media;
 const videoEl = ref<HTMLVideoElement | null>(null);
 
 watch(
@@ -35,6 +36,15 @@ watch(
             </p>
           </div>
         </div>
+
+        <!-- VU meter -->
+        <div class="mt-3 h-1.5 bg-[var(--color-border-muted)] w-full max-w-[320px] mx-auto">
+          <div
+            class="h-full bg-[var(--color-accent)] transition-all duration-75"
+            :style="{ width: `${micLevel * 100}%` }"
+          />
+        </div>
+        <p class="text-[10px] text-[var(--color-muted)] mt-1 tracking-wider text-center">MIC LEVEL</p>
 
         <!-- Quick toggles -->
         <div class="flex justify-center gap-3">
