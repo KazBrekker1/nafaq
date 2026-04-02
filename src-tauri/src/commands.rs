@@ -355,6 +355,27 @@ pub async fn reinit_video_encoder_with_config(
     Ok(())
 }
 
+// ── Presence probing ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn check_presence(
+    node_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let node_public_key: iroh::NodeId = node_id.parse().map_err(|e: anyhow::Error| e.to_string())?;
+    let addr = iroh::EndpointAddr::from_node_id(node_public_key);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.endpoint.connect(addr, crate::node::NAFAQ_ALPN),
+    ).await {
+        Ok(Ok(conn)) => {
+            conn.close(0u32.into(), b"presence_probe");
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 // ── Settings commands ───────────────────────────────────────────────
 
 #[tauri::command]

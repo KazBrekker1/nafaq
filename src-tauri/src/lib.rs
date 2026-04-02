@@ -573,6 +573,7 @@ pub fn run() {
             commands::get_contacts,
             commands::add_contact,
             commands::remove_contact,
+            commands::check_presence,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
