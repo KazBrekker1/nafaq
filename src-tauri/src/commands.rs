@@ -362,13 +362,14 @@ pub async fn check_presence(
     node_id: String,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let node_public_key: iroh::NodeId = node_id.parse().map_err(|e: anyhow::Error| e.to_string())?;
-    let addr = iroh::EndpointAddr::from_node_id(node_public_key);
+    let node_public_key: iroh::PublicKey = node_id.parse().map_err(|e| format!("{e}"))?;
+    let addr = iroh::EndpointAddr::new(node_public_key);
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state.endpoint.connect(addr, crate::node::NAFAQ_ALPN),
     ).await {
         Ok(Ok(conn)) => {
+            let conn: iroh::endpoint::Connection = conn;
             conn.close(0u32.into(), b"presence_probe");
             Ok(true)
         }
@@ -480,7 +481,7 @@ pub async fn disconnect_dm(
 #[tauri::command]
 pub async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    let settings = store.get("app_settings").cloned().unwrap_or(serde_json::json!({}));
+    let settings = store.get("app_settings").unwrap_or(serde_json::json!({}));
     Ok(settings)
 }
 
@@ -490,8 +491,8 @@ pub async fn update_settings(
     app: tauri::AppHandle,
 ) -> Result<(), String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    let mut current = store.get("app_settings").cloned().unwrap_or(serde_json::json!({}));
-    if let (Some(current_obj), Some(patch)) = (current.as_object_mut(), settings.as_object()) {
+    let mut current = store.get("app_settings").unwrap_or(serde_json::json!({}));
+    if let (serde_json::Value::Object(ref mut current_obj), serde_json::Value::Object(ref patch)) = (&mut current, &settings) {
         for (k, v) in patch {
             current_obj.insert(k.clone(), v.clone());
         }

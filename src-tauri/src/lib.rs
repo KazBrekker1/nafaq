@@ -16,7 +16,7 @@ use iroh::protocol::Router;
 use messages::{AudioPacket, ControlAction, Event, VideoPacket};
 use protocol::NafaqProtocol;
 use state::{AppState, MediaBridgeState};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::broadcast;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;

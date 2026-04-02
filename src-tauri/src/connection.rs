@@ -975,10 +975,10 @@ impl ConnectionManager {
     // ── DM connection management ────────────────────────────────────────
 
     pub async fn connect_dm(&self, node_id_str: &str) -> Result<()> {
-        let node_public_key: iroh::NodeId = node_id_str
+        let node_public_key: iroh::PublicKey = node_id_str
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid node ID: {node_id_str}"))?;
-        let addr = iroh::EndpointAddr::from_node_id(node_public_key);
+        let addr = iroh::EndpointAddr::new(node_public_key);
 
         let endpoint = {
             let guard = self.endpoint.lock().await;
@@ -987,10 +987,10 @@ impl ConnectionManager {
                 .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
         };
 
-        let connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
+        let connection: iroh::endpoint::Connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
         let peer_id = connection.remote_id().to_string();
 
-        let (mut dm_send, _) = connection.open_bi().await?;
+        let (mut dm_send, _): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) = connection.open_bi().await?;
         dm_send.write_all(&[STREAM_DM]).await?;
 
         let dm_peer = DmPeerConnection {
