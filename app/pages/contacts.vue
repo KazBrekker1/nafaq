@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import QRCode from "qrcode";
+import { truncateNodeId } from "~/utils/format";
 
 const { nodeId, displayName, joinCall } = useCall();
 const { contacts, remove } = useContacts();
@@ -10,7 +11,7 @@ const { settings } = useSettings();
 const truncatedNodeId = computed(() => {
   const id = nodeId.value;
   if (!id) return "—";
-  return `${id.slice(0, 4)}...${id.slice(-4)}`;
+  return truncateNodeId(id);
 });
 
 const nodeCopied = ref(false);
@@ -55,10 +56,6 @@ const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
 watch(contactNodeIds, (ids) => {
   if (ids.length > 0) startProbing(ids);
 }, { immediate: true });
-
-onMounted(() => {
-  if (contactNodeIds.value.length > 0) startProbing(contactNodeIds.value);
-});
 
 onUnmounted(() => {
   stopProbing();
@@ -156,7 +153,7 @@ onUnmounted(() => {
                 <span class="text-[10px] text-[var(--color-muted)]">{{ isOnline(contact.node_id) ? 'online' : 'offline' }}</span>
               </div>
               <p class="text-[10px] text-[var(--color-muted)] font-mono truncate">
-                {{ contact.node_id.slice(0, 4) }}...{{ contact.node_id.slice(-4) }}
+                {{ truncateNodeId(contact.node_id) }}
               </p>
             </div>
 

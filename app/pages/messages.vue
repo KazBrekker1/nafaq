@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { truncateNodeId } from "~/utils/format";
+
 const { conversations, unreadCounts } = useDM();
 const { contacts } = useContacts();
 
@@ -7,7 +9,7 @@ const { contacts } = useContacts();
 function displayName(nodeId: string): string {
   const contact = contacts.value.find(c => c.node_id === nodeId);
   if (contact?.display_name) return contact.display_name;
-  return `${nodeId.slice(0, 4)}…${nodeId.slice(-4)}`;
+  return truncateNodeId(nodeId, 4, 4).replace("...", "…");
 }
 
 function lastMessage(nodeId: string) {

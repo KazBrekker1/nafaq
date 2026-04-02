@@ -109,9 +109,12 @@ export function useDM() {
     if (!conversations.value[nodeId]) {
       conversations.value[nodeId] = [];
     }
-    conversations.value[nodeId] = [...conversations.value[nodeId], msg];
+    conversations.value[nodeId].push(msg);
+    // Trigger Vue reactivity for the conversations ref
+    conversations.value = { ...conversations.value };
     if (activeConversation.value !== nodeId) {
-      unreadCounts.value = { ...unreadCounts.value, [nodeId]: (unreadCounts.value[nodeId] || 0) + 1 };
+      unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] || 0) + 1;
+      unreadCounts.value = { ...unreadCounts.value };
     }
   }
 

@@ -17,10 +17,6 @@ function close() {
   emit("update:open", false);
 }
 
-function handleClose() {
-  close();
-}
-
 watch(() => props.open, (open) => {
   if (open) {
     nodeIdInput.value = "";
@@ -68,7 +64,7 @@ async function handleSave() {
   <div
     v-if="open"
     class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/80 p-4"
-    @click.self="handleClose"
+    @click.self="close"
   >
     <div class="w-full max-w-sm my-auto border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
 
@@ -78,7 +74,7 @@ async function handleSave() {
         <button
           class="text-[var(--color-muted)] transition-colors hover:text-white"
           aria-label="Close"
-          @click="handleClose"
+          @click="close"
         >
           <UIcon name="i-heroicons-x-mark" class="text-lg" />
         </button>
@@ -138,7 +134,7 @@ async function handleSave() {
           </button>
           <button
             class="flex-1 border-2 border-l-0 border-[var(--color-border)] py-2 text-xs font-bold tracking-widest text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-            @click="handleClose"
+            @click="close"
           >
             CANCEL
           </button>

@@ -8,10 +8,19 @@ export function usePresence() {
 
   async function probeAll(contacts: Contact[]) {
     const { invoke } = await import("@tauri-apps/api/core");
-    for (const contact of contacts) {
-      const online = await invoke<boolean>("check_presence", { nodeId: contact.node_id }).catch(() => false);
-      onlineStatus.value = { ...onlineStatus.value, [contact.node_id]: online };
+    const results = await Promise.allSettled(
+      contacts.map(async (contact) => {
+        const online = await invoke<boolean>("check_presence", { nodeId: contact.node_id }).catch(() => false);
+        return { nodeId: contact.node_id, online };
+      })
+    );
+    const newStatus: Record<string, boolean> = {};
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        newStatus[result.value.nodeId] = result.value.online;
+      }
     }
+    onlineStatus.value = newStatus;
   }
 
   function startProbing(contacts: Ref<Contact[]>) {

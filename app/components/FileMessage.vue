@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { formatSize } from "~/utils/format";
+
 const props = defineProps<{
   name: string;
   size: number;
@@ -6,12 +8,6 @@ const props = defineProps<{
   localPath: string | null;
   from: "self" | "peer";
 }>();
-
-function formatSize(bytes: number): string {
-  if (bytes === 0) return "—";
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 async function saveFile() {
   if (!props.localPath) return;

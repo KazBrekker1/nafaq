@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { DmMessageItem } from "../../composables/useDM";
+import { formatTime, truncateNodeId } from "~/utils/format";
 
 const route = useRoute();
 const peerId = computed(() => route.params.nodeId as string);
@@ -14,8 +15,7 @@ const { joinCall } = useCall();
 const contactName = computed(() => {
   const contact = contacts.value.find(c => c.node_id === peerId.value);
   if (contact?.display_name) return contact.display_name;
-  const id = peerId.value || "";
-  return `${id.slice(0, 4)}…${id.slice(-4)}`;
+  return truncateNodeId(peerId.value || "", 4, 4).replace("...", "…");
 });
 
 const online = computed(() => isOnline(peerId.value));
@@ -77,17 +77,12 @@ async function onFileInputChange(e: Event) {
 // ── Call escalation ───────────────────────────────────────
 
 async function initiateCall() {
-  // Send a call_invite DM then join
-  await sendText(peerId.value, "[call_invite]").catch(() => {});
-  await joinCall(peerId.value);
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("send_dm", {
+    peerId: peerId.value,
+    message: { type: "call_invite" },
+  }).catch(() => {});
   navigateTo("/");
-}
-
-// ── Timestamp formatting ──────────────────────────────────
-
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
 // ── Lifecycle ─────────────────────────────────────────────

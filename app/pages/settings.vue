@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import QRCode from "qrcode";
+import { truncateNodeId } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
 const { nodeId } = useCall();
@@ -24,7 +25,7 @@ async function saveName() {
 const truncatedNodeId = computed(() => {
   const id = nodeId.value;
   if (!id) return "—";
-  return `${id.slice(0, 8)}...${id.slice(-4)}`;
+  return truncateNodeId(id, 8, 4);
 });
 
 const nodeCopied = ref(false);

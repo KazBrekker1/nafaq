@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ChatMessage } from "../composables/useChat";
+import { formatTime } from "~/utils/format";
 
 const { messages, displayName = "", peerNames = {} } = defineProps<{
   messages: ChatMessage[];
@@ -11,11 +12,6 @@ const emit = defineEmits<{ send: [text: string]; close: [] }>();
 
 const input = ref("");
 const messagesEl = ref<HTMLElement | null>(null);
-
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-}
 
 function submit() {
   const text = input.value.trim();
