@@ -50,6 +50,23 @@ function onFullscreenChange() {
   isFullscreen.value = !!document.fullscreenElement;
 }
 
+const peerVideoContainerRefs = new Map<string, (el: any) => void>();
+function registerPeerContainerRef(peerId: string) {
+  let cached = peerVideoContainerRefs.get(peerId);
+  if (!cached) {
+    cached = (el: any) => {
+      if (el instanceof HTMLElement) {
+        el.dataset.peerId = peerId;
+        videoVisibilityObserver?.observe(el);
+      }
+    };
+    peerVideoContainerRefs.set(peerId, cached);
+  }
+  return cached;
+}
+
+let videoVisibilityObserver: IntersectionObserver | null = null;
+
 const peerCanvasRefs = new Map<string, (el: any) => void>();
 function registerPeerCanvasRef(peerId: string) {
   let cached = peerCanvasRefs.get(peerId);
@@ -74,6 +91,15 @@ onMounted(async () => {
     navigateTo("/");
     return;
   }
+
+  videoVisibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const peerId = (entry.target as HTMLElement).dataset.peerId;
+      if (peerId) {
+        transport.setPeerVideoPaused(peerId, !entry.isIntersecting);
+      }
+    }
+  }, { threshold: 0.1 });
 
   if (!media.localStream.value) await media.startPreview();
 
@@ -147,6 +173,8 @@ watch(chatOpen, (open) => {
 });
 
 onUnmounted(() => {
+  videoVisibilityObserver?.disconnect();
+  videoVisibilityObserver = null;
   cleanup();
   document.removeEventListener("fullscreenchange", onFullscreenChange);
 });
@@ -216,6 +244,8 @@ function handleSendChat(text: string) {
           <div
             v-for="peer in call.peers.value"
             :key="peer"
+            :ref="registerPeerContainerRef(peer)"
+            :data-peer-id="peer"
             class="relative min-h-0 bg-black overflow-hidden border border-[var(--color-border)] flex items-center justify-center"
           >
             <canvas

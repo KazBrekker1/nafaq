@@ -82,6 +82,7 @@ interface PeerMediaState {
   lastSpeakingTime: number;
   lastKeyframeRequestAt: number;
   pendingVideoFrame: PendingVideoFrame | null;
+  videoPaused: boolean;
 }
 
 interface MediaUploader {
@@ -387,6 +388,7 @@ function getOrCreatePeerState(peerId: string): PeerMediaState {
       lastSpeakingTime: 0,
       lastKeyframeRequestAt: 0,
       pendingVideoFrame: null,
+      videoPaused: false,
     };
     peerMediaStates.set(peerId, state);
   }
@@ -766,7 +768,8 @@ async function setupReceiveBridge(forceEventMode = false) {
       if (hasWebCodecs) {
         const { peerId, timestamp, isKeyframe, h264Data } = parseRawNaluPacket(packet);
         const peerState = peerMediaStates.get(peerId);
-        if (!peerState?.canvas) return;
+        if (!peerState || peerState.videoPaused) return;
+        if (!peerState.canvas) return;
         const decoder = getOrCreateVideoDecoder(peerId, peerState.canvas);
         if (decoder.state === "closed") return;
         try {
@@ -781,6 +784,8 @@ async function setupReceiveBridge(forceEventMode = false) {
         return; // Skip JPEG path
       }
       const { peerId, timestamp, width, height, jpegBytes } = unpackVideoChannelPacket(packet);
+      const peerState = peerMediaStates.get(peerId);
+      if (!peerState || peerState.videoPaused) return;
       handleIncomingVideoFrame(peerId, timestamp, width, height, jpegBytes).catch(() => {});
     };
     unlistenVideo = () => {
@@ -796,6 +801,8 @@ async function setupReceiveBridge(forceEventMode = false) {
     });
     unlistenVideo = await listen<LegacyVideoEvent>("video-received", (event) => {
       const payload = event.payload;
+      const peerState = peerMediaStates.get(payload.peer_id);
+      if (peerState?.videoPaused) return;
       handleIncomingVideoFrame(
         payload.peer_id,
         payload.timestamp,
@@ -1354,6 +1361,20 @@ export function useMediaTransport() {
     };
   }
 
+  async function setPeerVideoPaused(peerId: string, paused: boolean) {
+    const state = peerMediaStates.get(peerId);
+    if (!state || state.videoPaused === paused) return;
+    state.videoPaused = paused;
+    const invoke = await invokePromise;
+    await invoke("send_control", {
+      peerId,
+      action: {
+        action: "video_quality_request",
+        layer: paused ? "none" : "high",
+      },
+    }).catch(() => {});
+  }
+
   return {
     encoding,
     peerSpeakingMap,
@@ -1368,5 +1389,6 @@ export function useMediaTransport() {
     stop,
     syncSubscriptions,
     updateCaptureDimensions,
+    setPeerVideoPaused,
   };
 }
