@@ -222,6 +222,31 @@ function fromBase64(b64: string): Uint8Array {
   return bytes;
 }
 
+class BufferPool<T extends Int16Array | Uint8Array> {
+  private pool: T[] = [];
+  private factory: () => T;
+
+  constructor(size: number, factory: () => T) {
+    this.factory = factory;
+    for (let i = 0; i < size; i++) {
+      this.pool.push(factory());
+    }
+  }
+
+  acquire(): T {
+    return this.pool.pop() ?? this.factory();
+  }
+
+  release(buf: T) {
+    if (this.pool.length < 16) {
+      this.pool.push(buf);
+    }
+  }
+}
+
+let audioBufferPool: BufferPool<Int16Array> | null = null;
+let videoFrameBufferPool: BufferPool<Uint8Array> | null = null;
+
 // Tauri Channel<Vec<u8>> serializes as JSON array, not ArrayBuffer.
 function toArrayBuffer(data: unknown): ArrayBuffer {
   if (data instanceof ArrayBuffer) return data;
@@ -908,6 +933,8 @@ export function useMediaTransport() {
     currentWidth = width;
     currentHeight = height;
     targetFps = connectionQuality.value === "good" ? (isAndroid ? 8 : 12) : 8;
+    audioBufferPool = new BufferPool(8, () => new Int16Array(OPUS_FRAME_SAMPLES));
+    videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
     await invoke("init_codecs", { width, height });
   }
 
@@ -1002,11 +1029,16 @@ export function useMediaTransport() {
           srcOffset += toCopy;
 
           if (bufferOffset === OPUS_FRAME_SAMPLES) {
-            const pcm = new Int16Array(OPUS_FRAME_SAMPLES);
+            const pcm = audioBufferPool?.acquire() ?? new Int16Array(OPUS_FRAME_SAMPLES);
             for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
               pcm[i] = Math.max(-32768, Math.min(32767, Math.round(sampleBuffer[i]! * 32767)));
             }
-            mediaUploader?.sendAudio(new Uint8Array(pcm.buffer), Date.now()).catch(() => {});
+            const sendPromise = mediaUploader?.sendAudio(new Uint8Array(pcm.buffer), Date.now());
+            if (sendPromise) {
+              sendPromise.catch(() => {}).finally(() => { audioBufferPool?.release(pcm); });
+            } else {
+              audioBufferPool?.release(pcm);
+            }
             bufferOffset = 0;
           }
         }
@@ -1052,13 +1084,21 @@ export function useMediaTransport() {
             const imageData = ctx.getImageData(0, 0, currentWidth, currentHeight);
             const keyframe = frameCount === 0 || frameCount % 48 === 0;
             frameCount += 1;
-            mediaUploader?.sendVideo(
-              new Uint8Array(imageData.data.buffer),
+            const frameSize = currentWidth * currentHeight * 4;
+            const rgba = videoFrameBufferPool?.acquire() ?? new Uint8Array(frameSize);
+            rgba.set(new Uint8Array(imageData.data.buffer));
+            const sendPromise = mediaUploader?.sendVideo(
+              rgba,
               currentWidth,
               currentHeight,
               keyframe,
               Date.now(),
-            ).catch(() => {});
+            );
+            if (sendPromise) {
+              sendPromise.catch(() => {}).finally(() => { videoFrameBufferPool?.release(rgba); });
+            } else {
+              videoFrameBufferPool?.release(rgba);
+            }
           }
         }
 
@@ -1300,6 +1340,8 @@ export function useMediaTransport() {
     unlistenStats = null;
     unlistenQuality = null;
     connectionQuality.value = "good";
+    audioBufferPool = null;
+    videoFrameBufferPool = null;
 
     transportStatus.value = {
       state: "idle",
