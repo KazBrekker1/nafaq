@@ -6,7 +6,7 @@ mod node;
 mod protocol;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -258,6 +258,7 @@ pub fn run() {
                 let mut last_active: HashMap<String, std::time::Instant> = HashMap::new();
                 let mut last_sequence: HashMap<String, u16> = HashMap::new();
                 let mut last_prune = std::time::Instant::now();
+                let mut peer_energy: HashMap<String, f32> = HashMap::new();
                 loop {
                     match audio_rx.recv().await {
                         Ok(packet) => {
@@ -276,6 +277,7 @@ pub fn run() {
                                 for k in &stale {
                                     last_active.remove(k);
                                     last_sequence.remove(k);
+                                    peer_energy.remove(k);
                                     codec_audio.remove_peer_decoders(k).await;
                                 }
                             }
@@ -290,12 +292,39 @@ pub fn run() {
                                     None => false,
                                 };
 
+                            // Selective decode at 5+ peers: skip quiet speakers
+                            let peer_count = last_active.len();
+                            if peer_count >= 5 {
+                                let mut energies: Vec<(&String, &f32)> =
+                                    peer_energy.iter().collect();
+                                energies.sort_by(|a, b| {
+                                    b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                let top_speakers: HashSet<&String> =
+                                    energies.iter().take(3).map(|(id, _)| *id).collect();
+
+                                // Allow new peers (not yet in energy map) through for initial decode
+                                if peer_energy.contains_key(&peer_id)
+                                    && !top_speakers.contains(&peer_id)
+                                {
+                                    continue;
+                                }
+                            }
+
                             let mut decoders = codec_audio.decoders.lock().await;
                             let decoder = decoders
                                 .entry(peer_id.clone())
                                 .or_insert_with(AudioDecoder::new);
 
                             if let Some(pcm) = decoder.decode(&payload, packet_lost) {
+                                let rms = (pcm
+                                    .iter()
+                                    .map(|&s| (s as f32).powi(2))
+                                    .sum::<f32>()
+                                    / pcm.len() as f32)
+                                    .sqrt();
+                                peer_energy.insert(peer_id.clone(), rms);
+
                                 let raw: Vec<u8> =
                                     pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
                                 let registration = audio_bridge.lock().await.clone();
