@@ -33,10 +33,9 @@ function copyTicket() {
   </div>
 
   <ConnectionShareModal
-    :open="showShareModal"
+    v-model:open="showShareModal"
     :ticket="ticket"
     title="SHARE THIS TICKET"
     description="Open a larger QR code or copy the full ticket."
-    @close="showShareModal = false"
   />
 </template>

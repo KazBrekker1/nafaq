@@ -1,10 +1,10 @@
 <script setup lang="ts">
-const props = defineProps<{
+const { quality } = defineProps<{
   quality: "good" | "degraded" | "poor";
 }>();
 
 const config = computed(() => {
-  switch (props.quality) {
+  switch (quality) {
     case "good": return { bars: 4, color: "var(--color-accent)" };
     case "degraded": return { bars: 2, color: "var(--color-warning)" };
     case "poor": return { bars: 1, color: "var(--color-danger)" };

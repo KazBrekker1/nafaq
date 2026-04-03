@@ -1,14 +1,24 @@
 <script setup lang="ts">
 import QrScanner from "qr-scanner";
 
-const emit = defineEmits<{ scan: [ticket: string]; close: [] }>();
+const open = defineModel<boolean>('open', { required: true });
+const emit = defineEmits<{ scan: [ticket: string] }>();
 
 const videoRef = ref<HTMLVideoElement | null>(null);
 const scanner = ref<QrScanner | null>(null);
 const error = ref<string | null>(null);
 const streaming = ref(false);
 
-onMounted(async () => {
+watch(() => open.value, async (isOpen) => {
+  if (isOpen) {
+    await nextTick();
+    startScanner();
+  } else {
+    destroyScanner();
+  }
+});
+
+async function startScanner() {
   if (!videoRef.value) return;
 
   scanner.value = new QrScanner(
@@ -17,6 +27,7 @@ onMounted(async () => {
       if (result.data) {
         scanner.value?.stop();
         emit("scan", result.data);
+        open.value = false;
       }
     },
     {
@@ -32,47 +43,52 @@ onMounted(async () => {
   } catch {
     error.value = "Camera access denied.";
   }
-});
+}
 
-onBeforeUnmount(() => {
+function destroyScanner() {
   scanner.value?.destroy();
   scanner.value = null;
+  streaming.value = false;
+  error.value = null;
+}
+
+onBeforeUnmount(() => {
+  destroyScanner();
 });
 </script>
 
 <template>
-  <div
-    class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/80 p-4"
-    @click.self="emit('close')"
-  >
-    <div class="w-full max-w-sm my-auto border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
-      <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] p-3 sm:p-4">
-        <p class="label">SCAN QR CODE</p>
-        <button
-          class="text-[var(--color-muted)] transition-colors hover:text-white"
-          aria-label="Close scanner"
-          @click="emit('close')"
-        >
-          <UIcon name="i-heroicons-x-mark" class="text-lg" />
-        </button>
-      </div>
-
-      <div class="p-3 sm:p-4">
-        <div v-if="error" class="border-2 border-[var(--color-danger)] p-3 text-xs text-[var(--color-danger)] text-center">
-          {{ error }}
+  <UModal v-model:open="open">
+    <template #content>
+      <div class="w-full max-w-sm border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
+        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] p-3 sm:p-4">
+          <p class="label">SCAN QR CODE</p>
+          <button
+            class="text-[var(--color-muted)] transition-colors hover:text-white"
+            aria-label="Close scanner"
+            @click="open = false"
+          >
+            <UIcon name="i-heroicons-x-mark" class="text-lg" />
+          </button>
         </div>
-        <div v-else class="relative aspect-square w-full overflow-hidden bg-black">
-          <div v-if="!streaming" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black">
-            <UIcon name="i-heroicons-camera" class="text-2xl text-[var(--color-border-muted)]" />
-            <p class="text-xs text-[var(--color-muted)]">Opening camera...</p>
+
+        <div class="p-3 sm:p-4">
+          <div v-if="error" class="border-2 border-[var(--color-danger)] p-3 text-xs text-[var(--color-danger)] text-center">
+            {{ error }}
           </div>
-          <video ref="videoRef" class="h-full w-full object-cover" />
-        </div>
+          <div v-else class="relative aspect-square w-full overflow-hidden bg-black">
+            <div v-if="!streaming" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black">
+              <UIcon name="i-heroicons-camera" class="text-2xl text-[var(--color-border-muted)]" />
+              <p class="text-xs text-[var(--color-muted)]">Opening camera...</p>
+            </div>
+            <video ref="videoRef" class="h-full w-full object-cover" />
+          </div>
 
-        <UButton variant="outline" class="w-full rounded-none mt-3" @click="emit('close')">
-          Cancel
-        </UButton>
+          <UButton variant="outline" class="w-full rounded-none mt-3" @click="open = false">
+            Cancel
+          </UButton>
+        </div>
       </div>
-    </div>
-  </div>
+    </template>
+  </UModal>
 </template>

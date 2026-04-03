@@ -3,24 +3,8 @@ import QRCode from "qrcode";
 import { truncateNodeId } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
-const { nodeId } = useCall();
+const { nodeId, displayName } = useCall();
 const { settings, save, togglePersistentIdentity } = useSettings();
-
-// ── Identity ──────────────────────────────────────────────
-const displayNameInput = ref(settings.value.displayName);
-const editingName = ref(false);
-const nameSaved = ref(false);
-
-watch(() => settings.value.displayName, (v) => {
-  if (!editingName.value) displayNameInput.value = v;
-});
-
-async function saveName() {
-  editingName.value = false;
-  await save({ displayName: displayNameInput.value });
-  nameSaved.value = true;
-  setTimeout(() => { nameSaved.value = false; }, 1500);
-}
 
 const truncatedNodeId = computed(() => {
   const id = nodeId.value;
@@ -135,16 +119,9 @@ onMounted(loadDevices);
 </script>
 
 <template>
-  <div class="min-h-screen bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
     <!-- Header -->
-    <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center gap-3 sticky top-0 bg-[var(--color-surface)] z-10">
-      <button
-        class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors flex items-center gap-1.5"
-        aria-label="Back"
-        @click="navigateTo('/')"
-      >
-        <UIcon name="i-heroicons-arrow-left" class="text-base" />
-      </button>
+    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 sticky top-0 bg-[var(--color-surface)] z-10">
       <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">SETTINGS</h1>
     </div>
 
@@ -159,23 +136,7 @@ onMounted(loadDevices);
         <!-- Display Name -->
         <div class="px-4 sm:px-6 py-4 border-b border-[var(--color-border-muted)]">
           <p class="label mb-2">DISPLAY NAME</p>
-          <div class="flex gap-0">
-            <input
-              v-model="displayNameInput"
-              type="text"
-              class="flex-1 bg-black border-2 border-[var(--color-border)] px-3 py-2 text-sm text-[var(--color-border)] font-mono outline-none focus:border-[var(--color-accent)] transition-colors"
-              placeholder="Enter display name..."
-              @focus="editingName = true"
-              @keydown.enter="saveName"
-            />
-            <button
-              class="border-2 border-l-0 border-[var(--color-border)] px-4 py-2 text-xs font-bold tracking-widest transition-colors hover:bg-[var(--color-border)] hover:text-black"
-              :class="nameSaved ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : ''"
-              @click="saveName"
-            >
-              {{ nameSaved ? "SAVED" : "SAVE" }}
-            </button>
-          </div>
+          <NameInput v-model="displayName" />
         </div>
 
         <!-- Node ID -->
@@ -388,46 +349,41 @@ onMounted(loadDevices);
     </div>
 
     <!-- QR Modal for Node ID -->
-    <div
-      v-if="qrModalOpen"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-      @click.self="qrModalOpen = false"
-    >
-      <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
-        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-          <p class="label" style="letter-spacing: 4px;">NODE ID</p>
-          <button
-            class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-            aria-label="Close QR modal"
-            @click="qrModalOpen = false"
-          >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
-        </div>
-        <div class="p-4 space-y-3">
-          <div class="flex justify-center bg-white p-3">
-            <img
-              v-if="qrDataUrl"
-              :src="qrDataUrl"
-              alt="Node ID QR code"
-              class="w-48 h-48"
-            />
-            <div
-              v-else
-              class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
+    <UModal v-model:open="qrModalOpen">
+      <template #content>
+        <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
+          <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
+            <p class="label" style="letter-spacing: 4px;">NODE ID</p>
+            <button
+              class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
+              aria-label="Close QR modal"
+              @click="qrModalOpen = false"
             >
-              {{ nodeId ? "Generating..." : "No node ID" }}
-            </div>
+              <UIcon name="i-heroicons-x-mark" class="text-lg" />
+            </button>
           </div>
-          <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
-          <button
-            class="w-full border-2 border-[var(--color-border)] py-2 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-            @click="qrModalOpen = false"
-          >
-            CLOSE
-          </button>
+          <div class="p-4 space-y-3">
+            <div class="flex justify-center bg-white p-3">
+              <img
+                v-if="qrDataUrl"
+                :src="qrDataUrl"
+                alt="Node ID QR code"
+                class="w-48 h-48"
+              />
+              <div
+                v-else
+                class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
+              >
+                {{ nodeId ? "Generating..." : "No node ID" }}
+              </div>
+            </div>
+            <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
+            <UButton variant="outline" class="w-full rounded-none" @click="qrModalOpen = false">
+              CLOSE
+            </UButton>
+          </div>
         </div>
-      </div>
-    </div>
+      </template>
+    </UModal>
   </div>
 </template>

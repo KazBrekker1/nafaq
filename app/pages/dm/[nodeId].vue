@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { DmMessageItem } from "../../composables/useDM";
+import type { DmMessageItem } from "~/composables/useDM";
 import { formatTime, truncateNodeId } from "~/utils/format";
 
 const route = useRoute();
@@ -200,11 +200,10 @@ onUnmounted(async () => {
       />
 
       <!-- Text input -->
-      <input
+      <UInput
         v-model="inputText"
-        type="text"
-        class="flex-1 bg-black border-2 border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-border)] font-mono outline-none focus:border-[var(--color-accent)] transition-colors"
         placeholder="Type a message..."
+        class="flex-1 rounded-none font-mono text-xs"
         @keydown.enter="send"
       />
 

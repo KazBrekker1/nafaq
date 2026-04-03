@@ -31,5 +31,5 @@ function onScan(ticket: string) {
     </div>
   </div>
 
-  <QrScanner v-if="showScanner" @scan="onScan" @close="showScanner = false" />
+  <QrScanner v-model:open="showScanner" @scan="onScan" />
 </template>

@@ -63,22 +63,13 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
 
     <!-- Header -->
-    <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center justify-between sticky top-0 bg-[var(--color-surface)] z-10">
-      <div class="flex items-center gap-3">
-        <button
-          class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors flex items-center gap-1.5"
-          aria-label="Back"
-          @click="navigateTo('/')"
-        >
-          <UIcon name="i-heroicons-arrow-left" class="text-base" />
-        </button>
-        <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">CONTACTS</h1>
-      </div>
+    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 flex items-center justify-between sticky top-0 bg-[var(--color-surface)] z-10">
+      <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">CONTACTS</h1>
       <button
-        class="border-2 border-[var(--color-border)] px-3 py-1.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
+        class="text-xs font-bold tracking-widest text-[var(--color-accent)] hover:text-white transition-colors"
         @click="addModalOpen = true"
       >
         + ADD
@@ -193,47 +184,42 @@ onUnmounted(() => {
     </div>
 
     <!-- QR Modal for own node ID -->
-    <div
-      v-if="qrModalOpen"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
-      @click.self="qrModalOpen = false"
-    >
-      <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
-        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-          <p class="label" style="letter-spacing: 4px;">NODE ID</p>
-          <button
-            class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-            aria-label="Close QR modal"
-            @click="qrModalOpen = false"
-          >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
-        </div>
-        <div class="p-4 space-y-3">
-          <div class="flex justify-center bg-white p-3">
-            <img
-              v-if="qrDataUrl"
-              :src="qrDataUrl"
-              alt="Node ID QR code"
-              class="w-48 h-48"
-            />
-            <div
-              v-else
-              class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
+    <UModal v-model:open="qrModalOpen">
+      <template #content>
+        <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
+          <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
+            <p class="label" style="letter-spacing: 4px;">NODE ID</p>
+            <button
+              class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
+              aria-label="Close QR modal"
+              @click="qrModalOpen = false"
             >
-              {{ nodeId ? "Generating..." : "No node ID" }}
-            </div>
+              <UIcon name="i-heroicons-x-mark" class="text-lg" />
+            </button>
           </div>
-          <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
-          <button
-            class="w-full border-2 border-[var(--color-border)] py-2 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-            @click="qrModalOpen = false"
-          >
-            CLOSE
-          </button>
+          <div class="p-4 space-y-3">
+            <div class="flex justify-center bg-white p-3">
+              <img
+                v-if="qrDataUrl"
+                :src="qrDataUrl"
+                alt="Node ID QR code"
+                class="w-48 h-48"
+              />
+              <div
+                v-else
+                class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
+              >
+                {{ nodeId ? "Generating..." : "No node ID" }}
+              </div>
+            </div>
+            <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
+            <UButton variant="outline" class="w-full rounded-none" @click="qrModalOpen = false">
+              CLOSE
+            </UButton>
+          </div>
         </div>
-      </div>
-    </div>
+      </template>
+    </UModal>
 
     <!-- Add Contact Modal -->
     <AddContactModal

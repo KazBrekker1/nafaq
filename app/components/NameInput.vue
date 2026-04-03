@@ -1,8 +1,5 @@
 <script setup lang="ts">
-const { modelValue } = defineProps<{ modelValue: string }>();
-const emit = defineEmits<{
-  "update:modelValue": [value: string];
-}>();
+const model = defineModel<string>({ required: true });
 
 const pinned = ref(false);
 const loaded = ref(false);
@@ -12,7 +9,7 @@ onMounted(async () => {
     const { invoke } = await import("@tauri-apps/api/core");
     const savedName = await invoke<string | null>("get_pinned_name");
     if (savedName) {
-      emit("update:modelValue", savedName);
+      model.value = savedName;
       pinned.value = true;
     }
   } catch {}
@@ -24,19 +21,15 @@ async function togglePin() {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("set_pinned_name", {
-      name: pinned.value ? modelValue : null,
+      name: pinned.value ? model.value : null,
       pinned: pinned.value,
     });
   } catch {}
 }
 
-function onInput(value: string) {
-  emit("update:modelValue", value);
-}
-
 // Debounced persist — avoids an IPC call on every keystroke
 let persistTimer: ReturnType<typeof setTimeout>;
-watch(() => modelValue, (name) => {
+watch(() => model.value, (name) => {
   if (!pinned.value || !loaded.value) return;
   clearTimeout(persistTimer);
   persistTimer = setTimeout(async () => {
@@ -51,10 +44,9 @@ watch(() => modelValue, (name) => {
 <template>
   <div class="flex items-center gap-2">
     <UInput
-      :model-value="modelValue"
+      v-model="model"
       placeholder="Your name"
       class="flex-1 rounded-none text-sm text-center"
-      @update:model-value="onInput"
     />
     <button
       v-if="loaded"

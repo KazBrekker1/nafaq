@@ -1,9 +1,6 @@
 <script setup lang="ts">
-const props = defineProps<{ open: boolean }>();
-const emit = defineEmits<{
-  "update:open": [value: boolean];
-  added: [];
-}>();
+const open = defineModel<boolean>('open', { required: true });
+const emit = defineEmits<{ added: [] }>();
 
 const { add } = useContacts();
 
@@ -14,11 +11,11 @@ const error = ref<string | null>(null);
 const showScanner = ref(false);
 
 function close() {
-  emit("update:open", false);
+  open.value = false;
 }
 
-watch(() => props.open, (open) => {
-  if (open) {
+watch(() => open.value, (isOpen) => {
+  if (isOpen) {
     nodeIdInput.value = "";
     nameInput.value = "";
     error.value = null;
@@ -61,93 +58,89 @@ async function handleSave() {
 </script>
 
 <template>
-  <div
-    v-if="open"
-    class="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/80 p-4"
-    @click.self="close"
-  >
-    <div class="w-full max-w-sm my-auto border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
+  <UModal v-model:open="open">
+    <template #content>
+      <div class="w-full max-w-sm border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
 
-      <!-- Header -->
-      <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-        <p class="label" style="letter-spacing: 4px;">ADD CONTACT</p>
-        <button
-          class="text-[var(--color-muted)] transition-colors hover:text-white"
-          aria-label="Close"
-          @click="close"
-        >
-          <UIcon name="i-heroicons-x-mark" class="text-lg" />
-        </button>
-      </div>
-
-      <div class="p-4 space-y-4">
-
-        <!-- Node ID input -->
-        <div>
-          <p class="label mb-2">NODE ID</p>
-          <div class="flex gap-0">
-            <input
-              v-model="nodeIdInput"
-              type="text"
-              class="flex-1 bg-black border-2 border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-border)] font-mono outline-none focus:border-[var(--color-accent)] transition-colors min-w-0"
-              placeholder="Paste node ID..."
-              @keydown.enter="handleSave"
-            />
-            <button
-              class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors shrink-0"
-              title="Scan QR code"
-              @click="showScanner = true"
-            >
-              QR
-            </button>
-          </div>
-        </div>
-
-        <!-- Display name input -->
-        <div>
-          <p class="label mb-2">DISPLAY NAME</p>
-          <input
-            v-model="nameInput"
-            type="text"
-            class="w-full bg-black border-2 border-[var(--color-border)] px-3 py-2 text-xs text-[var(--color-border)] font-mono outline-none focus:border-[var(--color-accent)] transition-colors"
-            placeholder="Optional name..."
-            @keydown.enter="handleSave"
-          />
-        </div>
-
-        <!-- Error -->
-        <div
-          v-if="error"
-          class="border-2 border-[var(--color-danger)] p-2 text-xs text-[var(--color-danger)]"
-        >
-          {{ error }}
-        </div>
-
-        <!-- Actions -->
-        <div class="flex gap-0">
+        <!-- Header -->
+        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
+          <p class="label" style="letter-spacing: 4px;">ADD CONTACT</p>
           <button
-            class="flex-1 border-2 border-[var(--color-border)] py-2 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors disabled:opacity-40"
-            :disabled="saving || !nodeIdInput.trim()"
-            @click="handleSave"
-          >
-            {{ saving ? "SAVING..." : "SAVE" }}
-          </button>
-          <button
-            class="flex-1 border-2 border-l-0 border-[var(--color-border)] py-2 text-xs font-bold tracking-widest text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
+            class="text-[var(--color-muted)] transition-colors hover:text-white"
+            aria-label="Close"
             @click="close"
           >
-            CANCEL
+            <UIcon name="i-heroicons-x-mark" class="text-lg" />
           </button>
         </div>
 
-      </div>
-    </div>
-  </div>
+        <div class="p-4 space-y-4">
 
-  <!-- QR Scanner (full-screen overlay, rendered outside modal) -->
+          <!-- Node ID input -->
+          <div>
+            <p class="label mb-2">NODE ID</p>
+            <div class="flex gap-0">
+              <UInput
+                v-model="nodeIdInput"
+                placeholder="Paste node ID..."
+                class="flex-1 rounded-none font-mono text-xs"
+                @keydown.enter="handleSave"
+              />
+              <button
+                class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors shrink-0"
+                title="Scan QR code"
+                @click="showScanner = true"
+              >
+                QR
+              </button>
+            </div>
+          </div>
+
+          <!-- Display name input -->
+          <div>
+            <p class="label mb-2">DISPLAY NAME</p>
+            <UInput
+              v-model="nameInput"
+              placeholder="Optional name..."
+              class="w-full rounded-none font-mono text-xs"
+              @keydown.enter="handleSave"
+            />
+          </div>
+
+          <!-- Error -->
+          <div
+            v-if="error"
+            class="border-2 border-[var(--color-danger)] p-2 text-xs text-[var(--color-danger)]"
+          >
+            {{ error }}
+          </div>
+
+          <!-- Actions -->
+          <div class="flex gap-0">
+            <UButton
+              class="flex-1 rounded-none"
+              :disabled="saving || !nodeIdInput.trim()"
+              @click="handleSave"
+            >
+              {{ saving ? "SAVING..." : "SAVE" }}
+            </UButton>
+            <UButton
+              variant="outline"
+              class="flex-1 rounded-none border-l-0"
+              @click="close"
+            >
+              CANCEL
+            </UButton>
+          </div>
+
+        </div>
+      </div>
+    </template>
+  </UModal>
+
+  <!-- QR Scanner (rendered outside modal) -->
   <QrScanner
-    v-if="showScanner"
+    v-model:open="showScanner"
     @scan="handleScan"
-    @close="showScanner = false"
   />
 </template>

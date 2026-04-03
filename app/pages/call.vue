@@ -350,11 +350,10 @@ function handleSendChat(text: string) {
     />
 
     <ConnectionShareModal
-      :open="shareModalOpen"
+      v-model:open="shareModalOpen"
       :ticket="shareConnectionTicket"
       title="SHARE CONNECTION"
       description="Use this QR code or connection string to bring another device into the call."
-      @close="shareModalOpen = false"
     />
   </div>
 </template>

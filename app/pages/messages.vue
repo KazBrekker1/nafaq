@@ -55,17 +55,10 @@ const sortedConversations = computed(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
 
     <!-- Header -->
-    <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center gap-3 sticky top-0 bg-[var(--color-surface)] z-10">
-      <button
-        class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors flex items-center gap-1.5"
-        aria-label="Back"
-        @click="navigateTo('/')"
-      >
-        <UIcon name="i-heroicons-arrow-left" class="text-base" />
-      </button>
+    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 sticky top-0 bg-[var(--color-surface)] z-10">
       <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">MESSAGES</h1>
     </div>
 

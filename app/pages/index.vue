@@ -5,7 +5,7 @@ const hasName = computed(() => displayName.value.trim().length > 0);
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center p-4 sm:p-8 safe-area-inset-min">
+  <div class="min-h-full flex items-center justify-center p-4 sm:p-8 safe-area-inset-min">
     <div class="w-full max-w-xl">
       <div class="flex items-center justify-center gap-2 mb-6 sm:mb-8">
         <ConnectionProgress :step="connectionProgress" />

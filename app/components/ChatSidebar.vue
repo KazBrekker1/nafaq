@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { ChatMessage } from "../composables/useChat";
+import type { ChatMessage } from "~/composables/useChat";
 import { formatTime } from "~/utils/format";
 
 const { messages, displayName = "", peerNames = {} } = defineProps<{

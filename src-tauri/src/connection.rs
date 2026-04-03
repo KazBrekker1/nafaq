@@ -55,6 +55,7 @@ struct ActiveFileReceive {
     file: tokio::fs::File,
     temp_path: std::path::PathBuf,
     final_name: String,
+    #[allow(dead_code)]
     expected_size: u64,
     received_bytes: u64,
 }
@@ -297,6 +298,7 @@ impl ConnectionManager {
         *self.endpoint.lock().await = Some(endpoint);
     }
 
+    #[allow(dead_code)]
     pub async fn peer_count(&self) -> usize {
         self.peers.lock().await.len()
     }
@@ -1069,7 +1071,7 @@ impl ConnectionManager {
     pub async fn snapshot_network_stats(&self) -> Vec<NetworkPeerStats> {
         let peers = self.peers.lock().await;
         let video_state = self.video_receive_state.lock().await;
-        let now_ms = SystemTime::now()
+        let _now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);

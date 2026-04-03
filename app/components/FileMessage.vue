@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { formatSize } from "~/utils/format";
 
-const props = defineProps<{
+const { progress, localPath } = defineProps<{
   name: string;
   size: number;
   progress: number;
@@ -9,15 +9,14 @@ const props = defineProps<{
   from: "self" | "peer";
 }>();
 
-const isComplete = computed(() => props.progress >= 1);
-const progressPct = computed(() => Math.round(props.progress * 100));
+const isComplete = computed(() => progress >= 1);
+const progressPct = computed(() => Math.round(progress * 100));
 
 async function openFile() {
-  if (!props.localPath) return;
+  if (!localPath) return;
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    // Try shell open via tauri-plugin-shell
-    await invoke("plugin:shell|open", { path: props.localPath }).catch(() => {});
+    await invoke("plugin:shell|open", { path: localPath }).catch(() => {});
   } catch {
     // Silently fail — best-effort
   }
