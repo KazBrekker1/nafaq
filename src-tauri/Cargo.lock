@@ -2996,6 +2996,7 @@ dependencies = [
  "openh264",
  "opus",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tauri",
  "tauri-build",

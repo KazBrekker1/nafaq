@@ -402,13 +402,28 @@ pub async fn send_file(
 ) -> Result<FileTransferResult, String> {
     validate_peer_id(&peer_id)?;
     let path = std::path::PathBuf::from(&file_path);
-    let name = path
+
+    // Resolve symlinks and ../ traversal, then restrict to home directory
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "Could not determine home directory".to_string())?;
+    let canonical = tokio::fs::canonicalize(&path).await.map_err(|e| format!("Invalid file path: {e}"))?;
+    if !canonical.starts_with(&home) {
+        return Err("File path outside allowed directory".into());
+    }
+
+    let name = canonical
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("Invalid file name")?
         .to_string();
-    let metadata = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| e.to_string())?;
     let size = metadata.len();
+    const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
+    if size > MAX_FILE_SIZE {
+        return Err(format!("File too large ({} bytes, max {} bytes)", size, MAX_FILE_SIZE));
+    }
     let id = uuid::Uuid::new_v4().to_string();
 
     // Send FileStart
@@ -424,7 +439,7 @@ pub async fn send_file(
 
     // Stream file in 64KB chunks
     use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(&path).await.map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::open(&canonical).await.map_err(|e| e.to_string())?;
     let mut offset = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -475,6 +490,11 @@ pub async fn send_dm(
 ) -> Result<(), String> {
     let dm_msg: DmMessage =
         serde_json::from_value(message).map_err(|e| e.to_string())?;
+    if let DmMessage::Text { ref content, .. } = dm_msg {
+        if content.len() > MAX_CHAT_LEN {
+            return Err("DM text too long".into());
+        }
+    }
     state
         .conn_manager
         .send_dm(&peer_id, &dm_msg)

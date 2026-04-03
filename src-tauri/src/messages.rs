@@ -21,7 +21,7 @@ pub enum ContactSource {
 pub enum DmMessage {
     Text { content: String, timestamp: u64 },
     FileStart { name: String, size: u64, id: String },
-    FileChunk { id: String, offset: u64, data: Vec<u8> },
+    FileChunk { id: String, offset: u64, #[serde(with = "serde_bytes")] data: Vec<u8> },
     FileEnd { id: String },
     CallInvite,
     CallAccept,
