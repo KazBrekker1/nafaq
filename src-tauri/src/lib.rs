@@ -224,6 +224,7 @@ pub fn run() {
                                 Event::DmConnected { .. } => "dm-connected",
                                 Event::DmDisconnected { .. } => "dm-disconnected",
                                 Event::CallInviteReceived { .. } => "call-invite-received",
+                                Event::DmFileSaved { .. } => "dm-file-saved",
                                 Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);

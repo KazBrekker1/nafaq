@@ -215,6 +215,11 @@ pub enum Event {
     CallInviteReceived {
         peer_id: String,
     },
+    DmFileSaved {
+        peer_id: String,
+        file_id: String,
+        local_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

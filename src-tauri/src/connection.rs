@@ -51,6 +51,150 @@ use crate::messages::{
     STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO,
 };
 
+struct ActiveFileReceive {
+    file: tokio::fs::File,
+    temp_path: std::path::PathBuf,
+    final_name: String,
+    expected_size: u64,
+    received_bytes: u64,
+}
+
+/// Resolve a unique file path in the target directory, appending `(N)` if needed.
+fn unique_file_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|s| s.to_str());
+    for i in 1u32.. {
+        let new_name = match ext {
+            Some(e) => format!("{stem} ({i}).{e}"),
+            None => format!("{stem} ({i})"),
+        };
+        let p = dir.join(&new_name);
+        if !p.exists() {
+            return p;
+        }
+    }
+    candidate // unreachable in practice
+}
+
+/// Process a single DM message, handling file reconstruction when appropriate.
+/// Returns `true` if the caller should `continue` (i.e. skip emitting DmReceived).
+async fn handle_dm_file_message(
+    dm_msg: &DmMessage,
+    peer_id: &str,
+    active_files: &mut HashMap<String, ActiveFileReceive>,
+    event_tx: &broadcast::Sender<Event>,
+) -> bool {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    match dm_msg {
+        DmMessage::FileStart { name, size, id } => {
+            let temp_dir = std::env::temp_dir();
+            let temp_path = temp_dir.join(format!("nafaq_recv_{id}"));
+            match tokio::fs::File::create(&temp_path).await {
+                Ok(file) => {
+                    active_files.insert(id.clone(), ActiveFileReceive {
+                        file,
+                        temp_path,
+                        final_name: name.clone(),
+                        expected_size: *size,
+                        received_bytes: 0,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create temp file for transfer {id}: {e}");
+                }
+            }
+            false // still emit DmReceived so frontend shows the file
+        }
+        DmMessage::FileChunk { id, offset, data } => {
+            if let Some(recv) = active_files.get_mut(id) {
+                // Seek to the correct offset and write
+                if recv.file.seek(std::io::SeekFrom::Start(*offset)).await.is_ok() {
+                    if let Err(e) = recv.file.write_all(data).await {
+                        tracing::warn!("Failed to write chunk for transfer {id}: {e}");
+                    } else {
+                        recv.received_bytes = (*offset + data.len() as u64).max(recv.received_bytes);
+                    }
+                }
+            } else {
+                tracing::debug!("FileChunk for unknown transfer {id}, ignoring");
+            }
+            false
+        }
+        DmMessage::FileEnd { id } => {
+            if let Some(mut recv) = active_files.remove(id) {
+                // Flush and close the temp file
+                let _ = recv.file.flush().await;
+                drop(recv.file);
+
+                // Determine downloads directory
+                let downloads_dir = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+                    .unwrap_or_else(|_| std::env::temp_dir());
+
+                // Ensure the directory exists
+                let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+
+                let final_path = unique_file_path(&downloads_dir, &recv.final_name);
+
+                match tokio::fs::rename(&recv.temp_path, &final_path).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "File transfer {id} complete: {} ({} bytes) -> {}",
+                            recv.final_name,
+                            recv.received_bytes,
+                            final_path.display()
+                        );
+                        let _ = event_tx.send(Event::DmFileSaved {
+                            peer_id: peer_id.to_string(),
+                            file_id: id.clone(),
+                            local_path: final_path.to_string_lossy().to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        // rename can fail across filesystems; fall back to copy + remove
+                        tracing::debug!("rename failed ({e}), trying copy fallback");
+                        match tokio::fs::copy(&recv.temp_path, &final_path).await {
+                            Ok(_) => {
+                                let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                                tracing::info!(
+                                    "File transfer {id} complete (copy): {} -> {}",
+                                    recv.final_name,
+                                    final_path.display()
+                                );
+                                let _ = event_tx.send(Event::DmFileSaved {
+                                    peer_id: peer_id.to_string(),
+                                    file_id: id.clone(),
+                                    local_path: final_path.to_string_lossy().to_string(),
+                                });
+                            }
+                            Err(e2) => {
+                                tracing::warn!(
+                                    "Failed to save file for transfer {id}: rename={e}, copy={e2}"
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!("FileEnd for unknown transfer {id}, ignoring");
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 struct PeerConnection {
     connection: Connection,
     chat_send: Arc<Mutex<Option<SendStream>>>,
@@ -583,6 +727,8 @@ impl ConnectionManager {
         event_tx: broadcast::Sender<Event>,
         peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     ) {
+        let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+
         loop {
             match crate::messages::read_framed(&mut recv).await {
                 Ok(Some(data)) => match stream_type {
@@ -617,6 +763,9 @@ impl ConnectionManager {
                                     peer_id: peer_id.to_string(),
                                 });
                             }
+                            handle_dm_file_message(
+                                &dm_msg, peer_id, &mut active_files, &event_tx,
+                            ).await;
                             let _ = event_tx.send(Event::DmReceived {
                                 peer_id: peer_id.to_string(),
                                 message: dm_msg,
@@ -631,6 +780,13 @@ impl ConnectionManager {
                     break;
                 }
             }
+        }
+
+        // Clean up any incomplete temp files on stream close
+        for (id, recv) in active_files {
+            tracing::debug!("Cleaning up incomplete file transfer {id}");
+            drop(recv.file);
+            let _ = tokio::fs::remove_file(&recv.temp_path).await;
         }
     }
 
