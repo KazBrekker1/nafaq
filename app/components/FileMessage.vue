@@ -11,6 +11,17 @@ const props = defineProps<{
 
 const isComplete = computed(() => props.progress >= 1);
 const progressPct = computed(() => Math.round(props.progress * 100));
+
+async function openFile() {
+  if (!props.localPath) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    // Try shell open via tauri-plugin-shell
+    await invoke("plugin:shell|open", { path: props.localPath }).catch(() => {});
+  } catch {
+    // Silently fail — best-effort
+  }
+}
 </script>
 
 <template>
@@ -41,9 +52,20 @@ const progressPct = computed(() => Math.round(props.progress * 100));
       <p class="text-[9px] text-[var(--color-muted)] font-mono mt-1">{{ progressPct }}%</p>
     </div>
 
-    <!-- Completion status badge -->
+    <!-- Completion: OPEN button if localPath available, otherwise status badge -->
     <div
-      v-if="isComplete"
+      v-if="isComplete && localPath"
+      class="border-t border-[var(--color-accent)]/40"
+    >
+      <button
+        class="w-full px-3 py-1.5 text-[10px] font-bold tracking-widest text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-black transition-colors"
+        @click="openFile"
+      >
+        OPEN
+      </button>
+    </div>
+    <div
+      v-else-if="isComplete"
       class="border-t border-[var(--color-accent)]/40 px-3 py-1.5"
     >
       <p class="text-[10px] font-bold tracking-widest text-[var(--color-accent)] font-mono">

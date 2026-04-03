@@ -35,6 +35,16 @@ export function useDM() {
     if (dmListenerInitialized) return;
     dmListenerInitialized = true;
     const { listen } = await import("@tauri-apps/api/event");
+    listen<any>("dm-file-saved", (event) => {
+      const { peer_id, file_id, local_path } = event.payload;
+      if (!peer_id || !file_id) return;
+      const fileMsg = findFileMsg(peer_id, file_id);
+      if (fileMsg) {
+        fileMsg.localPath = local_path;
+        conversations.value = { ...conversations.value };
+      }
+    });
+
     listen<any>("dm-received", (event) => {
       const { peer_id, message } = event.payload;
       if (!peer_id || !message) return;
