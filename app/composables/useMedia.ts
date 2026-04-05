@@ -105,7 +105,7 @@ export function useMedia() {
       function update() {
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i]!;
         micLevel.value = sum / (dataArray.length * 255);
         micLevelRafId = requestAnimationFrame(update);
       }
