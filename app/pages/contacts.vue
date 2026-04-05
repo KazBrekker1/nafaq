@@ -2,7 +2,7 @@
 import QRCode from "qrcode";
 import { truncateNodeId } from "~/utils/format";
 
-const { nodeId, displayName, joinCall } = useCall();
+const { nodeId, displayName } = useCall();
 const { contacts, remove } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { settings } = useSettings();
@@ -47,7 +47,7 @@ function avatarLetter(name: string) {
 }
 
 function handleCall(nodeId: string) {
-  joinCall(nodeId);
+  navigateTo('/dm/' + nodeId);
 }
 
 // ── Presence ──────────────────────────────────────────────
@@ -186,7 +186,7 @@ onUnmounted(() => {
     <!-- QR Modal for own node ID -->
     <UModal v-model:open="qrModalOpen">
       <template #content>
-        <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
+        <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
           <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
             <p class="label" style="letter-spacing: 4px;">NODE ID</p>
             <button

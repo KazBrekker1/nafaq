@@ -23,7 +23,7 @@ pub enum DmMessage {
     FileStart { name: String, size: u64, id: String },
     FileChunk { id: String, offset: u64, #[serde(with = "serde_bytes")] data: Vec<u8> },
     FileEnd { id: String },
-    CallInvite,
+    CallInvite { ticket: String },
     CallAccept,
     CallDecline,
     Heartbeat,
@@ -214,6 +214,7 @@ pub enum Event {
     },
     CallInviteReceived {
         peer_id: String,
+        ticket: String,
     },
     DmFileSaved {
         peer_id: String,

@@ -7,8 +7,8 @@ const peerId = computed(() => route.params.nodeId as string);
 
 const { conversations, connect, disconnect, sendText, sendFile, markRead } = useDM();
 const { contacts } = useContacts();
-const { isOnline } = usePresence();
-const { joinCall } = useCall();
+const { isOnline, startProbing, stopProbing } = usePresence();
+const { createCall, shareTicket } = useCall();
 
 // ── Contact info ──────────────────────────────────────────
 
@@ -50,50 +50,45 @@ async function send() {
 
 // ── File attach ───────────────────────────────────────────
 
-const fileInputEl = ref<HTMLInputElement | null>(null);
-
 async function openFilePicker() {
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const path = await open({ multiple: false });
     if (path) await sendFile(peerId.value, path as string);
-  } catch {
-    // Fallback to hidden file input if plugin not available
-    fileInputEl.value?.click();
+  } catch (e) {
+    console.warn("[dm] File picker failed:", e);
   }
-}
-
-async function onFileInputChange(e: Event) {
-  const input = e.target as HTMLInputElement;
-  const file = input.files?.[0];
-  if (!file) return;
-  // In Tauri, file.name gives the name; for path we use webkitRelativePath or name
-  // Best-effort: send the file name as path (backend may need real path)
-  const path = (file as any).path || file.name;
-  await sendFile(peerId.value, path);
-  input.value = "";
 }
 
 // ── Call escalation ───────────────────────────────────────
 
 async function initiateCall() {
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("send_dm", {
-    peerId: peerId.value,
-    message: { type: "call_invite" },
-  }).catch(() => {});
+  // Create a call first, then send the ticket via DM
+  await createCall();
+  const t = shareTicket.value;
+  if (t) {
+    await invoke("send_dm", {
+      peerId: peerId.value,
+      message: { type: "call_invite", ticket: t },
+    }).catch(() => {});
+  }
   navigateTo("/");
 }
 
 // ── Lifecycle ─────────────────────────────────────────────
 
+const peerIds = computed(() => [peerId.value]);
+
 onMounted(async () => {
   await connect(peerId.value);
   markRead(peerId.value);
   await scrollToBottom();
+  startProbing(peerIds);
 });
 
 onUnmounted(async () => {
+  stopProbing();
   await disconnect();
 });
 </script>
@@ -190,14 +185,6 @@ onUnmounted(async () => {
       >
         <UIcon name="i-heroicons-paper-clip" class="text-lg" />
       </button>
-
-      <!-- Hidden fallback file input -->
-      <input
-        ref="fileInputEl"
-        type="file"
-        class="hidden"
-        @change="onFileInputChange"
-      />
 
       <!-- Text input -->
       <UInput

@@ -30,59 +30,73 @@ function findFileMsg(peerId: string, fileId: string): DmFileMessage | undefined 
   return msgs.find(m => m.type === "file" && (m as DmFileMessage).id === fileId) as DmFileMessage | undefined;
 }
 
-export function useDM() {
-  async function initListener() {
-    if (dmListenerInitialized) return;
-    dmListenerInitialized = true;
-    const { listen } = await import("@tauri-apps/api/event");
-    listen<any>("dm-file-saved", (event) => {
-      const { peer_id, file_id, local_path } = event.payload;
-      if (!peer_id || !file_id) return;
-      const fileMsg = findFileMsg(peer_id, file_id);
-      if (fileMsg) {
-        fileMsg.localPath = local_path;
-        conversations.value = { ...conversations.value };
-      }
-    });
-
-    listen<any>("dm-received", (event) => {
-      const { peer_id, message } = event.payload;
-      if (!peer_id || !message) return;
-      if (message.type === "text") {
-        pushMessage(peer_id, {
-          type: "text",
-          content: message.content,
-          timestamp: message.timestamp,
-          from: "peer",
-        });
-      } else if (message.type === "file_start") {
-        pushMessage(peer_id, {
-          type: "file",
-          name: message.name,
-          size: message.size,
-          id: message.id,
-          progress: 0,
-          localPath: null,
-          from: "peer",
-          timestamp: Date.now(),
-        });
-      } else if (message.type === "file_chunk") {
-        // Update progress for the matching file message
-        const fileMsg = findFileMsg(peer_id, message.id);
-        if (fileMsg && fileMsg.size > 0) {
-          fileMsg.progress = Math.min(1, (message.offset + (message.data?.length || 0)) / fileMsg.size);
-        }
-      } else if (message.type === "file_end") {
-        const fileMsg = findFileMsg(peer_id, message.id);
-        if (fileMsg) {
-          fileMsg.progress = 1;
-        }
-      }
-    });
+function pushMessage(nodeId: string, msg: DmMessageItem) {
+  if (!conversations.value[nodeId]) {
+    conversations.value[nodeId] = [];
   }
+  conversations.value[nodeId].push(msg);
+  conversations.value = { ...conversations.value };
+  if (activeConversation.value !== nodeId) {
+    unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] || 0) + 1;
+    unreadCounts.value = { ...unreadCounts.value };
+  }
+}
+
+async function initDmListeners() {
+  if (dmListenerInitialized) return;
+  dmListenerInitialized = true;
+  const { listen } = await import("@tauri-apps/api/event");
+  listen<any>("dm-file-saved", (event) => {
+    const { peer_id, file_id, local_path } = event.payload;
+    if (!peer_id || !file_id) return;
+    const fileMsg = findFileMsg(peer_id, file_id);
+    if (fileMsg) {
+      fileMsg.localPath = local_path;
+      conversations.value = { ...conversations.value };
+    }
+  });
+
+  listen<any>("dm-received", (event) => {
+    const { peer_id, message } = event.payload;
+    if (!peer_id || !message) return;
+    if (message.type === "text") {
+      pushMessage(peer_id, {
+        type: "text",
+        content: message.content,
+        timestamp: message.timestamp,
+        from: "peer",
+      });
+    } else if (message.type === "file_start") {
+      pushMessage(peer_id, {
+        type: "file",
+        name: message.name,
+        size: message.size,
+        id: message.id,
+        progress: 0,
+        localPath: null,
+        from: "peer",
+        timestamp: Date.now(),
+      });
+    } else if (message.type === "file_chunk") {
+      const fileMsg = findFileMsg(peer_id, message.id);
+      if (fileMsg && fileMsg.size > 0) {
+        fileMsg.progress = Math.min(1, (message.offset + (message.data?.length || 0)) / fileMsg.size);
+      }
+    } else if (message.type === "file_end") {
+      const fileMsg = findFileMsg(peer_id, message.id);
+      if (fileMsg) {
+        fileMsg.progress = 1;
+      }
+    }
+  });
+}
+
+export function useDM() {
+  // Auto-initialize listeners so passive consumers (TabBar, messages page)
+  // receive DM events without needing to call connect() first
+  initDmListeners();
 
   async function connect(nodeId: string) {
-    await initListener();
     const { invoke } = await import("@tauri-apps/api/core");
     await invoke("connect_dm", { nodeId });
     activeConversation.value = nodeId;
@@ -113,19 +127,6 @@ export function useDM() {
       type: "file", name, size: result.size, id: result.id, progress: 1,
       localPath: filePath, from: "self", timestamp: Date.now(),
     });
-  }
-
-  function pushMessage(nodeId: string, msg: DmMessageItem) {
-    if (!conversations.value[nodeId]) {
-      conversations.value[nodeId] = [];
-    }
-    conversations.value[nodeId].push(msg);
-    // Trigger Vue reactivity for the conversations ref
-    conversations.value = { ...conversations.value };
-    if (activeConversation.value !== nodeId) {
-      unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] || 0) + 1;
-      unreadCounts.value = { ...unreadCounts.value };
-    }
   }
 
   function markRead(nodeId: string) {

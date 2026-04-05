@@ -64,6 +64,8 @@ export function useCall() {
         await invoke("end_call", { peerId: p });
       }
     } catch {}
+    // Stop camera/mic preview if it was started by PreCallOverlay
+    useMedia().stopPreview();
     state.value = "idle";
     peerId.value = null;
     peers.value = [];
@@ -75,8 +77,12 @@ export function useCall() {
     navigateTo("/");
   }
 
-  function joinCallFromOverlay() {
+  async function joinCallFromOverlay() {
     showPreCallOverlay.value = false;
+    // If we have a ticket but haven't connected (incoming invite), join first
+    if (ticket.value && state.value !== "connected") {
+      await joinCall(ticket.value);
+    }
     navigateTo("/call");
   }
 
@@ -136,6 +142,8 @@ async function initCallListeners() {
       }
       allPeersLeft.value = false;
       peerId.value = pid;
+      // Only show pre-call overlay if user was in a call-related state
+      const wasInCall = state.value !== "idle";
       state.value = "connected";
       // Send our display name to the new peer
       if (displayName.value && pid) {
@@ -144,8 +152,9 @@ async function initCallListeners() {
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
       }
-      // Show pre-call overlay instead of auto-navigating
-      showPreCallOverlay.value = true;
+      if (wasInCall) {
+        showPreCallOverlay.value = true;
+      }
     });
 
     listen<any>("peer-disconnected", (event) => {
@@ -174,6 +183,17 @@ async function initCallListeners() {
       const action = data?.action;
       if (pid && action?.action === "set_display_name" && typeof action.name === "string") {
         peerNames.value = { ...peerNames.value, [pid]: action.name };
+      }
+    });
+
+    listen<any>("call-invite-received", (event) => {
+      const data = event.payload;
+      const pid = typeof data === "string" ? data : data?.peer_id;
+      const inviteTicket = data?.ticket;
+      if (pid && inviteTicket && state.value === "idle") {
+        ticket.value = inviteTicket;
+        peerId.value = pid;
+        showPreCallOverlay.value = true;
       }
     });
 

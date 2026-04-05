@@ -31,3 +31,28 @@ impl ProtocolHandler for NafaqProtocol {
         Ok(())
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct NafaqDmProtocol {
+    conn_manager: Arc<ConnectionManager>,
+}
+
+impl NafaqDmProtocol {
+    pub fn new(conn_manager: Arc<ConnectionManager>) -> Self {
+        Self { conn_manager }
+    }
+}
+
+impl ProtocolHandler for NafaqDmProtocol {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let peer_id = connection.remote_id();
+        tracing::info!("Accepted incoming DM connection from {peer_id}");
+
+        self.conn_manager
+            .handle_incoming_dm(connection)
+            .await
+            .map_err(|e| AcceptError::from_boxed(e.into()))?;
+
+        Ok(())
+    }
+}

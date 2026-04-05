@@ -338,6 +338,126 @@ impl ConnectionManager {
         self.setup_connection(peer_id, connection).await
     }
 
+    pub async fn handle_incoming_dm(&self, connection: Connection) -> Result<()> {
+        let peer_id = connection.remote_id().to_string();
+        tracing::info!("Setting up incoming DM connection from {peer_id}");
+        self.setup_dm_connection(peer_id, connection).await
+    }
+
+    async fn setup_dm_connection(&self, peer_id: String, connection: Connection) -> Result<()> {
+        let dm_peers_ref = self.dm_peers.clone();
+        let event_tx = self.event_tx.clone();
+        let peer_id_reader = peer_id.clone();
+        let connection_reader = connection.clone();
+
+        // Spawn bi-stream reader for incoming DM streams
+        tokio::spawn(async move {
+            loop {
+                match connection_reader.accept_bi().await {
+                    Ok((send, mut recv)) => {
+                        let mut type_buf = [0u8; 1];
+                        if recv.read_exact(&mut type_buf).await.is_err() {
+                            continue;
+                        }
+                        if type_buf[0] == STREAM_DM {
+                            let mut dm_peers = dm_peers_ref.lock().await;
+                            if !dm_peers.contains_key(&peer_id_reader) {
+                                dm_peers.insert(
+                                    peer_id_reader.clone(),
+                                    DmPeerConnection {
+                                        connection: connection_reader.clone(),
+                                        dm_send: Arc::new(Mutex::new(Some(send))),
+                                    },
+                                );
+                                let _ = event_tx.send(Event::DmConnected {
+                                    peer_id: peer_id_reader.clone(),
+                                });
+                            }
+                            drop(dm_peers);
+
+                            // Spawn reader for this DM stream
+                            let event_tx = event_tx.clone();
+                            let peer_id = peer_id_reader.clone();
+                            tokio::spawn(async move {
+                                let mut active_files: HashMap<String, ActiveFileReceive> =
+                                    HashMap::new();
+                                loop {
+                                    match crate::messages::read_framed(&mut recv).await {
+                                        Ok(Some(data)) => {
+                                            if let Ok(dm_msg) =
+                                                serde_json::from_slice::<DmMessage>(&data)
+                                            {
+                                                if matches!(dm_msg, DmMessage::Heartbeat) {
+                                                    continue;
+                                                }
+                                                if let DmMessage::CallInvite { ref ticket } = dm_msg {
+                                                    let _ =
+                                                        event_tx.send(Event::CallInviteReceived {
+                                                            peer_id: peer_id.clone(),
+                                                            ticket: ticket.clone(),
+                                                        });
+                                                }
+                                                handle_dm_file_message(
+                                                    &dm_msg,
+                                                    &peer_id,
+                                                    &mut active_files,
+                                                    &event_tx,
+                                                )
+                                                .await;
+                                                let _ = event_tx.send(Event::DmReceived {
+                                                    peer_id: peer_id.clone(),
+                                                    message: dm_msg,
+                                                });
+                                            }
+                                        }
+                                        Ok(None) => break,
+                                        Err(_) => break,
+                                    }
+                                }
+                                // Clean up incomplete temp files
+                                for (id, recv) in active_files {
+                                    tracing::debug!("Cleaning up incomplete file transfer {id}");
+                                    drop(recv.file);
+                                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                                }
+                            });
+                        }
+                        // Ignore non-DM streams on a DM connection
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Connection closed — clean up
+            let removed = dm_peers_ref.lock().await.remove(&peer_id_reader);
+            if removed.is_some() {
+                let _ = event_tx.send(Event::DmDisconnected {
+                    peer_id: peer_id_reader,
+                });
+            }
+        });
+
+        // Spawn a task to detect connection closure as a backstop
+        let event_tx_closed = self.event_tx.clone();
+        let dm_peers_closed = self.dm_peers.clone();
+        let peer_id_closed = peer_id;
+        tokio::spawn(async move {
+            connection.closed().await;
+            if dm_peers_closed
+                .lock()
+                .await
+                .remove(&peer_id_closed)
+                .is_some()
+            {
+                let _ = event_tx_closed.send(Event::DmDisconnected {
+                    peer_id: peer_id_closed,
+                });
+            }
+        });
+
+        Ok(())
+    }
+
     pub async fn connect_to_peer(
         &self,
         endpoint: &iroh::Endpoint,
@@ -760,9 +880,10 @@ impl ConnectionManager {
                             if matches!(dm_msg, DmMessage::Heartbeat) {
                                 continue;
                             }
-                            if matches!(dm_msg, DmMessage::CallInvite) {
+                            if let DmMessage::CallInvite { ref ticket } = dm_msg {
                                 let _ = event_tx.send(Event::CallInviteReceived {
                                     peer_id: peer_id.to_string(),
+                                    ticket: ticket.clone(),
                                 });
                             }
                             handle_dm_file_message(
@@ -1145,7 +1266,7 @@ impl ConnectionManager {
                 .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
         };
 
-        let connection: iroh::endpoint::Connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
+        let connection: iroh::endpoint::Connection = endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN).await?;
         let peer_id = connection.remote_id().to_string();
 
         let (mut dm_send, _): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) = connection.open_bi().await?;
@@ -1180,6 +1301,8 @@ impl ConnectionManager {
                         let event_tx = event_tx.clone();
                         let peer_id = peer_id_reader.clone();
                         tokio::spawn(async move {
+                            let mut active_files: HashMap<String, ActiveFileReceive> =
+                                HashMap::new();
                             loop {
                                 match crate::messages::read_framed(&mut recv).await {
                                     Ok(Some(data)) => {
@@ -1189,12 +1312,20 @@ impl ConnectionManager {
                                             if matches!(dm_msg, DmMessage::Heartbeat) {
                                                 continue;
                                             }
-                                            if matches!(dm_msg, DmMessage::CallInvite) {
+                                            if let DmMessage::CallInvite { ref ticket } = dm_msg {
                                                 let _ =
                                                     event_tx.send(Event::CallInviteReceived {
                                                         peer_id: peer_id.clone(),
+                                                        ticket: ticket.clone(),
                                                     });
                                             }
+                                            handle_dm_file_message(
+                                                &dm_msg,
+                                                &peer_id,
+                                                &mut active_files,
+                                                &event_tx,
+                                            )
+                                            .await;
                                             let _ = event_tx.send(Event::DmReceived {
                                                 peer_id: peer_id.clone(),
                                                 message: dm_msg,
@@ -1205,17 +1336,29 @@ impl ConnectionManager {
                                     Err(_) => break,
                                 }
                             }
+                            // Clean up incomplete temp files
+                            for (id, recv) in active_files {
+                                tracing::debug!("Cleaning up incomplete file transfer {id}");
+                                drop(recv.file);
+                                let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                            }
                         });
                     }
                     Err(_) => break,
                 }
             }
 
-            // Connection closed — clean up
-            dm_peers_ref
+            // Connection closed — clean up and emit DmDisconnected
+            if dm_peers_ref
                 .lock()
                 .await
-                .remove(&peer_id_reader);
+                .remove(&peer_id_reader)
+                .is_some()
+            {
+                let _ = event_tx.send(Event::DmDisconnected {
+                    peer_id: peer_id_reader,
+                });
+            }
         });
 
         // Spawn a task to detect connection closure
@@ -1298,7 +1441,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::node;
-    use crate::protocol::NafaqProtocol;
+    use crate::protocol::{NafaqDmProtocol, NafaqProtocol};
 
     #[tokio::test]
     async fn emits_single_disconnect_when_remote_endpoint_closes() {
@@ -1323,6 +1466,7 @@ mod tests {
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
 
         let mut rx_a = event_tx_a.subscribe();

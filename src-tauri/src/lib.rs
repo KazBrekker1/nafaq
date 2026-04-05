@@ -14,7 +14,7 @@ use codec::{AudioDecoder, AudioCodecState, VideoCodecState};
 use connection::ConnectionManager;
 use iroh::protocol::Router;
 use messages::{AudioPacket, ControlAction, Event, VideoPacket};
-use protocol::NafaqProtocol;
+use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
 use tauri::{Emitter, Manager};
 use tokio::sync::broadcast;
@@ -110,6 +110,7 @@ pub fn run() {
     }
 
     builder = builder.plugin(tauri_plugin_store::Builder::new().build());
+    builder = builder.plugin(tauri_plugin_dialog::init());
 
     builder
         .setup(move |app| {
@@ -168,6 +169,7 @@ pub fn run() {
 
                 let router = Router::builder(endpoint.clone())
                     .accept(node::NAFAQ_ALPN, NafaqProtocol::new(conn_manager_for_rt.clone()))
+                    .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(conn_manager_for_rt.clone()))
                     .spawn();
 
                 (endpoint, router)

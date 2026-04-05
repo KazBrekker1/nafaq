@@ -60,7 +60,7 @@ onBeforeUnmount(() => {
 <template>
   <UModal v-model:open="open">
     <template #content>
-      <div class="w-full max-w-sm border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
+      <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
         <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] p-3 sm:p-4">
           <p class="label">SCAN QR CODE</p>
           <button

@@ -17,7 +17,17 @@ const error = ref<string | null>(null);
 let micLevelRafId: number | null = null;
 let audioContext: AudioContext | null = null;
 
+let prefsLoaded = false;
+
 export function useMedia() {
+  // Seed device selections from persisted settings on first use
+  if (!prefsLoaded) {
+    prefsLoaded = true;
+    const { settings } = useSettings();
+    if (settings.value.preferredCamera) selectedCamera.value = settings.value.preferredCamera;
+    if (settings.value.preferredMic) selectedMic.value = settings.value.preferredMic;
+  }
+
   async function enumerateDevices() {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();

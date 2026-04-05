@@ -5,6 +5,7 @@ use iroh_tickets::Ticket;
 
 /// Creates and configures an Iroh endpoint for the nafaq protocol.
 pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/1";
+pub const NAFAQ_DM_ALPN: &[u8] = b"nafaq/dm/1";
 
 #[allow(dead_code)]
 pub async fn create_endpoint() -> Result<Endpoint> {
@@ -29,7 +30,7 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
         .build();
 
     let mut builder = Endpoint::builder(presets::N0)
-        .alpns(vec![NAFAQ_ALPN.to_vec()])
+        .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
         .transport_config(transport_config);
 
     if let Some(key) = secret_key {

@@ -43,11 +43,16 @@ async function handlePersistentIdentity(e: Event) {
 }
 
 // ── Devices ───────────────────────────────────────────────
+const media = useMedia();
 const allDevices = ref<MediaDeviceInfo[]>([]);
 
 async function loadDevices() {
   try {
+    // Request a brief getUserMedia to unlock device labels (browsers hide
+    // labels until permission is granted), then immediately stop the tracks.
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
     allDevices.value = await navigator.mediaDevices.enumerateDevices();
+    stream?.getTracks().forEach(t => t.stop());
   } catch {
     allDevices.value = [];
   }
@@ -83,10 +88,12 @@ watch(() => settings.value.preferredSpeaker, (v) => { if (v) selectedSpeaker.val
 async function onMicChange(e: Event) {
   selectedMic.value = (e.target as HTMLSelectElement).value;
   await save({ preferredMic: selectedMic.value || null });
+  if (selectedMic.value) media.switchMic(selectedMic.value);
 }
 async function onCameraChange(e: Event) {
   selectedCamera.value = (e.target as HTMLSelectElement).value;
   await save({ preferredCamera: selectedCamera.value || null });
+  if (selectedCamera.value) media.switchCamera(selectedCamera.value);
 }
 async function onSpeakerChange(e: Event) {
   selectedSpeaker.value = (e.target as HTMLSelectElement).value;
@@ -351,7 +358,7 @@ onMounted(loadDevices);
     <!-- QR Modal for Node ID -->
     <UModal v-model:open="qrModalOpen">
       <template #content>
-        <div class="w-full max-w-xs border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
+        <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
           <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
             <p class="label" style="letter-spacing: 4px;">NODE ID</p>
             <button

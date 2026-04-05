@@ -366,7 +366,7 @@ pub async fn check_presence(
     let addr = iroh::EndpointAddr::new(node_public_key);
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        state.endpoint.connect(addr, crate::node::NAFAQ_ALPN),
+        state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
     ).await {
         Ok(Ok(conn)) => {
             let conn: iroh::endpoint::Connection = conn;

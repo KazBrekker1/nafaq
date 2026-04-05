@@ -26,11 +26,6 @@ export default defineNuxtConfig({
   },
 
   vite: {
-    build: {
-      rollupOptions: {
-        external: ["@tauri-apps/plugin-dialog"],
-      },
-    },
     envPrefix: ["VITE_", "TAURI_"],
     server: {
       strictPort: true,
