@@ -102,13 +102,16 @@ async fn handle_dm_file_message(
             let temp_path = temp_dir.join(format!("nafaq_recv_{id}"));
             match tokio::fs::File::create(&temp_path).await {
                 Ok(file) => {
-                    active_files.insert(id.clone(), ActiveFileReceive {
-                        file,
-                        temp_path,
-                        final_name: name.clone(),
-                        expected_size: *size,
-                        received_bytes: 0,
-                    });
+                    active_files.insert(
+                        id.clone(),
+                        ActiveFileReceive {
+                            file,
+                            temp_path,
+                            final_name: name.clone(),
+                            expected_size: *size,
+                            received_bytes: 0,
+                        },
+                    );
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create temp file for transfer {id}: {e}");
@@ -119,11 +122,17 @@ async fn handle_dm_file_message(
         DmMessage::FileChunk { id, offset, data } => {
             if let Some(recv) = active_files.get_mut(id) {
                 // Seek to the correct offset and write
-                if recv.file.seek(std::io::SeekFrom::Start(*offset)).await.is_ok() {
+                if recv
+                    .file
+                    .seek(std::io::SeekFrom::Start(*offset))
+                    .await
+                    .is_ok()
+                {
                     if let Err(e) = recv.file.write_all(data).await {
                         tracing::warn!("Failed to write chunk for transfer {id}: {e}");
                     } else {
-                        recv.received_bytes = (*offset + data.len() as u64).max(recv.received_bytes);
+                        recv.received_bytes =
+                            (*offset + data.len() as u64).max(recv.received_bytes);
                     }
                 }
             } else {
@@ -696,34 +705,32 @@ impl ConnectionManager {
                                         _ => break,
                                     }
                                 },
-                                STREAM_VIDEO => {
-                                    loop {
-                                        match crate::messages::read_framed(&mut recv).await {
-                                            Ok(Some(data)) => {
-                                                if data.len() < 8 {
-                                                    continue;
-                                                }
-                                                Self::mark_peer_active_internal(&peers_ref, &peer_id)
-                                                    .await;
-                                                let timestamp_ms =
-                                                    u64::from_be_bytes(data[..8].try_into().unwrap());
-                                                let payload = data[8..].to_vec();
-                                                video_state_ref.lock().await.insert(
-                                                    peer_id.clone(),
-                                                    VideoReceiveState {
-                                                        last_received: std::time::Instant::now(),
-                                                    },
-                                                );
-                                                let _ = video_tx.send(VideoPacket {
-                                                    peer_id: peer_id.clone(),
-                                                    timestamp_ms,
-                                                    payload,
-                                                });
+                                STREAM_VIDEO => loop {
+                                    match crate::messages::read_framed(&mut recv).await {
+                                        Ok(Some(data)) => {
+                                            if data.len() < 8 {
+                                                continue;
                                             }
-                                            _ => break,
+                                            Self::mark_peer_active_internal(&peers_ref, &peer_id)
+                                                .await;
+                                            let timestamp_ms =
+                                                u64::from_be_bytes(data[..8].try_into().unwrap());
+                                            let payload = data[8..].to_vec();
+                                            video_state_ref.lock().await.insert(
+                                                peer_id.clone(),
+                                                VideoReceiveState {
+                                                    last_received: std::time::Instant::now(),
+                                                },
+                                            );
+                                            let _ = video_tx.send(VideoPacket {
+                                                peer_id: peer_id.clone(),
+                                                timestamp_ms,
+                                                payload,
+                                            });
                                         }
+                                        _ => break,
                                     }
-                                }
+                                },
                                 _ => {}
                             }
                         });
@@ -885,9 +892,8 @@ impl ConnectionManager {
                                     ticket: ticket.clone(),
                                 });
                             }
-                            handle_dm_file_message(
-                                &dm_msg, peer_id, &mut active_files, &event_tx,
-                            ).await;
+                            handle_dm_file_message(&dm_msg, peer_id, &mut active_files, &event_tx)
+                                .await;
                             let _ = event_tx.send(Event::DmReceived {
                                 peer_id: peer_id.to_string(),
                                 message: dm_msg,
@@ -942,19 +948,27 @@ impl ConnectionManager {
                                     if stream.write_all(&[STREAM_VIDEO]).await.is_ok() {
                                         send = Some(stream);
                                     } else {
-                                        tracing::warn!("Failed to prime video stream for peer {peer_id}");
+                                        tracing::warn!(
+                                            "Failed to prime video stream for peer {peer_id}"
+                                        );
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to open video stream for peer {peer_id}: {e}");
+                                    tracing::warn!(
+                                        "Failed to open video stream for peer {peer_id}: {e}"
+                                    );
                                     break;
                                 }
                             }
                         }
 
                         let result = if let Some(stream) = send.as_mut() {
-                            let _ = stream.set_priority(if is_keyframe(&frame.payload) { 50 } else { 30 });
+                            let _ = stream.set_priority(if is_keyframe(&frame.payload) {
+                                50
+                            } else {
+                                30
+                            });
                             crate::messages::write_framed(stream, &payload).await
                         } else {
                             break;
@@ -1246,7 +1260,8 @@ impl ConnectionManager {
     pub async fn set_peer_outbound_bitrate(&self, peer_id: &str, bitrate_bps: u32) {
         let peers = self.peers.lock().await;
         if let Some(peer) = peers.get(peer_id) {
-            peer.outbound_bitrate_bps.store(bitrate_bps, Ordering::Relaxed);
+            peer.outbound_bitrate_bps
+                .store(bitrate_bps, Ordering::Relaxed);
         }
     }
 
@@ -1265,10 +1280,12 @@ impl ConnectionManager {
                 .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
         };
 
-        let connection: iroh::endpoint::Connection = endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN).await?;
+        let connection: iroh::endpoint::Connection =
+            endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN).await?;
         let peer_id = connection.remote_id().to_string();
 
-        let (mut dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) = connection.open_bi().await?;
+        let (mut dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) =
+            connection.open_bi().await?;
         dm_send.write_all(&[STREAM_DM]).await?;
 
         let dm_peer = DmPeerConnection {
@@ -1276,10 +1293,7 @@ impl ConnectionManager {
             dm_send: Arc::new(Mutex::new(Some(dm_send))),
         };
 
-        self.dm_peers
-            .lock()
-            .await
-            .insert(peer_id.clone(), dm_peer);
+        self.dm_peers.lock().await.insert(peer_id.clone(), dm_peer);
 
         // Spawn a reader for the initial bistream's recv side so the remote
         // peer can reply on the same bistream (via accept_bi's send half).
@@ -1318,12 +1332,7 @@ impl ConnectionManager {
             }
 
             // Connection closed — clean up and emit DmDisconnected
-            if dm_peers_ref
-                .lock()
-                .await
-                .remove(&peer_id_reader)
-                .is_some()
-            {
+            if dm_peers_ref.lock().await.remove(&peer_id_reader).is_some() {
                 let _ = event_tx.send(Event::DmDisconnected {
                     peer_id: peer_id_reader,
                 });
@@ -1348,9 +1357,7 @@ impl ConnectionManager {
             }
         });
 
-        let _ = self.event_tx.send(Event::DmConnected {
-            peer_id,
-        });
+        let _ = self.event_tx.send(Event::DmConnected { peer_id });
 
         Ok(())
     }
@@ -1406,7 +1413,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::protocol::Router;
+    use iroh::{endpoint::Connection, protocol::Router};
     use tokio::time::timeout;
 
     use crate::node;
@@ -1490,6 +1497,77 @@ mod tests {
         );
 
         router_a.shutdown().await.ok();
+        endpoint_a.close().await;
+    }
+
+    async fn wait_for_selected_relay(conn: &Connection) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let paths = conn.paths().get();
+                if paths
+                    .iter()
+                    .any(|path| path.is_selected() && path.is_relay())
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for relay path selection");
+    }
+
+    #[tokio::test]
+    async fn two_nodes_connect_via_relay_only_addr() {
+        let endpoint_a = node::create_endpoint().await.unwrap();
+        let endpoint_b = node::create_endpoint().await.unwrap();
+
+        let mut relay_only_addr = endpoint_a.addr();
+        relay_only_addr.addrs.retain(|addr| addr.is_relay());
+        assert!(
+            !relay_only_addr.addrs.is_empty(),
+            "endpoint A did not publish any relay address"
+        );
+
+        let accept_task = tokio::spawn({
+            let endpoint_a = endpoint_a.clone();
+            async move {
+                timeout(Duration::from_secs(30), async {
+                    endpoint_a.accept().await.unwrap().await.unwrap()
+                })
+                .await
+                .expect("timed out accepting relay connection")
+            }
+        });
+
+        let conn_b = timeout(
+            Duration::from_secs(30),
+            endpoint_b.connect(relay_only_addr, node::NAFAQ_ALPN),
+        )
+        .await
+        .expect("timed out dialing relay-only address")
+        .unwrap();
+
+        let conn_a = accept_task.await.unwrap();
+
+        wait_for_selected_relay(&conn_a).await;
+        wait_for_selected_relay(&conn_b).await;
+
+        let mut send = conn_b.open_uni().await.unwrap();
+        send.write_all(b"relay-ok").await.unwrap();
+        send.finish().unwrap();
+
+        let mut recv = timeout(Duration::from_secs(10), conn_a.accept_uni())
+            .await
+            .expect("timed out waiting for unidirectional stream")
+            .unwrap();
+        let mut buf = [0u8; 8];
+        recv.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"relay-ok");
+
+        conn_b.close(0u32.into(), b"done");
+        conn_a.close(0u32.into(), b"done");
+        endpoint_b.close().await;
         endpoint_a.close().await;
     }
 

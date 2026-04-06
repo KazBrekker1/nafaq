@@ -58,7 +58,9 @@ pub struct NodeInfo {
 
 #[tauri::command]
 pub async fn get_node_info(state: State<'_, AppState>) -> Result<NodeInfo, String> {
-    let ticket = node::generate_ticket(&state.endpoint);
+    let ticket = node::generate_ticket_when_online(&state.endpoint)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(NodeInfo {
         id: state.endpoint.id().to_string(),
         ticket,
@@ -67,7 +69,9 @@ pub async fn get_node_info(state: State<'_, AppState>) -> Result<NodeInfo, Strin
 
 #[tauri::command]
 pub async fn create_call(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(node::generate_ticket(&state.endpoint))
+    node::generate_ticket_when_online(&state.endpoint)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -347,27 +351,28 @@ pub async fn reinit_video_encoder_with_config(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.video_codec.encoder.lock().await =
-        Some(VideoEncoder::new_with_config(width, height, bitrate_bps, fps));
-    tracing::info!(
-        "Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps"
-    );
+    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new_with_config(
+        width,
+        height,
+        bitrate_bps,
+        fps,
+    ));
+    tracing::info!("Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps");
     Ok(())
 }
 
 // ── Presence probing ────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn check_presence(
-    node_id: String,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
+pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let node_public_key: iroh::PublicKey = node_id.parse().map_err(|e| format!("{e}"))?;
     let addr = iroh::EndpointAddr::new(node_public_key);
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(conn)) => {
             let conn: iroh::endpoint::Connection = conn;
             conn.close(0u32.into(), b"presence_probe");
@@ -408,7 +413,9 @@ pub async fn send_file(
         .or_else(|_| std::env::var("USERPROFILE"))
         .map(std::path::PathBuf::from)
         .map_err(|_| "Could not determine home directory".to_string())?;
-    let canonical = tokio::fs::canonicalize(&path).await.map_err(|e| format!("Invalid file path: {e}"))?;
+    let canonical = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|e| format!("Invalid file path: {e}"))?;
     if !canonical.starts_with(&home) {
         return Err("File path outside allowed directory".into());
     }
@@ -418,28 +425,38 @@ pub async fn send_file(
         .and_then(|n| n.to_str())
         .ok_or("Invalid file name")?
         .to_string();
-    let metadata = tokio::fs::metadata(&canonical).await.map_err(|e| e.to_string())?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|e| e.to_string())?;
     let size = metadata.len();
     const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
     if size > MAX_FILE_SIZE {
-        return Err(format!("File too large ({} bytes, max {} bytes)", size, MAX_FILE_SIZE));
+        return Err(format!(
+            "File too large ({} bytes, max {} bytes)",
+            size, MAX_FILE_SIZE
+        ));
     }
     let id = uuid::Uuid::new_v4().to_string();
 
     // Send FileStart
     state
         .conn_manager
-        .send_dm(&peer_id, &DmMessage::FileStart {
-            name,
-            size,
-            id: id.clone(),
-        })
+        .send_dm(
+            &peer_id,
+            &DmMessage::FileStart {
+                name,
+                size,
+                id: id.clone(),
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
 
     // Stream file in 64KB chunks
     use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(&canonical).await.map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::open(&canonical)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut offset = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -449,11 +466,14 @@ pub async fn send_file(
         }
         state
             .conn_manager
-            .send_dm(&peer_id, &DmMessage::FileChunk {
-                id: id.clone(),
-                offset,
-                data: buf[..n].to_vec(),
-            })
+            .send_dm(
+                &peer_id,
+                &DmMessage::FileChunk {
+                    id: id.clone(),
+                    offset,
+                    data: buf[..n].to_vec(),
+                },
+            )
             .await
             .map_err(|e| e.to_string())?;
         offset += n as u64;
@@ -471,10 +491,7 @@ pub async fn send_file(
 }
 
 #[tauri::command]
-pub async fn connect_dm(
-    node_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn connect_dm(node_id: String, state: State<'_, AppState>) -> Result<(), String> {
     state
         .conn_manager
         .connect_dm(&node_id)
@@ -488,8 +505,7 @@ pub async fn send_dm(
     message: serde_json::Value,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let dm_msg: DmMessage =
-        serde_json::from_value(message).map_err(|e| e.to_string())?;
+    let dm_msg: DmMessage = serde_json::from_value(message).map_err(|e| e.to_string())?;
     if let DmMessage::Text { ref content, .. } = dm_msg {
         if content.len() > MAX_CHAT_LEN {
             return Err("DM text too long".into());
@@ -503,10 +519,7 @@ pub async fn send_dm(
 }
 
 #[tauri::command]
-pub async fn disconnect_dm(
-    peer_id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
     state.conn_manager.disconnect_dm(&peer_id).await;
     Ok(())
 }
@@ -527,7 +540,9 @@ pub async fn update_settings(
 ) -> Result<(), String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     let mut current = store.get("app_settings").unwrap_or(serde_json::json!({}));
-    if let (serde_json::Value::Object(ref mut current_obj), serde_json::Value::Object(ref patch)) = (&mut current, &settings) {
+    if let (serde_json::Value::Object(ref mut current_obj), serde_json::Value::Object(ref patch)) =
+        (&mut current, &settings)
+    {
         for (k, v) in patch {
             current_obj.insert(k.clone(), v.clone());
         }
@@ -556,7 +571,10 @@ pub async fn add_contact(contact: Contact, app: tauri::AppHandle) -> Result<(), 
     } else {
         contacts.push(contact);
     }
-    store.set("contacts", serde_json::to_value(&contacts).map_err(|e| e.to_string())?);
+    store.set(
+        "contacts",
+        serde_json::to_value(&contacts).map_err(|e| e.to_string())?,
+    );
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -566,7 +584,10 @@ pub async fn remove_contact(node_id: String, app: tauri::AppHandle) -> Result<()
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
     let mut contacts = load_contacts(&store);
     contacts.retain(|c| c.node_id != node_id);
-    store.set("contacts", serde_json::to_value(&contacts).map_err(|e| e.to_string())?);
+    store.set(
+        "contacts",
+        serde_json::to_value(&contacts).map_err(|e| e.to_string())?,
+    );
     store.save().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -583,11 +604,7 @@ pub async fn toggle_persistent_identity(
     if enabled {
         let key = state.endpoint.secret_key();
         // SecretKey doesn't implement Display; encode bytes as lowercase hex
-        let hex: String = key
-            .to_bytes()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
         store.set("secret_key", serde_json::Value::String(hex));
         store.set("persistent_identity", serde_json::Value::Bool(true));
     } else {
@@ -602,9 +619,7 @@ pub async fn toggle_persistent_identity(
 
 #[tauri::command]
 pub async fn get_pinned_name(app: tauri::AppHandle) -> Result<Option<String>, String> {
-    let store = app
-        .store("settings.json")
-        .map_err(|e| e.to_string())?;
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
     let pinned = store
         .get("name_pinned")
         .and_then(|v| v.as_bool())
@@ -623,9 +638,7 @@ pub async fn set_pinned_name(
     name: Option<String>,
     pinned: bool,
 ) -> Result<(), String> {
-    let store = app
-        .store("settings.json")
-        .map_err(|e| e.to_string())?;
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("name_pinned", serde_json::json!(pinned));
     if let Some(n) = name {
         store.set("display_name", serde_json::json!(n));

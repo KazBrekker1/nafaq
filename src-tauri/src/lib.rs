@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
-use codec::{AudioDecoder, AudioCodecState, VideoCodecState};
+use codec::{AudioCodecState, AudioDecoder, VideoCodecState};
 use connection::ConnectionManager;
 use iroh::protocol::Router;
 use messages::{AudioPacket, ControlAction, Event, VideoPacket};
@@ -79,8 +79,7 @@ fn pack_video_channel_packet(
     let peer_id_bytes = peer_id.as_bytes();
     let peer_id_len = u16::try_from(peer_id_bytes.len()).ok()?;
     let jpeg_len = u32::try_from(jpeg.len()).ok()?;
-    let mut packet =
-        Vec::with_capacity(2 + peer_id_bytes.len() + 8 + 4 + 4 + 4 + jpeg.len());
+    let mut packet = Vec::with_capacity(2 + peer_id_bytes.len() + 8 + 4 + 4 + 4 + jpeg.len());
     packet.extend_from_slice(&peer_id_len.to_le_bytes());
     packet.extend_from_slice(peer_id_bytes);
     packet.extend_from_slice(&timestamp.to_le_bytes());
@@ -116,9 +115,7 @@ pub fn run() {
         .setup(move |app| {
             // Load optional persisted secret key from store
             let secret_key = {
-                let store = app
-                    .handle()
-                    .store("settings.json")?;
+                let store = app.handle().store("settings.json")?;
                 let persistent = store
                     .get("persistent_identity")
                     .and_then(|v| v.as_bool())
@@ -132,9 +129,11 @@ pub fn run() {
                                 // Fallback: try base64 decode
                                 use base64::Engine;
                                 B64.decode(&hex).ok().and_then(|bytes| {
-                                    bytes.as_slice().try_into().ok().map(|arr: [u8; 32]| {
-                                        iroh::SecretKey::from_bytes(&arr)
-                                    })
+                                    bytes
+                                        .as_slice()
+                                        .try_into()
+                                        .ok()
+                                        .map(|arr: [u8; 32]| iroh::SecretKey::from_bytes(&arr))
                                 })
                             })
                         })
@@ -168,8 +167,14 @@ pub fn run() {
                 conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
 
                 let router = Router::builder(endpoint.clone())
-                    .accept(node::NAFAQ_ALPN, NafaqProtocol::new(conn_manager_for_rt.clone()))
-                    .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(conn_manager_for_rt.clone()))
+                    .accept(
+                        node::NAFAQ_ALPN,
+                        NafaqProtocol::new(conn_manager_for_rt.clone()),
+                    )
+                    .accept(
+                        node::NAFAQ_DM_ALPN,
+                        NafaqDmProtocol::new(conn_manager_for_rt.clone()),
+                    )
                     .spawn();
 
                 (endpoint, router)
@@ -346,10 +351,8 @@ pub fn run() {
                                 let now = std::time::Instant::now();
                                 if now.duration_since(last_speaker_update).as_millis() >= 200 {
                                     last_speaker_update = now;
-                                    let mut energies: Vec<(String, f32)> = peer_energy
-                                        .iter()
-                                        .map(|(k, v)| (k.clone(), *v))
-                                        .collect();
+                                    let mut energies: Vec<(String, f32)> =
+                                        peer_energy.iter().map(|(k, v)| (k.clone(), *v)).collect();
                                     energies.sort_by(|a, b| {
                                         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                                     });
@@ -448,15 +451,19 @@ pub fn run() {
                             let codec_video_clone = codec_video.clone();
                             let peer_id_clone = packet.peer_id.clone();
                             let payload = packet.payload.clone();
-                            let jpeg_result = video_runtime_handle.spawn(async move {
-                                let mut decoders = codec_video_clone.decoders.lock().await;
-                                let decoder = decoders
-                                    .entry(peer_id_clone)
-                                    .or_insert_with(codec::VideoDecoder::new);
-                                decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
-                                    codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
+                            let jpeg_result = video_runtime_handle
+                                .spawn(async move {
+                                    let mut decoders = codec_video_clone.decoders.lock().await;
+                                    let decoder = decoders
+                                        .entry(peer_id_clone)
+                                        .or_insert_with(codec::VideoDecoder::new);
+                                    decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
+                                        codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
+                                    })
                                 })
-                            }).await.ok().flatten();
+                                .await
+                                .ok()
+                                .flatten();
                             if let Some((jpeg, width, height)) = jpeg_result {
                                 let registration = video_bridge.lock().await.clone();
                                 if let Some(registration) = registration {
@@ -538,9 +545,13 @@ pub fn run() {
                         } else {
                             0 // Use global profile (no override)
                         };
-                        let current = conn_manager_stats.get_peer_outbound_bitrate(&stats.peer_id).await;
+                        let current = conn_manager_stats
+                            .get_peer_outbound_bitrate(&stats.peer_id)
+                            .await;
                         if current != target {
-                            conn_manager_stats.set_peer_outbound_bitrate(&stats.peer_id, target).await;
+                            conn_manager_stats
+                                .set_peer_outbound_bitrate(&stats.peer_id, target)
+                                .await;
                         }
                         let _ = app_handle_stats.emit("network-stats", &stats);
                     }

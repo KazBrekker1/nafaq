@@ -19,11 +19,27 @@ pub enum ContactSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DmMessage {
-    Text { content: String, timestamp: u64 },
-    FileStart { name: String, size: u64, id: String },
-    FileChunk { id: String, offset: u64, #[serde(with = "serde_bytes")] data: Vec<u8> },
-    FileEnd { id: String },
-    CallInvite { ticket: String },
+    Text {
+        content: String,
+        timestamp: u64,
+    },
+    FileStart {
+        name: String,
+        size: u64,
+        id: String,
+    },
+    FileChunk {
+        id: String,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    FileEnd {
+        id: String,
+    },
+    CallInvite {
+        ticket: String,
+    },
     CallAccept,
     CallDecline,
     Heartbeat,
