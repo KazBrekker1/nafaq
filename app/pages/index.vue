@@ -1,7 +1,17 @@
 <script setup lang="ts">
 const call = useCall();
-const { state, ticket, nodeId, nodeReady, error, displayName, connectionProgress, showPreCallOverlay, createCall, joinCall, endCall, joinCallFromOverlay } = call;
+const { state, ticket, nodeId, error, displayName, connectionProgress } = call;
 const hasName = computed(() => displayName.value.trim().length > 0);
+
+async function handleCreate() {
+  await call.createCall();
+  navigateTo("/call");
+}
+
+async function handleJoin(t: string) {
+  await call.joinCall(t);
+  if (call.state.value !== "idle") navigateTo("/call");
+}
 </script>
 
 <template>
@@ -24,10 +34,10 @@ const hasName = computed(() => displayName.value.trim().length > 0);
 
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-0">
         <div class="border-2 border-[var(--color-border)] p-4 sm:p-6 sm:border-r-0 border-b-0 sm:border-b-2">
-          <TicketCreate :ticket="ticket" :state="state" :disabled="!hasName" @create="createCall" />
+          <TicketCreate :ticket="ticket" :state="state" :disabled="!hasName" @create="handleCreate" />
         </div>
         <div class="border-2 border-[var(--color-border)] p-4 sm:p-6">
-          <TicketJoin :state="state" :disabled="!hasName" @join="joinCall" />
+          <TicketJoin :state="state" :disabled="!hasName" @join="handleJoin" />
         </div>
       </div>
 
@@ -37,10 +47,5 @@ const hasName = computed(() => displayName.value.trim().length > 0);
       </div>
     </div>
 
-    <PreCallOverlay
-      v-model:open="showPreCallOverlay"
-      @join="joinCallFromOverlay"
-      @cancel="endCall"
-    />
   </div>
 </template>

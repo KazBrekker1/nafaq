@@ -38,5 +38,18 @@ export function useNotificationSounds() {
     playTone(784, 80, 0.08);          // G5 short blip
   }
 
-  return { playPeerConnected, playPeerLeft, playMessageReceived };
+  function playIncomingRing(): () => void {
+    let stopped = false;
+    function ring() {
+      if (stopped) return;
+      playTone(523, 150, 0.15, 0);       // C5
+      playTone(659, 150, 0.15, 0.18);    // E5
+      playTone(784, 200, 0.15, 0.36);    // G5
+      setTimeout(() => { if (!stopped) ring(); }, 2000);
+    }
+    ring();
+    return () => { stopped = true; };
+  }
+
+  return { playPeerConnected, playPeerLeft, playMessageReceived, playIncomingRing };
 }

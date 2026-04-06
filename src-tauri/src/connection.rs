@@ -196,6 +196,45 @@ async fn handle_dm_file_message(
     }
 }
 
+/// Shared DM stream reader loop — reads framed messages, handles files,
+/// emits events. Used by both connect_dm and setup_dm_connection.
+async fn run_dm_reader(
+    recv: &mut iroh::endpoint::RecvStream,
+    peer_id: &str,
+    event_tx: &broadcast::Sender<Event>,
+) {
+    let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+    loop {
+        match crate::messages::read_framed(recv).await {
+            Ok(Some(data)) => {
+                if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(&data) {
+                    if matches!(dm_msg, DmMessage::Heartbeat) {
+                        continue;
+                    }
+                    if let DmMessage::CallInvite { ref ticket } = dm_msg {
+                        let _ = event_tx.send(Event::CallInviteReceived {
+                            peer_id: peer_id.to_string(),
+                            ticket: ticket.clone(),
+                        });
+                    }
+                    handle_dm_file_message(&dm_msg, peer_id, &mut active_files, event_tx).await;
+                    let _ = event_tx.send(Event::DmReceived {
+                        peer_id: peer_id.to_string(),
+                        message: dm_msg,
+                    });
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    for (id, recv) in active_files {
+        tracing::debug!("Cleaning up incomplete file transfer {id}");
+        drop(recv.file);
+        let _ = tokio::fs::remove_file(&recv.temp_path).await;
+    }
+}
+
 struct PeerConnection {
     connection: Connection,
     chat_send: Arc<Mutex<Option<SendStream>>>,
@@ -379,47 +418,7 @@ impl ConnectionManager {
                             let event_tx = event_tx.clone();
                             let peer_id = peer_id_reader.clone();
                             tokio::spawn(async move {
-                                let mut active_files: HashMap<String, ActiveFileReceive> =
-                                    HashMap::new();
-                                loop {
-                                    match crate::messages::read_framed(&mut recv).await {
-                                        Ok(Some(data)) => {
-                                            if let Ok(dm_msg) =
-                                                serde_json::from_slice::<DmMessage>(&data)
-                                            {
-                                                if matches!(dm_msg, DmMessage::Heartbeat) {
-                                                    continue;
-                                                }
-                                                if let DmMessage::CallInvite { ref ticket } = dm_msg {
-                                                    let _ =
-                                                        event_tx.send(Event::CallInviteReceived {
-                                                            peer_id: peer_id.clone(),
-                                                            ticket: ticket.clone(),
-                                                        });
-                                                }
-                                                handle_dm_file_message(
-                                                    &dm_msg,
-                                                    &peer_id,
-                                                    &mut active_files,
-                                                    &event_tx,
-                                                )
-                                                .await;
-                                                let _ = event_tx.send(Event::DmReceived {
-                                                    peer_id: peer_id.clone(),
-                                                    message: dm_msg,
-                                                });
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(_) => break,
-                                    }
-                                }
-                                // Clean up incomplete temp files
-                                for (id, recv) in active_files {
-                                    tracing::debug!("Cleaning up incomplete file transfer {id}");
-                                    drop(recv.file);
-                                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
-                                }
+                                run_dm_reader(&mut recv, &peer_id, &event_tx).await;
                             });
                         }
                         // Ignore non-DM streams on a DM connection
@@ -1269,7 +1268,7 @@ impl ConnectionManager {
         let connection: iroh::endpoint::Connection = endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN).await?;
         let peer_id = connection.remote_id().to_string();
 
-        let (mut dm_send, _): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) = connection.open_bi().await?;
+        let (mut dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) = connection.open_bi().await?;
         dm_send.write_all(&[STREAM_DM]).await?;
 
         let dm_peer = DmPeerConnection {
@@ -1282,7 +1281,17 @@ impl ConnectionManager {
             .await
             .insert(peer_id.clone(), dm_peer);
 
-        // Spawn a reader task for incoming DM messages on this connection
+        // Spawn a reader for the initial bistream's recv side so the remote
+        // peer can reply on the same bistream (via accept_bi's send half).
+        {
+            let event_tx = self.event_tx.clone();
+            let peer_id = peer_id.clone();
+            tokio::spawn(async move {
+                run_dm_reader(&mut dm_recv, &peer_id, &event_tx).await;
+            });
+        }
+
+        // Spawn a reader task for additional incoming DM bistreams on this connection
         let event_tx = self.event_tx.clone();
         let dm_peers_ref = self.dm_peers.clone();
         let peer_id_reader = peer_id.clone();
@@ -1301,47 +1310,7 @@ impl ConnectionManager {
                         let event_tx = event_tx.clone();
                         let peer_id = peer_id_reader.clone();
                         tokio::spawn(async move {
-                            let mut active_files: HashMap<String, ActiveFileReceive> =
-                                HashMap::new();
-                            loop {
-                                match crate::messages::read_framed(&mut recv).await {
-                                    Ok(Some(data)) => {
-                                        if let Ok(dm_msg) =
-                                            serde_json::from_slice::<DmMessage>(&data)
-                                        {
-                                            if matches!(dm_msg, DmMessage::Heartbeat) {
-                                                continue;
-                                            }
-                                            if let DmMessage::CallInvite { ref ticket } = dm_msg {
-                                                let _ =
-                                                    event_tx.send(Event::CallInviteReceived {
-                                                        peer_id: peer_id.clone(),
-                                                        ticket: ticket.clone(),
-                                                    });
-                                            }
-                                            handle_dm_file_message(
-                                                &dm_msg,
-                                                &peer_id,
-                                                &mut active_files,
-                                                &event_tx,
-                                            )
-                                            .await;
-                                            let _ = event_tx.send(Event::DmReceived {
-                                                peer_id: peer_id.clone(),
-                                                message: dm_msg,
-                                            });
-                                        }
-                                    }
-                                    Ok(None) => break,
-                                    Err(_) => break,
-                                }
-                            }
-                            // Clean up incomplete temp files
-                            for (id, recv) in active_files {
-                                tracing::debug!("Cleaning up incomplete file transfer {id}");
-                                drop(recv.file);
-                                let _ = tokio::fs::remove_file(&recv.temp_path).await;
-                            }
+                            run_dm_reader(&mut recv, &peer_id, &event_tx).await;
                         });
                     }
                     Err(_) => break,

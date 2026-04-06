@@ -1,4 +1,4 @@
-export type CallState = "idle" | "creating" | "joining" | "waiting" | "connected";
+export type CallState = "idle" | "creating" | "waiting" | "ringing" | "joining" | "connected";
 
 // Singleton state — shared across all pages/components
 const state = ref<CallState>("idle");
@@ -12,11 +12,20 @@ const peers = ref<string[]>([]);
 const displayName = ref("");
 const peerNames = ref<Record<string, string>>({});
 const connectionProgress = ref<"idle" | "starting-node" | "node-ready" | "connecting" | "securing" | "connected">("idle");
-const showPreCallOverlay = ref(false);
+const incomingInvite = ref<{ peerId: string; ticket: string } | null>(null);
+const missedCall = ref<{ callerName: string; timestamp: number } | null>(null);
 const lastDisconnectedPeer = ref<{ id: string; name: string } | null>(null);
 const allPeersLeft = ref(false);
 
+let ringingTimer: ReturnType<typeof setTimeout> | null = null;
+let missedCallTimer: ReturnType<typeof setTimeout> | null = null;
 let initialized = false;
+
+function showMissedCall(callerName: string) {
+  missedCall.value = { callerName, timestamp: Date.now() };
+  if (missedCallTimer) clearTimeout(missedCallTimer);
+  missedCallTimer = setTimeout(() => { missedCall.value = null; }, 5000);
+}
 
 export function useCall() {
   if (!initialized) {
@@ -33,7 +42,6 @@ export function useCall() {
       ticket.value = t;
       shareTicket.value = t;
       state.value = "waiting";
-      // Stay on home page to display/share the ticket. Peer connection auto-navigates to /call.
     } catch (e) {
       error.value = `Failed to create call: ${e}`;
       state.value = "idle";
@@ -57,6 +65,10 @@ export function useCall() {
     }
   }
 
+  function clearRingingTimer() {
+    if (ringingTimer) { clearTimeout(ringingTimer); ringingTimer = null; }
+  }
+
   async function endCall() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
@@ -64,26 +76,34 @@ export function useCall() {
         await invoke("end_call", { peerId: p });
       }
     } catch {}
-    // Stop camera/mic preview if it was started by PreCallOverlay
     useMedia().stopPreview();
+    clearRingingTimer();
     state.value = "idle";
     peerId.value = null;
     peers.value = [];
     peerNames.value = {};
     ticket.value = null;
-    showPreCallOverlay.value = false;
+    incomingInvite.value = null;
     allPeersLeft.value = false;
     lastDisconnectedPeer.value = null;
     navigateTo("/");
   }
 
-  async function joinCallFromOverlay() {
-    showPreCallOverlay.value = false;
-    // If we have a ticket but haven't connected (incoming invite), join first
-    if (ticket.value && state.value !== "connected") {
-      await joinCall(ticket.value);
-    }
+  async function acceptInvite() {
+    if (!incomingInvite.value) return;
+    clearRingingTimer();
+    const t = incomingInvite.value.ticket;
+    incomingInvite.value = null;
     navigateTo("/call");
+    await joinCall(t);
+  }
+
+  function declineInvite() {
+    clearRingingTimer();
+    state.value = "idle";
+    ticket.value = null;
+    peerId.value = null;
+    incomingInvite.value = null;
   }
 
   return {
@@ -98,13 +118,15 @@ export function useCall() {
     displayName,
     peerNames,
     connectionProgress,
-    showPreCallOverlay,
+    incomingInvite,
+    missedCall,
     lastDisconnectedPeer,
     allPeersLeft,
     createCall,
     joinCall,
     endCall,
-    joinCallFromOverlay,
+    acceptInvite,
+    declineInvite,
   };
 }
 
@@ -142,8 +164,6 @@ async function initCallListeners() {
       }
       allPeersLeft.value = false;
       peerId.value = pid;
-      // Only show pre-call overlay if user was in a call-related state
-      const wasInCall = state.value !== "idle";
       state.value = "connected";
       // Send our display name to the new peer
       if (displayName.value && pid) {
@@ -151,9 +171,6 @@ async function initCallListeners() {
           peerId: pid,
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
-      }
-      if (wasInCall) {
-        showPreCallOverlay.value = true;
       }
     });
 
@@ -173,7 +190,6 @@ async function initCallListeners() {
 
       if (peers.value.length === 0) {
         allPeersLeft.value = true;
-        // Don't auto-redirect — show "everyone left" prompt
       }
     });
 
@@ -190,10 +206,30 @@ async function initCallListeners() {
       const data = event.payload;
       const pid = typeof data === "string" ? data : data?.peer_id;
       const inviteTicket = data?.ticket;
-      if (pid && inviteTicket && state.value === "idle") {
+      if (!pid || !inviteTicket) return;
+
+      if (state.value === "idle") {
+        // Show incoming call banner
+        state.value = "ringing";
         ticket.value = inviteTicket;
         peerId.value = pid;
-        showPreCallOverlay.value = true;
+        incomingInvite.value = { peerId: pid, ticket: inviteTicket };
+        // Auto-decline after 30 seconds
+        ringingTimer = setTimeout(() => {
+          if (state.value === "ringing") {
+            const callerName = peerNames.value[pid] || pid.slice(0, 12);
+            ringingTimer = null;
+            state.value = "idle";
+            ticket.value = null;
+            peerId.value = null;
+            incomingInvite.value = null;
+            showMissedCall(callerName);
+          }
+        }, 30_000);
+      } else {
+        // Already busy — record as missed call
+        const callerName = peerNames.value[pid] || pid.slice(0, 12);
+        showMissedCall(callerName);
       }
     });
 

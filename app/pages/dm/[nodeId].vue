@@ -73,7 +73,7 @@ async function initiateCall() {
       message: { type: "call_invite", ticket: t },
     }).catch(() => {});
   }
-  navigateTo("/");
+  navigateTo("/call");
 }
 
 // ── Lifecycle ─────────────────────────────────────────────
@@ -94,7 +94,7 @@ onUnmounted(async () => {
 </script>
 
 <template>
-  <div class="h-screen flex flex-col bg-[var(--color-surface)] safe-area-inset">
+  <div class="h-full flex flex-col bg-[var(--color-surface)] safe-area-inset">
 
     <!-- Header -->
     <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center gap-3 shrink-0 sticky top-0 bg-[var(--color-surface)] z-10">
