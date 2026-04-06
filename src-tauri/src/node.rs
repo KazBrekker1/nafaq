@@ -39,8 +39,13 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
 
     let endpoint = builder.bind().await?;
 
-    // Wait until we're connected to a relay so our address is reachable
-    endpoint.online().await;
+    // Wait for relay connection with a timeout — online() can hang indefinitely
+    // if the relay's QUIC endpoint is unreachable (even if HTTP is up).
+    // The relay will continue connecting in the background after timeout.
+    match tokio::time::timeout(Duration::from_secs(10), endpoint.online()).await {
+        Ok(_) => tracing::info!("Connected to relay"),
+        Err(_) => tracing::warn!("Timed out waiting for relay — continuing, relay will connect in background"),
+    }
 
     tracing::info!("Iroh endpoint started with ID: {}", endpoint.id());
     Ok(endpoint)
