@@ -1,61 +1,29 @@
 <script setup lang="ts">
-import QRCode from "qrcode";
-import { truncateNodeId } from "~/utils/format";
+import { truncateNodeId, avatarLetter } from "~/utils/format";
 
 const { nodeId, displayName } = useCall();
 const { contacts, remove } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { settings } = useSettings();
 
-// ── Identity card ─────────────────────────────────────────
 const truncatedNodeId = computed(() => {
-  const id = nodeId.value;
-  if (!id) return "—";
-  return truncateNodeId(id);
+  if (!nodeId.value) return "\u2014";
+  return truncateNodeId(nodeId.value);
 });
 
-const nodeCopied = ref(false);
-async function copyNodeId() {
-  if (!nodeId.value) return;
-  await navigator.clipboard.writeText(nodeId.value);
-  nodeCopied.value = true;
-  setTimeout(() => { nodeCopied.value = false; }, 1500);
+const { copy, copied: nodeCopied } = useClipboard();
+function copyNodeId() {
+  if (nodeId.value) copy(nodeId.value);
 }
 
 const qrModalOpen = ref(false);
-const qrDataUrl = ref<string | null>(null);
-
-watch([qrModalOpen, nodeId], async ([open, id]) => {
-  if (!open || !id) { qrDataUrl.value = null; return; }
-  try {
-    qrDataUrl.value = await QRCode.toDataURL(id, {
-      width: 256,
-      margin: 1,
-      color: { dark: "#000", light: "#fff" },
-    });
-  } catch {
-    qrDataUrl.value = null;
-  }
-});
-
-// ── Add modal ─────────────────────────────────────────────
 const addModalOpen = ref(false);
 
-// ── Contact actions ───────────────────────────────────────
-function avatarLetter(name: string) {
-  return (name || "?")[0].toUpperCase();
-}
-
-function handleCall(nodeId: string) {
-  navigateTo('/dm/' + nodeId);
-}
-
-// ── Presence ──────────────────────────────────────────────
 const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
 
-watch(contactNodeIds, (ids) => {
-  if (ids.length > 0) startProbing(contactNodeIds);
-}, { immediate: true });
+onMounted(() => {
+  if (contactNodeIds.value.length > 0) startProbing(contactNodeIds);
+});
 
 onUnmounted(() => {
   stopProbing();
@@ -123,13 +91,11 @@ onUnmounted(() => {
           class="border-b border-[var(--color-border-muted)] px-4 sm:px-6 py-3"
         >
           <div class="flex items-center gap-3">
-            <!-- Avatar -->
-            <div
-              class="shrink-0 flex items-center justify-center text-sm font-bold text-[var(--color-accent)] font-mono bg-black"
-              style="width: 36px; height: 36px; border: 2px solid #8B5CF6;"
-            >
-              {{ avatarLetter(contact.display_name) }}
-            </div>
+            <UAvatar
+              :text="avatarLetter(contact.display_name)"
+              size="md"
+              class="shrink-0 border-2 border-[var(--color-accent)] bg-black text-[var(--color-accent)] font-mono font-bold"
+            />
 
             <!-- Name + node ID -->
             <div class="flex-1 min-w-0">
@@ -138,8 +104,7 @@ onUnmounted(() => {
                 <!-- Online dot -->
                 <span
                   class="shrink-0 inline-block w-2 h-2 rounded-full"
-                  :style="isOnline(contact.node_id) ? 'background:#4ade80' : 'background:#666666'"
-                  :title="isOnline(contact.node_id) ? 'online' : 'offline'"
+                  :style="isOnline(contact.node_id) ? 'background:var(--color-online)' : 'background:var(--color-muted)'"
                 />
                 <span class="text-[10px] text-[var(--color-muted)]">{{ isOnline(contact.node_id) ? 'online' : 'offline' }}</span>
               </div>
@@ -153,29 +118,32 @@ onUnmounted(() => {
               class="flex gap-0 shrink-0 transition-opacity"
               :class="isOnline(contact.node_id) ? 'opacity-100' : 'opacity-40'"
             >
-              <button
-                class="border-2 border-[var(--color-border)] px-2 py-1.5 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                :disabled="!isOnline(contact.node_id)"
-                :title="isOnline(contact.node_id) ? 'Send message' : 'Offline'"
-                @click="navigateTo('/dm/' + contact.node_id)"
-              >
-                ✉
-              </button>
-              <button
-                class="border-2 border-l-0 border-[var(--color-border)] px-2 py-1.5 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                :disabled="!isOnline(contact.node_id)"
-                :title="isOnline(contact.node_id) ? 'Call' : 'Offline'"
-                @click="handleCall(contact.node_id)"
-              >
-                ☎
-              </button>
-              <button
-                class="border-2 border-l-0 border-[var(--color-border-muted)] px-2 py-1.5 text-[10px] text-[var(--color-muted)] hover:border-[var(--color-danger)] hover:text-[var(--color-danger)] transition-colors"
-                title="Remove contact"
-                @click="remove(contact.node_id)"
-              >
-                ✕
-              </button>
+              <UTooltip :text="isOnline(contact.node_id) ? 'Message' : 'Offline'">
+                <button
+                  class="border-2 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
+                  :disabled="!isOnline(contact.node_id)"
+                  @click="navigateTo('/dm/' + contact.node_id)"
+                >
+                  ✉
+                </button>
+              </UTooltip>
+              <UTooltip :text="isOnline(contact.node_id) ? 'Call' : 'Offline'">
+                <button
+                  class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
+                  :disabled="!isOnline(contact.node_id)"
+                  @click="navigateTo('/dm/' + contact.node_id)"
+                >
+                  ☎
+                </button>
+              </UTooltip>
+              <UTooltip text="Remove">
+                <button
+                  class="border-2 border-l-0 border-[var(--color-border-muted)] px-3 py-2.5 text-xs text-[var(--color-muted)] hover:border-[var(--color-danger)] hover:text-[var(--color-danger)] transition-colors"
+                  @click="remove(contact.node_id)"
+                >
+                  ✕
+                </button>
+              </UTooltip>
             </div>
           </div>
         </div>
@@ -183,43 +151,7 @@ onUnmounted(() => {
 
     </div>
 
-    <!-- QR Modal for own node ID -->
-    <UModal v-model:open="qrModalOpen">
-      <template #content>
-        <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
-          <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-            <p class="label" style="letter-spacing: 4px;">NODE ID</p>
-            <button
-              class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-              aria-label="Close QR modal"
-              @click="qrModalOpen = false"
-            >
-              <UIcon name="i-heroicons-x-mark" class="text-lg" />
-            </button>
-          </div>
-          <div class="p-4 space-y-3">
-            <div class="flex justify-center bg-white p-3">
-              <img
-                v-if="qrDataUrl"
-                :src="qrDataUrl"
-                alt="Node ID QR code"
-                class="w-48 h-48"
-              />
-              <div
-                v-else
-                class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
-              >
-                {{ nodeId ? "Generating..." : "No node ID" }}
-              </div>
-            </div>
-            <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
-            <UButton variant="outline" class="w-full rounded-none" @click="qrModalOpen = false">
-              CLOSE
-            </UButton>
-          </div>
-        </div>
-      </template>
-    </UModal>
+    <NodeIdQrModal v-model:open="qrModalOpen" />
 
     <!-- Add Contact Modal -->
     <AddContactModal

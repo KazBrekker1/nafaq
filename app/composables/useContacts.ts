@@ -1,3 +1,5 @@
+import { truncateNodeId } from "~/utils/format";
+
 export interface Contact {
   node_id: string;
   display_name: string;
@@ -38,7 +40,13 @@ export function useContacts() {
     });
   }
 
+  function displayName(nodeId: string): string {
+    const contact = contacts.value.find(c => c.node_id === nodeId);
+    if (contact?.display_name) return contact.display_name;
+    return truncateNodeId(nodeId);
+  }
+
   if (!loaded.value) load();
 
-  return { contacts, loaded, add, remove, starFromCall };
+  return { contacts, loaded, add, remove, starFromCall, displayName };
 }

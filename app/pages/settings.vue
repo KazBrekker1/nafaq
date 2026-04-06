@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import QRCode from "qrcode";
 import { truncateNodeId } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
@@ -7,35 +6,16 @@ const { nodeId, displayName } = useCall();
 const { settings, save, togglePersistentIdentity } = useSettings();
 
 const truncatedNodeId = computed(() => {
-  const id = nodeId.value;
-  if (!id) return "—";
-  return truncateNodeId(id, 8, 4);
+  if (!nodeId.value) return "\u2014";
+  return truncateNodeId(nodeId.value, 8, 4);
 });
 
-const nodeCopied = ref(false);
-async function copyNodeId() {
-  if (!nodeId.value) return;
-  await navigator.clipboard.writeText(nodeId.value);
-  nodeCopied.value = true;
-  setTimeout(() => { nodeCopied.value = false; }, 1500);
+const { copy, copied: nodeCopied } = useClipboard();
+function copyNodeId() {
+  if (nodeId.value) copy(nodeId.value);
 }
 
-// QR modal for node ID
 const qrModalOpen = ref(false);
-const qrDataUrl = ref<string | null>(null);
-
-watch([qrModalOpen, nodeId], async ([open, id]) => {
-  if (!open || !id) { qrDataUrl.value = null; return; }
-  try {
-    qrDataUrl.value = await QRCode.toDataURL(id, {
-      width: 256,
-      margin: 1,
-      color: { dark: "#000", light: "#fff" },
-    });
-  } catch {
-    qrDataUrl.value = null;
-  }
-});
 
 async function handlePersistentIdentity(e: Event) {
   const enabled = (e.target as HTMLInputElement).checked;
@@ -355,42 +335,6 @@ onMounted(loadDevices);
 
     </div>
 
-    <!-- QR Modal for Node ID -->
-    <UModal v-model:open="qrModalOpen">
-      <template #content>
-        <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
-          <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-            <p class="label" style="letter-spacing: 4px;">NODE ID</p>
-            <button
-              class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-              aria-label="Close QR modal"
-              @click="qrModalOpen = false"
-            >
-              <UIcon name="i-heroicons-x-mark" class="text-lg" />
-            </button>
-          </div>
-          <div class="p-4 space-y-3">
-            <div class="flex justify-center bg-white p-3">
-              <img
-                v-if="qrDataUrl"
-                :src="qrDataUrl"
-                alt="Node ID QR code"
-                class="w-48 h-48"
-              />
-              <div
-                v-else
-                class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
-              >
-                {{ nodeId ? "Generating..." : "No node ID" }}
-              </div>
-            </div>
-            <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "—" }}</p>
-            <UButton variant="outline" class="w-full rounded-none" @click="qrModalOpen = false">
-              CLOSE
-            </UButton>
-          </div>
-        </div>
-      </template>
-    </UModal>
+    <NodeIdQrModal v-model:open="qrModalOpen" />
   </div>
 </template>

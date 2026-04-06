@@ -1,6 +1,6 @@
 export default defineNuxtConfig({
   ssr: false,
-  modules: ["@nuxt/ui"],
+  modules: ["@nuxt/ui", "@vueuse/nuxt"],
   devtools: { enabled: false },
   future: { compatibilityVersion: 4 },
   compatibilityDate: "2025-07-01",
@@ -14,6 +14,10 @@ export default defineNuxtConfig({
   app: {
     head: {
       viewport: "width=device-width, initial-scale=1, viewport-fit=cover",
+      meta: [
+        { name: "theme-color", content: "#000000" },
+        { name: "format-detection", content: "telephone=no" },
+      ],
     },
   },
 

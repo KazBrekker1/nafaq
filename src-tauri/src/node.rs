@@ -1,13 +1,16 @@
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
+use iroh::{endpoint::presets, Endpoint, RelayMode, RelayUrl, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Creates and configures an Iroh endpoint for the nafaq protocol.
 pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/1";
 pub const NAFAQ_DM_ALPN: &[u8] = b"nafaq/dm/1";
 pub const RELAY_URL: &str = "https://iroh-relay.sanad.ink";
+pub static RELAY_URL_PARSED: LazyLock<RelayUrl> =
+    LazyLock::new(|| RELAY_URL.parse().expect("invalid relay URL"));
 const TICKET_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[allow(dead_code)]
@@ -31,7 +34,7 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
         .datagram_send_buffer_size(2 * 1024 * 1024)
         .build();
 
-    let relay_url: iroh::RelayUrl = RELAY_URL.parse().expect("invalid relay URL");
+    let relay_url = RELAY_URL_PARSED.clone();
 
     let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])

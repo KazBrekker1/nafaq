@@ -1271,7 +1271,8 @@ impl ConnectionManager {
         let node_public_key: iroh::PublicKey = node_id_str
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid node ID: {node_id_str}"))?;
-        let addr = iroh::EndpointAddr::new(node_public_key);
+        let addr = iroh::EndpointAddr::new(node_public_key)
+            .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
 
         let endpoint = {
             let guard = self.endpoint.lock().await;

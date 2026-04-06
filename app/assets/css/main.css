@@ -9,8 +9,15 @@
   --color-border: #e2e8f0;
   --color-border-muted: #333333;
   --color-muted: #666666;
+  --color-online: #4ade80;
   --color-warning: #EAB308;
   --color-danger: #ff0000;
+}
+
+*,
+*::before,
+*::after {
+  -webkit-tap-highlight-color: transparent;
 }
 
 body {
@@ -20,6 +27,17 @@ body {
   font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1.6;
+  touch-action: manipulation;
+  overscroll-behavior: contain;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Allow text selection in message content and inputs */
+input, textarea, [contenteditable],
+.select-text {
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .label {

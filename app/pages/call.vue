@@ -1,10 +1,13 @@
 <script setup lang="ts">
+import { useWakeLock } from "@vueuse/core";
+
 const call = useCall();
 const media = useMedia();
 const chat = useChat();
 const transport = useMediaTransport();
 const { playPeerConnected, playPeerLeft, playMessageReceived } = useNotificationSounds();
 const { starFromCall, contacts } = useContacts();
+const { request: requestWakeLock, release: releaseWakeLock } = useWakeLock();
 
 const starredPeers = ref<Set<string>>(new Set());
 
@@ -109,6 +112,8 @@ onMounted(async () => {
     return;
   }
 
+  requestWakeLock("screen");
+
   // Start camera preview for lobby (or active call)
   if (!media.localStream.value) await media.startPreview();
 
@@ -199,6 +204,7 @@ watch(chatOpen, (open) => {
 });
 
 onUnmounted(() => {
+  releaseWakeLock();
   videoVisibilityObserver?.disconnect();
   videoVisibilityObserver = null;
   cleanup();

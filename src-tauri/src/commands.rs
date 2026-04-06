@@ -366,7 +366,8 @@ pub async fn reinit_video_encoder_with_config(
 #[tauri::command]
 pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Result<bool, String> {
     let node_public_key: iroh::PublicKey = node_id.parse().map_err(|e| format!("{e}"))?;
-    let addr = iroh::EndpointAddr::new(node_public_key);
+    let addr = iroh::EndpointAddr::new(node_public_key)
+        .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
@@ -408,17 +409,10 @@ pub async fn send_file(
     validate_peer_id(&peer_id)?;
     let path = std::path::PathBuf::from(&file_path);
 
-    // Resolve symlinks and ../ traversal, then restrict to home directory
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .map_err(|_| "Could not determine home directory".to_string())?;
+    // Resolve symlinks and ../ traversal
     let canonical = tokio::fs::canonicalize(&path)
         .await
         .map_err(|e| format!("Invalid file path: {e}"))?;
-    if !canonical.starts_with(&home) {
-        return Err("File path outside allowed directory".into());
-    }
 
     let name = canonical
         .file_name()
@@ -428,6 +422,9 @@ pub async fn send_file(
     let metadata = tokio::fs::metadata(&canonical)
         .await
         .map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Path is not a regular file".into());
+    }
     let size = metadata.len();
     const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
     if size > MAX_FILE_SIZE {

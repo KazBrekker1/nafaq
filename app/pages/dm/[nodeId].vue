@@ -1,22 +1,27 @@
 <script setup lang="ts">
 import type { DmMessageItem } from "~/composables/useDM";
-import { formatTime, truncateNodeId } from "~/utils/format";
+import { formatTime } from "~/utils/format";
 
 const route = useRoute();
 const peerId = computed(() => route.params.nodeId as string);
 
 const { conversations, connect, disconnect, sendText, sendFile, markRead } = useDM();
-const { contacts } = useContacts();
+const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { createCall, shareTicket } = useCall();
 
-// ── Contact info ──────────────────────────────────────────
+const isContact = computed(() => contacts.value.some(c => c.node_id === peerId.value));
+const contactName = computed(() => resolveDisplayName(peerId.value));
 
-const contactName = computed(() => {
-  const contact = contacts.value.find(c => c.node_id === peerId.value);
-  if (contact?.display_name) return contact.display_name;
-  return truncateNodeId(peerId.value || "", 4, 4).replace("...", "…");
-});
+async function handleAddContact() {
+  await addContact({
+    node_id: peerId.value,
+    display_name: contactName.value,
+    added_at: Date.now(),
+    last_seen: Date.now(),
+    source: "manual",
+  });
+}
 
 const online = computed(() => isOnline(peerId.value));
 
@@ -26,7 +31,7 @@ const messages = computed<DmMessageItem[]>(() => conversations.value[peerId.valu
 
 // ── Scroll to bottom ──────────────────────────────────────
 
-const messagesEl = ref<HTMLElement | null>(null);
+const messagesEl = useTemplateRef<HTMLElement>("messages-el");
 
 async function scrollToBottom() {
   await nextTick();
@@ -76,6 +81,17 @@ async function initiateCall() {
   navigateTo("/call");
 }
 
+// ── Keyboard-aware viewport ──────────────────────────────
+
+const viewportHeight = ref("100%");
+
+function onViewportResize() {
+  if (window.visualViewport) {
+    viewportHeight.value = `${window.visualViewport.height}px`;
+    scrollToBottom();
+  }
+}
+
 // ── Lifecycle ─────────────────────────────────────────────
 
 const peerIds = computed(() => [peerId.value]);
@@ -85,16 +101,18 @@ onMounted(async () => {
   markRead(peerId.value);
   await scrollToBottom();
   startProbing(peerIds);
+  window.visualViewport?.addEventListener("resize", onViewportResize);
 });
 
 onUnmounted(async () => {
   stopProbing();
+  window.visualViewport?.removeEventListener("resize", onViewportResize);
   await disconnect();
 });
 </script>
 
 <template>
-  <div class="h-full flex flex-col bg-[var(--color-surface)] safe-area-inset">
+  <div class="flex flex-col bg-[var(--color-surface)] safe-area-inset" :style="{ height: viewportHeight }">
 
     <!-- Header -->
     <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center gap-3 shrink-0 sticky top-0 bg-[var(--color-surface)] z-10">
@@ -111,11 +129,20 @@ onUnmounted(async () => {
         <span class="text-sm font-bold text-[var(--color-border)] font-mono truncate">{{ contactName }}</span>
         <span
           class="shrink-0 inline-block w-2 h-2 rounded-full"
-          :style="online ? 'background:#4ade80' : 'background:#555'"
+          :style="online ? 'background:var(--color-online)' : 'background:var(--color-muted)'"
           :title="online ? 'online' : 'offline'"
         />
         <span class="text-[10px] text-[var(--color-muted)] shrink-0">{{ online ? "online" : "offline" }}</span>
       </div>
+
+      <!-- Add contact button -->
+      <button
+        v-if="!isContact"
+        class="border-2 border-[var(--color-accent)] px-3 py-1.5 text-[10px] font-bold tracking-widest text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-white transition-colors shrink-0"
+        @click="handleAddContact"
+      >
+        + ADD
+      </button>
 
       <!-- Call button -->
       <button
@@ -127,7 +154,7 @@ onUnmounted(async () => {
     </div>
 
     <!-- Message list -->
-    <div ref="messagesEl" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+    <div ref="messages-el" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
 
       <div v-if="messages.length === 0" class="flex items-center justify-center h-full">
         <p class="text-xs text-[var(--color-muted)] text-center">No messages yet.<br />Say hello!</p>
@@ -153,7 +180,7 @@ onUnmounted(async () => {
         <!-- Text message -->
         <div
           v-if="msg.type === 'text'"
-          class="max-w-[75%] px-3 py-2 text-xs text-[var(--color-border)] font-mono"
+          class="select-text max-w-[75%] px-3 py-2 text-xs text-[var(--color-border)] font-mono"
           :class="msg.from === 'self'
             ? 'bg-[var(--color-surface-alt)] border-2 border-[var(--color-border)]'
             : 'border-l-2 border-[var(--color-accent)] pl-3'"

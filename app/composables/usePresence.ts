@@ -1,37 +1,51 @@
 import type { Ref } from "vue";
+import { useIntervalFn } from "@vueuse/core";
 
 const onlineStatus = ref<Record<string, boolean>>({});
-let probeInterval: ReturnType<typeof setInterval> | null = null;
+let activeNodeIds: Ref<string[]> | null = null;
 
-export function usePresence() {
-  async function probeAllByIds(nodeIds: string[]) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const results = await Promise.allSettled(
-      nodeIds.map(async (nodeId) => {
-        const online = await invoke<boolean>("check_presence", { nodeId }).catch(() => false);
-        return { nodeId, online };
-      })
-    );
-    const newStatus: Record<string, boolean> = {};
-    for (const result of results) {
-      if (result.status === "fulfilled") {
-        newStatus[result.value.nodeId] = result.value.online;
-      }
+async function probeAllByIds(nodeIds: string[]) {
+  if (nodeIds.length === 0) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  const results = await Promise.allSettled(
+    nodeIds.map(async (nodeId) => {
+      const online = await invoke<boolean>("check_presence", { nodeId }).catch(() => false);
+      return { nodeId, online };
+    })
+  );
+  const newStatus: Record<string, boolean> = {};
+  for (const result of results) {
+    if (result.status === "fulfilled") {
+      newStatus[result.value.nodeId] = result.value.online;
     }
+  }
+  // Only update if status actually changed to avoid unnecessary reactivity
+  const changed = Object.keys(newStatus).some(
+    k => newStatus[k] !== onlineStatus.value[k]
+  ) || Object.keys(onlineStatus.value).length !== Object.keys(newStatus).length;
+  if (changed) {
     onlineStatus.value = newStatus;
   }
+}
 
+const { pause, resume } = useIntervalFn(
+  () => {
+    if (activeNodeIds) probeAllByIds(activeNodeIds.value);
+  },
+  30_000,
+  { immediate: false }
+);
+
+export function usePresence() {
   function startProbing(nodeIds: Ref<string[]>) {
-    stopProbing(); // Clear any existing interval
+    activeNodeIds = nodeIds;
     probeAllByIds(nodeIds.value);
-    probeInterval = setInterval(() => probeAllByIds(nodeIds.value), 30_000);
+    resume();
   }
 
   function stopProbing() {
-    if (probeInterval) {
-      clearInterval(probeInterval);
-      probeInterval = null;
-    }
+    pause();
+    activeNodeIds = null;
   }
 
   function isOnline(nodeId: string): boolean {
