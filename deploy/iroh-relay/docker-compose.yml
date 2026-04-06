@@ -11,32 +11,32 @@ services:
       - "${RELAY_METRICS_PORT:-9090}:9090"
     volumes:
       - certs:/data/certs
-      - type: bind
-        source: ./relay-config.toml
-        target: /etc/iroh-relay/config.toml
-        is_directory: false
-        content: |
-          enable_relay = true
-          http_bind_addr = "[::]:80"
-          enable_quic_addr_discovery = true
-          enable_metrics = true
-          metrics_bind_addr = "[::]:9090"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/relay.toml <<'EOF'
+        enable_relay = true
+        http_bind_addr = "[::]:80"
+        enable_quic_addr_discovery = true
+        enable_metrics = true
+        metrics_bind_addr = "[::]:9090"
 
-          [limits]
-          accept_conn_limit = 1000.0
-          accept_conn_burst = 10000
+        [limits]
+        accept_conn_limit = 1000.0
+        accept_conn_burst = 10000
 
-          [[limits.client]]
-          rate_limit_bytes = 10485760
-          burst_allowance = 52428800
+        [[limits.client]]
+        rate_limit_bytes = 10485760
+        burst_allowance = 52428800
 
-          [tls]
-          cert_mode = "LetsEncrypt"
-          hostname = "iroh-relay.sanad.ink"
-          contact = "yousseif.elshahawy@proton.me"
-          prod_tls = true
-          cert_dir = "/data/certs"
-    command: ["--config-path", "/etc/iroh-relay/config.toml"]
+        [tls]
+        cert_mode = "LetsEncrypt"
+        hostname = "iroh-relay.sanad.ink"
+        contact = "yousseif.elshahawy@proton.me"
+        prod_tls = true
+        cert_dir = "/data/certs"
+        EOF
+        exec iroh-relay --config-path /tmp/relay.toml
     environment:
       RUST_LOG: info
 
