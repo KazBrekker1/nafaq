@@ -1,15 +1,10 @@
 services:
   iroh-relay:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: n0computer/iroh-relay:latest
     restart: unless-stopped
-    # Bypass Coolify's Traefik — relay handles its own TLS
     labels:
       - traefik.enable=false
     ports:
-      # If Traefik is on 80/443, use alternative ports (e.g. 8443).
-      # Change left side to match your setup:
       - "${RELAY_HTTPS_PORT:-443}:443"
       - "${RELAY_HTTP_PORT:-80}:80"
       - "${RELAY_QUIC_PORT:-7842}:7842/udp"
@@ -19,17 +14,9 @@ services:
       - type: bind
         source: ./relay-config.toml
         target: /etc/iroh-relay/config.toml
-        is_directory: false
-    command:
-      - "--config-path"
-      - "/etc/iroh-relay/config.toml"
+    command: ["--config-path", "/etc/iroh-relay/config.toml"]
     environment:
       RUST_LOG: info
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:80/generate_204"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
 volumes:
   certs:
