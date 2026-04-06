@@ -14,7 +14,7 @@ burst_allowance = 52428800
 
 [tls]
 cert_mode = "LetsEncrypt"
-hostname = "relay.example.com"
-contact = "admin@example.com"
+hostname = "iroh-relay.sanad.ink"
+contact = "yousseif.elshahawy@proton.me"
 prod_tls = true
 cert_dir = "/data/certs"
