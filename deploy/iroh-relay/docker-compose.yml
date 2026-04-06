@@ -2,21 +2,18 @@ services:
   iroh-relay:
     image: n0computer/iroh-relay:latest
     restart: unless-stopped
-    labels:
-      - traefik.http.middlewares.iroh-relay-headers.headers.customrequestheaders.X-Forwarded-Proto=https
-      - traefik.http.routers.iroh-relay-https.middlewares=iroh-relay-headers
-      - traefik.http.services.iroh-relay.loadbalancer.server.scheme=http
-      - traefik.http.services.iroh-relay.loadbalancer.responseforwarding.flushinterval=-1
-      - traefik.http.services.iroh-relay.loadbalancer.server.transport=iroh-relay-transport
-      - traefik.http.transports.iroh-relay-transport.respondingTimeouts.readTimeout=0
-      - traefik.http.transports.iroh-relay-transport.respondingTimeouts.writeTimeout=0
-      - traefik.http.transports.iroh-relay-transport.respondingTimeouts.idleTimeout=0
     environment:
       - SERVICE_FQDN_IROHRELAY_3340
       - RUST_LOG=info
     ports:
       - "7842:7842/udp"
     command: ["--dev"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3340/generate_204 || exit 0"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   certs:
