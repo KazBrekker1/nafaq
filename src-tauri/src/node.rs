@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint, SecretKey};
+use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
 
@@ -29,9 +29,14 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
         .datagram_send_buffer_size(2 * 1024 * 1024)
         .build();
 
+    let relay_url: iroh::RelayUrl = "https://iroh-relay.sanad.ink"
+        .parse()
+        .expect("invalid relay URL");
+
     let mut builder = Endpoint::builder(presets::N0)
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
-        .transport_config(transport_config);
+        .transport_config(transport_config)
+        .relay_mode(RelayMode::custom([relay_url]));
 
     if let Some(key) = secret_key {
         builder = builder.secret_key(key);
