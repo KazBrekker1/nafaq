@@ -1268,6 +1268,11 @@ impl ConnectionManager {
     // ── DM connection management ────────────────────────────────────────
 
     pub async fn connect_dm(&self, node_id_str: &str) -> Result<()> {
+        // Skip if we already have a live connection to this peer
+        if self.dm_peers.lock().await.contains_key(node_id_str) {
+            return Ok(());
+        }
+
         let node_public_key: iroh::PublicKey = node_id_str
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid node ID: {node_id_str}"))?;

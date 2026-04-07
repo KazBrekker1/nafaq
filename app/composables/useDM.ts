@@ -21,6 +21,7 @@ export type DmMessageItem = DmTextMessage | DmFileMessage;
 const conversations = ref<Record<string, DmMessageItem[]>>({});
 const activeConversation = ref<string | null>(null);
 const unreadCounts = ref<Record<string, number>>({});
+const connectedPeers = new Set<string>();
 
 let dmListenerInitialized = false;
 
@@ -89,6 +90,11 @@ async function initDmListeners() {
       }
     }
   });
+
+  listen<any>("dm-disconnected", (event) => {
+    const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
+    if (pid) connectedPeers.delete(pid);
+  });
 }
 
 export function useDM() {
@@ -97,16 +103,23 @@ export function useDM() {
   initDmListeners();
 
   async function connect(nodeId: string) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("connect_dm", { nodeId });
+    if (!connectedPeers.has(nodeId)) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("connect_dm", { nodeId });
+      connectedPeers.add(nodeId);
+    }
     activeConversation.value = nodeId;
   }
 
-  async function disconnect() {
-    if (!activeConversation.value) return;
+  async function disconnect(nodeId?: string) {
+    const target = nodeId || activeConversation.value;
+    if (!target) return;
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("disconnect_dm", { peerId: activeConversation.value }).catch(() => {});
-    activeConversation.value = null;
+    await invoke("disconnect_dm", { peerId: target }).catch(() => {});
+    connectedPeers.delete(target);
+    if (activeConversation.value === target) {
+      activeConversation.value = null;
+    }
   }
 
   async function sendText(nodeId: string, content: string) {
@@ -133,13 +146,17 @@ export function useDM() {
     unreadCounts.value = { ...unreadCounts.value, [nodeId]: 0 };
   }
 
+  function clearActiveConversation() {
+    activeConversation.value = null;
+  }
+
   function totalUnread(): number {
     return Object.values(unreadCounts.value).reduce((a, b) => a + b, 0);
   }
 
   return {
     conversations, activeConversation, unreadCounts,
-    connect, disconnect, sendText, sendFile,
-    pushMessage, markRead, totalUnread,
+    connect, disconnect, clearActiveConversation,
+    sendText, sendFile, pushMessage, markRead, totalUnread,
   };
 }

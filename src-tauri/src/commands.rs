@@ -526,7 +526,19 @@ pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Resul
 #[tauri::command]
 pub async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    let settings = store.get("app_settings").unwrap_or(serde_json::json!({}));
+    let mut settings = store.get("app_settings").unwrap_or(serde_json::json!({}));
+    // persistent_identity is stored at the top level (not inside app_settings),
+    // so merge it into the returned object for the frontend.
+    if let serde_json::Value::Object(ref mut obj) = settings {
+        let persistent = store
+            .get("persistent_identity")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        obj.insert(
+            "persistentIdentity".to_string(),
+            serde_json::Value::Bool(persistent),
+        );
+    }
     Ok(settings)
 }
 

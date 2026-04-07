@@ -5,7 +5,7 @@ import { formatTime } from "~/utils/format";
 const route = useRoute();
 const peerId = computed(() => route.params.nodeId as string);
 
-const { conversations, connect, disconnect, sendText, sendFile, markRead } = useDM();
+const { conversations, connect, clearActiveConversation, sendText, sendFile, markRead } = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { createCall, shareTicket } = useCall();
@@ -104,10 +104,10 @@ onMounted(async () => {
   window.visualViewport?.addEventListener("resize", onViewportResize);
 });
 
-onUnmounted(async () => {
+onUnmounted(() => {
   stopProbing();
   window.visualViewport?.removeEventListener("resize", onViewportResize);
-  await disconnect();
+  clearActiveConversation();
 });
 </script>
 
