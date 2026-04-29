@@ -1,6 +1,7 @@
 mod codec;
 mod commands;
 mod connection;
+mod identity;
 mod messages;
 mod node;
 mod protocol;
@@ -92,8 +93,6 @@ fn pack_video_channel_packet(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    use tauri_plugin_store::StoreExt;
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -113,34 +112,9 @@ pub fn run() {
 
     builder
         .setup(move |app| {
-            // Load optional persisted secret key from store
-            let secret_key = {
-                let store = app.handle().store("settings.json")?;
-                let persistent = store
-                    .get("persistent_identity")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if persistent {
-                    store
-                        .get("secret_key")
-                        .and_then(|v| v.as_str().map(String::from))
-                        .and_then(|hex| {
-                            hex.parse::<iroh::SecretKey>().ok().or_else(|| {
-                                // Fallback: try base64 decode
-                                use base64::Engine;
-                                B64.decode(&hex).ok().and_then(|bytes| {
-                                    bytes
-                                        .as_slice()
-                                        .try_into()
-                                        .ok()
-                                        .map(|arr: [u8; 32]| iroh::SecretKey::from_bytes(&arr))
-                                })
-                            })
-                        })
-                } else {
-                    None
-                }
-            };
+            let loaded_identity = identity::load_or_create_persistent_identity(app.handle())?;
+            let identity_status = loaded_identity.status.clone();
+            let secret_key = loaded_identity.secret_key;
 
             // Initialize Iroh synchronously on the async runtime
             let (event_tx, _) = broadcast::channel::<Event>(256);
@@ -158,7 +132,7 @@ pub fn run() {
 
             let conn_manager_for_rt = conn_manager.clone();
             let (endpoint, router) = tauri::async_runtime::handle().block_on(async {
-                let endpoint = node::create_endpoint_with_key(secret_key)
+                let endpoint = node::create_endpoint_with_key(Some(secret_key))
                     .await
                     .expect("Failed to create Iroh endpoint");
                 tracing::info!("Node ID: {}", endpoint.id());
@@ -204,6 +178,7 @@ pub fn run() {
                 audio_codec: audio_codec.clone(),
                 video_codec: video_codec.clone(),
                 video_runtime: video_runtime_handle.clone(),
+                identity_status,
             };
 
             let media_bridge_ref = media_bridge.current.clone();

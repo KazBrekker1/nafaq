@@ -11,7 +11,7 @@ export interface AppSettings {
 
 const settings = ref<AppSettings>({
   displayName: "",
-  persistentIdentity: false,
+  persistentIdentity: true,
   nodeId: null,
   preferredMic: null,
   preferredCamera: null,
@@ -36,13 +36,7 @@ export function useSettings() {
     await invoke("update_settings", { settings: patch }).catch(() => {});
   }
 
-  async function togglePersistentIdentity(enabled: boolean) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("toggle_persistent_identity", { enabled });
-    settings.value.persistentIdentity = enabled;
-  }
-
   if (!loaded.value) load();
 
-  return { settings, loaded, save, togglePersistentIdentity };
+  return { settings, loaded, save };
 }

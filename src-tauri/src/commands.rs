@@ -3,6 +3,7 @@ use tauri::{ipc::Channel, Emitter, State};
 use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
+use crate::identity;
 use crate::messages::{
     Contact, ControlAction, DmMessage, MediaBridgeMode,
     MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
@@ -524,19 +525,28 @@ pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Resul
 // ── Settings commands ───────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn get_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     let mut settings = store.get("app_settings").unwrap_or(serde_json::json!({}));
     // persistent_identity is stored at the top level (not inside app_settings),
-    // so merge it into the returned object for the frontend.
+    // so merge it into the returned object for the frontend. Persistent identity
+    // is now required; normalize older false/missing settings to true.
+    if store.get("persistent_identity").and_then(|v| v.as_bool()) != Some(true) {
+        store.set("persistent_identity", serde_json::Value::Bool(true));
+        store.save().map_err(|e| e.to_string())?;
+    }
     if let serde_json::Value::Object(ref mut obj) = settings {
-        let persistent = store
-            .get("persistent_identity")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         obj.insert(
             "persistentIdentity".to_string(),
-            serde_json::Value::Bool(persistent),
+            serde_json::Value::Bool(true),
+        );
+        let identity_status = identity::status_from_store(&store, &state.identity_status);
+        obj.insert(
+            "identityStatus".to_string(),
+            serde_json::to_value(identity_status).map_err(|e| e.to_string())?,
         );
     }
     Ok(settings)
@@ -609,18 +619,13 @@ pub async fn toggle_persistent_identity(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    if enabled {
-        let key = state.endpoint.secret_key();
-        // SecretKey doesn't implement Display; encode bytes as lowercase hex
-        let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        store.set("secret_key", serde_json::Value::String(hex));
-        store.set("persistent_identity", serde_json::Value::Bool(true));
-    } else {
-        store.delete("secret_key");
-        store.set("persistent_identity", serde_json::Value::Bool(false));
+    if !enabled {
+        return Err("Persistent identity cannot be disabled".into());
     }
-    store.save().map_err(|e| e.to_string())?;
+
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let key = state.endpoint.secret_key();
+    identity::persist_secret_key(&store, key).map_err(|e| e.to_string())?;
     Ok(())
 }
 

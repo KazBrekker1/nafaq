@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 
 use crate::codec::{AudioCodecState, VideoCodecState};
 use crate::connection::ConnectionManager;
+use crate::identity::IdentityStatus;
 use crate::messages::{AudioPacket, Event, MediaSessionProfile, VideoPacket};
 
 #[derive(Clone)]
@@ -33,4 +34,5 @@ pub struct AppState {
     pub audio_codec: Arc<AudioCodecState>,
     pub video_codec: Arc<VideoCodecState>,
     pub video_runtime: tokio::runtime::Handle,
+    pub identity_status: IdentityStatus,
 }

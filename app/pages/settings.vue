@@ -3,7 +3,7 @@ import { truncateNodeId } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
 const { nodeId, displayName } = useCall();
-const { settings, save, togglePersistentIdentity } = useSettings();
+const { settings, save } = useSettings();
 
 const truncatedNodeId = computed(() => {
   if (!nodeId.value) return "\u2014";
@@ -16,11 +16,6 @@ function copyNodeId() {
 }
 
 const qrModalOpen = ref(false);
-
-async function handlePersistentIdentity(e: Event) {
-  const enabled = (e.target as HTMLInputElement).checked;
-  await togglePersistentIdentity(enabled);
-}
 
 // ── Devices ───────────────────────────────────────────────
 const media = useMedia();
@@ -154,29 +149,11 @@ onMounted(loadDevices);
           <div class="flex items-center justify-between gap-4">
             <div>
               <p class="label mb-1">PERSISTENT IDENTITY</p>
-              <p class="text-xs text-[var(--color-muted)]">Keep your node ID across restarts</p>
+              <p class="text-xs text-[var(--color-muted)]">Your node ID is persistent by default across restarts. Reset will be an explicit future action.</p>
             </div>
-            <!-- Custom toggle -->
-            <label class="relative inline-flex items-center cursor-pointer shrink-0">
-              <input
-                type="checkbox"
-                class="sr-only peer"
-                :checked="settings.persistentIdentity"
-                @change="handlePersistentIdentity"
-              />
-              <div
-                class="w-10 h-6 border-2 transition-colors bg-black relative"
-                :class="settings.persistentIdentity
-                  ? 'border-[var(--color-accent)] bg-[var(--color-accent)]'
-                  : 'border-[var(--color-border)]'"
-              >
-                <div
-                  class="absolute top-0.5 left-0.5 w-4 h-4 transition-transform"
-                  :class="settings.persistentIdentity ? 'translate-x-4' : 'translate-x-0'"
-                  :style="settings.persistentIdentity ? 'background: white' : 'background: var(--color-border)'"
-                />
-              </div>
-            </label>
+            <div class="shrink-0 border-2 border-[var(--color-accent)] px-3 py-1 text-xs font-bold tracking-widest text-[var(--color-accent)]">
+              ENABLED
+            </div>
           </div>
         </div>
       </section>
