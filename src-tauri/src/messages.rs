@@ -189,6 +189,18 @@ pub enum RelayStatusKind {
     Offline,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerConnectionKind {
+    Idle,
+    Connecting,
+    Connected,
+    Suspect,
+    Reconnecting,
+    Disconnected,
+    Failed,
+}
+
 /// Events from Rust backend → frontend (via Tauri events)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -217,6 +229,11 @@ pub enum Event {
     ConnectionStatus {
         peer_id: String,
         status: ConnectionStatusKind,
+    },
+    PeerConnectionStatusChanged {
+        peer_id: String,
+        status: PeerConnectionKind,
+        reason: Option<String>,
     },
     Error {
         message: String,

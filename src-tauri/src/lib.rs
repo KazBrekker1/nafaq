@@ -211,6 +211,9 @@ pub fn run() {
                                 Event::ChatReceived { .. } => "chat-received",
                                 Event::ControlReceived { .. } => "control-received",
                                 Event::ConnectionStatus { .. } => "connection-status",
+                                Event::PeerConnectionStatusChanged { .. } => {
+                                    "peer-connection-status-changed"
+                                }
                                 Event::Error { .. } => "nafaq-error",
                                 Event::QualityProfileChanged { .. } => "quality-profile-changed",
                                 Event::RelayStatusChanged { .. } => "relay-status-changed",
