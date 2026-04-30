@@ -5,7 +5,7 @@
 <h1 align="center">Nafaq</h1>
 
 <p align="center">
-  Peer-to-peer encrypted video calls — no servers, no middlemen.
+  Standalone peer-to-peer encrypted video calls — no accounts, no signaling server, no app backend.
 </p>
 
 <p align="center">
@@ -16,7 +16,9 @@
 
 ---
 
-Nafaq connects you directly to whoever you're calling. Audio and video are encoded in Rust (Opus + H.264), transported over QUIC, and routed peer-to-peer using [Iroh](https://iroh.computer)'s relay-assisted NAT traversal. No data ever touches a central server.
+Nafaq connects you directly to whoever you're calling. Audio and video are encoded in Rust (Opus + H.264), transported over QUIC, and routed peer-to-peer using [Iroh](https://iroh.computer)'s relay-assisted NAT traversal through the project-controlled relay. Nafaq stays standalone: no accounts, no hosted signaling service, no central contact registry, and no server-stored messages, files, or media.
+
+See [`docs/GOALS.md`](docs/GOALS.md) for the product goals and non-goals.
 
 ## Features
 

@@ -1,11 +1,11 @@
 # Nafaq — P2P Voice & Video Calling App Design Spec
 
 **Date**: 2026-03-24
-**Status**: Approved
+**Status**: Superseded for connectivity goals by `docs/GOALS.md` and `docs/plans/2026-04-30-standalone-relay-resilience.md`
 
 ## Context
 
-Nafaq is a peer-to-peer voice and video calling application built on Iroh (Rust QUIC networking library). The core motivation is fully decentralized, serverless communication — no central infrastructure, no TURN servers, no accounts. Users connect directly via Iroh's NAT holepunching over QUIC, with TLS 1.3 encryption built in.
+Nafaq is a peer-to-peer voice and video calling application built on Iroh (Rust QUIC networking library). The current connectivity goal is a standalone app with no accounts, no app backend, no hosted signaling service, no central contact registry, and no server-stored messages/media. Nafaq uses the project-controlled relay at `https://iroh-relay.sanad.ink` for Iroh relay-assisted NAT traversal; do not add default/public relay fallback unless that product decision changes. Users connect directly via Iroh's NAT holepunching over QUIC where possible, with TLS 1.3 encryption built in.
 
 The app ships as an Electrobun desktop application (Bun runtime + native webview) with a Vue + Nuxt UI v4 frontend and a brutalist design aesthetic (violet #8B5CF6 accent, monospace typography, sharp edges, high contrast).
 

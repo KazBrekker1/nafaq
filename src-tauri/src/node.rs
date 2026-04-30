@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
 use std::sync::LazyLock;
@@ -13,12 +13,7 @@ pub static RELAY_URL_PARSED: LazyLock<RelayUrl> =
     LazyLock::new(|| RELAY_URL.parse().expect("invalid relay URL"));
 const TICKET_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 
-#[allow(dead_code)]
-pub async fn create_endpoint() -> Result<Endpoint> {
-    create_endpoint_with_key(None).await
-}
-
-pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<Endpoint> {
+pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<Endpoint> {
     use noq_proto::congestion::BbrConfig;
     use std::sync::Arc;
 
@@ -36,16 +31,13 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
 
     let relay_url = RELAY_URL_PARSED.clone();
 
-    let mut builder = Endpoint::builder(presets::N0)
+    let endpoint = Endpoint::empty_builder()
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
         .transport_config(transport_config)
-        .relay_mode(RelayMode::custom([relay_url]));
-
-    if let Some(key) = secret_key {
-        builder = builder.secret_key(key);
-    }
-
-    let endpoint = builder.bind().await?;
+        .relay_mode(RelayMode::custom([relay_url]))
+        .secret_key(secret_key)
+        .bind()
+        .await?;
 
     // Wait for relay connection with a timeout — online() can hang indefinitely
     // if the relay's QUIC endpoint is unreachable (even if HTTP is up).
@@ -62,7 +54,14 @@ pub async fn create_endpoint_with_key(secret_key: Option<SecretKey>) -> Result<E
     Ok(endpoint)
 }
 
+#[cfg(test)]
+pub async fn create_test_endpoint() -> Result<Endpoint> {
+    let mut rng = rand::rng();
+    create_endpoint_with_key(SecretKey::generate(&mut rng)).await
+}
+
 /// Generate a shareable ticket string from the endpoint's current address.
+#[cfg(test)]
 pub fn generate_ticket(endpoint: &Endpoint) -> String {
     let ticket = EndpointTicket::new(endpoint.addr());
     ticket.serialize()
@@ -87,9 +86,29 @@ pub async fn generate_ticket_when_online(endpoint: &Endpoint) -> Result<String> 
     Ok(EndpointTicket::new(addr).serialize())
 }
 
+/// Validate that an endpoint address only references the project relay.
+pub fn validate_project_relay_addr(addr: &iroh::EndpointAddr) -> Result<()> {
+    for transport_addr in &addr.addrs {
+        if let TransportAddr::Relay(url) = transport_addr {
+            if url != &*RELAY_URL_PARSED {
+                anyhow::bail!("ticket uses unsupported relay {url}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a ticket string back into an EndpointTicket.
 pub fn parse_ticket(ticket_str: &str) -> Result<EndpointTicket> {
     let ticket = EndpointTicket::deserialize(ticket_str)?;
+    Ok(ticket)
+}
+
+/// Parse and validate a ticket supplied by another peer.
+pub fn parse_external_ticket(ticket_str: &str) -> Result<EndpointTicket> {
+    let ticket = parse_ticket(ticket_str)?;
+    validate_project_relay_addr(ticket.endpoint_addr())?;
     Ok(ticket)
 }
 
@@ -99,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_endpoint() {
-        let endpoint = create_endpoint().await.unwrap();
+        let endpoint = create_test_endpoint().await.unwrap();
         let id = endpoint.id();
         assert!(!id.to_string().is_empty());
         endpoint.close().await;
@@ -107,7 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ticket_roundtrip() {
-        let endpoint = create_endpoint().await.unwrap();
+        let endpoint = create_test_endpoint().await.unwrap();
         let ticket_str = generate_ticket(&endpoint);
         assert!(!ticket_str.is_empty());
         let ticket = parse_ticket(&ticket_str).unwrap();
@@ -117,7 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_ticket_when_online() {
-        let endpoint = create_endpoint().await.unwrap();
+        let endpoint = create_test_endpoint().await.unwrap();
         let ticket_str = generate_ticket_when_online(&endpoint).await.unwrap();
         let ticket = parse_ticket(&ticket_str).unwrap();
         assert_eq!(ticket.endpoint_addr().id, endpoint.id().into());

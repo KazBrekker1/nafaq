@@ -1,12 +1,21 @@
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
 use base64::Engine;
 use tauri::{ipc::Channel, Emitter, State};
 use tauri_plugin_store::StoreExt;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
 use crate::codec::{AudioEncoder, VideoEncoder};
+use crate::identity;
 use crate::messages::{
-    Contact, ControlAction, DmMessage, MediaBridgeMode,
+    Contact, ControlAction, DmMessage, Event, MediaBridgeMode,
     MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
     MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode, MediaSessionProfile,
+    RelayStatusKind,
 };
 use crate::node;
 use crate::state::{AppState, MediaBridgeRegistration, MediaBridgeState};
@@ -18,6 +27,15 @@ const MAX_TICKET_LEN: usize = 4096;
 const MAX_CHAT_LEN: usize = 64 * 1024; // 64 KB
 const MAX_RESOLUTION: u32 = 4096;
 const PROBE_PEER_ID: &str = "__bridge_probe__";
+const PRESENCE_MAX_CONCURRENT_PROBES: usize = 3;
+const PRESENCE_PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
+const PRESENCE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+const PRESENCE_FAILURE_MAX_ENTRIES: usize = 1024;
+
+static PRESENCE_PROBE_LIMIT: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(PRESENCE_MAX_CONCURRENT_PROBES));
+static PRESENCE_FAILURES: LazyLock<TokioMutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| TokioMutex::new(HashMap::new()));
 
 #[derive(Clone, serde::Serialize)]
 struct ProbeAudioEvent {
@@ -51,27 +69,43 @@ fn validate_resolution(width: u32, height: u32) -> Result<(), String> {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub id: String,
-    pub ticket: String,
+    pub ticket: Option<String>,
+    pub relay_status: RelayStatusKind,
 }
 
 #[tauri::command]
 pub async fn get_node_info(state: State<'_, AppState>) -> Result<NodeInfo, String> {
-    let ticket = node::generate_ticket_when_online(&state.endpoint)
-        .await
-        .map_err(|e| e.to_string())?;
+    let ticket = state.latest_ticket.lock().await.clone();
+    let relay_status = state.relay_status.lock().await.clone();
     Ok(NodeInfo {
         id: state.endpoint.id().to_string(),
         ticket,
+        relay_status,
     })
 }
 
 #[tauri::command]
 pub async fn create_call(state: State<'_, AppState>) -> Result<String, String> {
-    node::generate_ticket_when_online(&state.endpoint)
+    if let Some(ticket) = state.latest_ticket.lock().await.clone() {
+        return Ok(ticket);
+    }
+
+    let ticket = node::generate_ticket_when_online(&state.endpoint)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let mut latest_ticket = state.latest_ticket.lock().await;
+    if latest_ticket.as_deref() != Some(ticket.as_str()) {
+        *latest_ticket = Some(ticket.clone());
+        let _ = state.event_tx.send(Event::TicketRefreshed {
+            ticket: ticket.clone(),
+        });
+    }
+
+    Ok(ticket)
 }
 
 #[tauri::command]
@@ -83,11 +117,9 @@ pub async fn join_call(
     if ticket.len() > MAX_TICKET_LEN {
         return Err("Ticket too large".into());
     }
-    let endpoint_ticket = node::parse_ticket(&ticket).map_err(|e| e.to_string())?;
-    let addr = endpoint_ticket.endpoint_addr().clone();
     let peer_id = state
         .conn_manager
-        .connect_to_peer(&state.endpoint, addr)
+        .connect_to_peer_with_ticket(&state.endpoint, &ticket)
         .await
         .map_err(|e| e.to_string())?;
     let _ = app.emit("peer-connected", &peer_id);
@@ -363,13 +395,76 @@ pub async fn reinit_video_encoder_with_config(
 
 // ── Presence probing ────────────────────────────────────────────────
 
+fn relay_allows_presence_probe(status: &RelayStatusKind) -> bool {
+    matches!(status, RelayStatusKind::Online)
+}
+
+fn presence_backoff_active(failed_at: Instant, now: Instant) -> bool {
+    now.duration_since(failed_at) < PRESENCE_FAILURE_BACKOFF
+}
+
+fn prune_expired_presence_failures(failures: &mut HashMap<String, Instant>, now: Instant) {
+    failures.retain(|_, failed_at| presence_backoff_active(*failed_at, now));
+}
+
+fn prune_oldest_presence_failure(failures: &mut HashMap<String, Instant>) {
+    if let Some(oldest_node_id) = failures
+        .iter()
+        .min_by_key(|(_, failed_at)| **failed_at)
+        .map(|(node_id, _)| node_id.clone())
+    {
+        failures.remove(&oldest_node_id);
+    }
+}
+
+async fn peer_presence_backed_off(node_id: &str) -> bool {
+    let now = Instant::now();
+    let mut failures = PRESENCE_FAILURES.lock().await;
+    prune_expired_presence_failures(&mut failures, now);
+    failures.contains_key(node_id)
+}
+
+async fn record_presence_probe_result(node_id: &str, online: bool) {
+    let now = Instant::now();
+    let mut failures = PRESENCE_FAILURES.lock().await;
+    prune_expired_presence_failures(&mut failures, now);
+    if online {
+        failures.remove(node_id);
+    } else {
+        if !failures.contains_key(node_id) && failures.len() >= PRESENCE_FAILURE_MAX_ENTRIES {
+            prune_oldest_presence_failure(&mut failures);
+        }
+        failures.insert(node_id.to_string(), now);
+    }
+}
+
 #[tauri::command]
 pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let relay_status = state.relay_status.lock().await.clone();
+    if !relay_allows_presence_probe(&relay_status) {
+        return Ok(false);
+    }
+
+    if peer_presence_backed_off(&node_id).await {
+        return Ok(false);
+    }
+
+    let _permit = match tokio::time::timeout(
+        PRESENCE_PROBE_ACQUIRE_TIMEOUT,
+        PRESENCE_PROBE_LIMIT.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("presence probe unavailable".into()),
+        Err(_) => return Err("presence probe busy".into()),
+    };
+
     let node_public_key: iroh::PublicKey = node_id.parse().map_err(|e| format!("{e}"))?;
     let addr = iroh::EndpointAddr::new(node_public_key)
         .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    let online = match tokio::time::timeout(
+        crate::connection::DM_DIAL_TIMEOUT,
         state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
     )
     .await
@@ -377,9 +472,62 @@ pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Resu
         Ok(Ok(conn)) => {
             let conn: iroh::endpoint::Connection = conn;
             conn.close(0u32.into(), b"presence_probe");
-            Ok(true)
+            true
         }
-        _ => Ok(false),
+        _ => false,
+    };
+    record_presence_probe_result(&node_id, online).await;
+    Ok(online)
+}
+
+#[cfg(test)]
+mod check_presence_tests {
+    use super::*;
+
+    #[test]
+    fn check_presence_only_probes_when_relay_online() {
+        assert!(relay_allows_presence_probe(&RelayStatusKind::Online));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Starting));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Connecting));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Degraded));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Offline));
+    }
+
+    #[test]
+    fn check_presence_failed_peer_backoff_expires() {
+        let now = Instant::now();
+        assert!(presence_backoff_active(now, now));
+        assert!(presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF + Duration::from_millis(1),
+            now,
+        ));
+        assert!(!presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF,
+            now
+        ));
+        assert!(!presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF - Duration::from_millis(1),
+            now,
+        ));
+    }
+
+    #[test]
+    fn check_presence_failure_cache_prunes_expired_and_oldest() {
+        let now = Instant::now();
+        let mut failures = HashMap::from([
+            ("expired".to_string(), now - PRESENCE_FAILURE_BACKOFF),
+            ("oldest".to_string(), now - Duration::from_secs(30)),
+            ("newest".to_string(), now - Duration::from_secs(1)),
+        ]);
+
+        prune_expired_presence_failures(&mut failures, now);
+        assert!(!failures.contains_key("expired"));
+        assert!(failures.contains_key("oldest"));
+        assert!(failures.contains_key("newest"));
+
+        prune_oldest_presence_failure(&mut failures);
+        assert!(!failures.contains_key("oldest"));
+        assert!(failures.contains_key("newest"));
     }
 }
 
@@ -435,10 +583,19 @@ pub async fn send_file(
     }
     let id = uuid::Uuid::new_v4().to_string();
 
-    // Send FileStart
+    // File transfer receiver state is tied to a single DM stream, so ensure once
+    // and then use strict frame sends. A mid-transfer stream loss must be
+    // reported instead of reconnecting and retrying a chunk/end on a fresh stream
+    // without FileStart.
     state
         .conn_manager
-        .send_dm(
+        .ensure_dm_connected(&peer_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    state
+        .conn_manager
+        .send_dm_frame_strict(
             &peer_id,
             &DmMessage::FileStart {
                 name,
@@ -463,7 +620,7 @@ pub async fn send_file(
         }
         state
             .conn_manager
-            .send_dm(
+            .send_dm_frame_strict(
                 &peer_id,
                 &DmMessage::FileChunk {
                     id: id.clone(),
@@ -479,7 +636,7 @@ pub async fn send_file(
     // Send FileEnd
     state
         .conn_manager
-        .send_dm(&peer_id, &DmMessage::FileEnd { id: id.clone() })
+        .send_dm_frame_strict(&peer_id, &DmMessage::FileEnd { id: id.clone() })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -524,19 +681,28 @@ pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Resul
 // ── Settings commands ───────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn get_settings(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub async fn get_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     let mut settings = store.get("app_settings").unwrap_or(serde_json::json!({}));
     // persistent_identity is stored at the top level (not inside app_settings),
-    // so merge it into the returned object for the frontend.
+    // so merge it into the returned object for the frontend. Persistent identity
+    // is now required; normalize older false/missing settings to true.
+    if store.get("persistent_identity").and_then(|v| v.as_bool()) != Some(true) {
+        store.set("persistent_identity", serde_json::Value::Bool(true));
+        store.save().map_err(|e| e.to_string())?;
+    }
     if let serde_json::Value::Object(ref mut obj) = settings {
-        let persistent = store
-            .get("persistent_identity")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
         obj.insert(
             "persistentIdentity".to_string(),
-            serde_json::Value::Bool(persistent),
+            serde_json::Value::Bool(true),
+        );
+        let identity_status = identity::status_from_store(&store, &state.identity_status);
+        obj.insert(
+            "identityStatus".to_string(),
+            serde_json::to_value(identity_status).map_err(|e| e.to_string())?,
         );
     }
     Ok(settings)
@@ -609,18 +775,13 @@ pub async fn toggle_persistent_identity(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    if enabled {
-        let key = state.endpoint.secret_key();
-        // SecretKey doesn't implement Display; encode bytes as lowercase hex
-        let hex: String = key.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        store.set("secret_key", serde_json::Value::String(hex));
-        store.set("persistent_identity", serde_json::Value::Bool(true));
-    } else {
-        store.delete("secret_key");
-        store.set("persistent_identity", serde_json::Value::Bool(false));
+    if !enabled {
+        return Err("Persistent identity cannot be disabled".into());
     }
-    store.save().map_err(|e| e.to_string())?;
+
+    let store = app.store("settings.json").map_err(|e| e.to_string())?;
+    let key = state.endpoint.secret_key();
+    identity::persist_secret_key(&store, key).map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - main
+      - "**"
   workflow_dispatch:
     inputs:
       draft:
@@ -18,12 +18,17 @@ concurrency:
 
 jobs:
   create-release:
+    # Only run when commit message contains [build], or when manually dispatched.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[build]')
     permissions:
       contents: write
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
       draft: ${{ steps.meta.outputs.draft }}
     steps:
       - uses: actions/checkout@v4
@@ -34,16 +39,34 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure GitHub release exists
+      - name: Compute branch slug + release metadata
         id: meta
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
           DRAFT: ${{ github.event.inputs.draft == 'true' }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="nafaq-v${VERSION}"
+          # Slugify branch name for use in tag (replace anything not [A-Za-z0-9.] with '-').
+          BRANCH_SLUG=$(echo "$REF_NAME" | sed -E 's/[^A-Za-z0-9.]+/-/g' | sed -E 's/^-+|-+$//g')
+          TAG="${BRANCH_SLUG}-v${VERSION}"
+          RELEASE_NAME="Nafaq ${BRANCH_SLUG} v${VERSION}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
           echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+
+          NOTES=$(cat <<EOF
+          ## $RELEASE_NAME
+
+          ### macOS install
+
+          After installing, macOS may require clearing the quarantine attribute once:
+
+          \`\`\`sh
+          xattr -cr "/Applications/Nafaq.app"
+          \`\`\`
+          EOF
+          )
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists"
@@ -51,9 +74,9 @@ jobs:
           fi
 
           if [ "$DRAFT" = "true" ]; then
-            gh release create "$TAG" --title "Nafaq v${VERSION}" --notes "## Nafaq v${VERSION}" --draft
+            gh release create "$TAG" --target "$REF_NAME" --title "$RELEASE_NAME" --notes "$NOTES" --draft
           else
-            gh release create "$TAG" --title "Nafaq v${VERSION}" --notes "## Nafaq v${VERSION}"
+            gh release create "$TAG" --target "$REF_NAME" --title "$RELEASE_NAME" --notes "$NOTES"
           fi
 
   publish-desktop:
@@ -90,7 +113,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
@@ -122,7 +145,7 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         with:
           tagName: ${{ needs.create-release.outputs.tag }}
-          releaseName: Nafaq v${{ needs.create-release.outputs.version }}
+          releaseName: ${{ needs.create-release.outputs.release_name }}
           releaseBody: ""
           releaseDraft: ${{ needs.create-release.outputs.draft == 'true' }}
           prerelease: false
@@ -146,7 +169,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
@@ -206,7 +229,7 @@ jobs:
           echo "password=$ANDROID_KEY_PASSWORD" >> keystore.properties
 
       - name: Build Android APK (release)
-        run: bun run tauri android build
+        run: bun run tauri android build --target aarch64
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 

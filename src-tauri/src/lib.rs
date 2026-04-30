@@ -1,9 +1,11 @@
 mod codec;
 mod commands;
 mod connection;
+mod identity;
 mod messages;
 mod node;
 mod protocol;
+mod relay;
 mod state;
 
 use std::collections::{HashMap, HashSet};
@@ -13,11 +15,11 @@ use base64::Engine;
 use codec::{AudioCodecState, AudioDecoder, VideoCodecState};
 use connection::ConnectionManager;
 use iroh::protocol::Router;
-use messages::{AudioPacket, ControlAction, Event, VideoPacket};
+use messages::{AudioPacket, ControlAction, Event, RelayStatusKind, VideoPacket};
 use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
 use tauri::{Emitter, Manager};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
@@ -92,8 +94,6 @@ fn pack_video_channel_packet(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    use tauri_plugin_store::StoreExt;
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -113,39 +113,16 @@ pub fn run() {
 
     builder
         .setup(move |app| {
-            // Load optional persisted secret key from store
-            let secret_key = {
-                let store = app.handle().store("settings.json")?;
-                let persistent = store
-                    .get("persistent_identity")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if persistent {
-                    store
-                        .get("secret_key")
-                        .and_then(|v| v.as_str().map(String::from))
-                        .and_then(|hex| {
-                            hex.parse::<iroh::SecretKey>().ok().or_else(|| {
-                                // Fallback: try base64 decode
-                                use base64::Engine;
-                                B64.decode(&hex).ok().and_then(|bytes| {
-                                    bytes
-                                        .as_slice()
-                                        .try_into()
-                                        .ok()
-                                        .map(|arr: [u8; 32]| iroh::SecretKey::from_bytes(&arr))
-                                })
-                            })
-                        })
-                } else {
-                    None
-                }
-            };
+            let loaded_identity = identity::load_or_create_persistent_identity(app.handle())?;
+            let identity_status = loaded_identity.status.clone();
+            let secret_key = loaded_identity.secret_key;
 
             // Initialize Iroh synchronously on the async runtime
             let (event_tx, _) = broadcast::channel::<Event>(256);
             let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
             let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
+            let latest_ticket = Arc::new(Mutex::new(None));
+            let relay_status = Arc::new(Mutex::new(RelayStatusKind::Starting));
 
             let audio_media_tx_for_setup = audio_media_tx.clone();
             let video_media_tx_for_setup = video_media_tx.clone();
@@ -154,6 +131,7 @@ pub fn run() {
                 event_tx.clone(),
                 audio_media_tx.clone(),
                 video_media_tx.clone(),
+                latest_ticket.clone(),
             ));
 
             let conn_manager_for_rt = conn_manager.clone();
@@ -194,6 +172,11 @@ pub fn run() {
             // Keep runtime alive for the app's lifetime
             std::mem::forget(video_runtime);
 
+            let endpoint_for_relay = endpoint.clone();
+            let latest_ticket_for_relay = latest_ticket.clone();
+            let relay_status_for_relay = relay_status.clone();
+            let event_tx_for_relay = event_tx.clone();
+
             let app_state = AppState {
                 endpoint,
                 router,
@@ -204,6 +187,9 @@ pub fn run() {
                 audio_codec: audio_codec.clone(),
                 video_codec: video_codec.clone(),
                 video_runtime: video_runtime_handle.clone(),
+                identity_status,
+                latest_ticket,
+                relay_status,
             };
 
             let media_bridge_ref = media_bridge.current.clone();
@@ -225,8 +211,13 @@ pub fn run() {
                                 Event::ChatReceived { .. } => "chat-received",
                                 Event::ControlReceived { .. } => "control-received",
                                 Event::ConnectionStatus { .. } => "connection-status",
+                                Event::PeerConnectionStatusChanged { .. } => {
+                                    "peer-connection-status-changed"
+                                }
                                 Event::Error { .. } => "nafaq-error",
                                 Event::QualityProfileChanged { .. } => "quality-profile-changed",
+                                Event::RelayStatusChanged { .. } => "relay-status-changed",
+                                Event::TicketRefreshed { .. } => "ticket-refreshed",
                                 Event::DmReceived { .. } => "dm-received",
                                 Event::DmConnected { .. } => "dm-connected",
                                 Event::DmDisconnected { .. } => "dm-disconnected",
@@ -243,6 +234,13 @@ pub fn run() {
                     }
                 }
             });
+
+            tauri::async_runtime::spawn(relay::monitor_relay(
+                endpoint_for_relay,
+                latest_ticket_for_relay,
+                relay_status_for_relay,
+                event_tx_for_relay,
+            ));
 
             // Spawn PeerAnnounce + VideoQualityRequest handler
             let conn_manager_for_control = conn_manager.clone();
@@ -282,6 +280,11 @@ pub fn run() {
                             tracing::debug!(
                                 "Peer {peer_id} requested keyframe for layer: {layer:?}"
                             );
+                        }
+                        Ok(Event::TicketRefreshed { ticket }) => {
+                            conn_manager_for_control
+                                .send_self_announce_to_all(ticket)
+                                .await;
                         }
                         Ok(_) => {} // ignore other events
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -565,7 +568,7 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     conn_manager_liveness.send_heartbeat_to_all().await;
-                    conn_manager_liveness.prune_stale_peers(15_000).await;
+                    conn_manager_liveness.maintain_peer_liveness().await;
                 }
             });
 

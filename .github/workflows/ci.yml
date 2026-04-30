@@ -3,11 +3,11 @@ name: CI
 on:
   push:
     branches:
-      - dev
+      - feature/standalone-relay-resilience
   pull_request:
     branches:
       - main
-      - dev
+      - feature/standalone-relay-resilience
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,7 +28,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
@@ -67,7 +67,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
@@ -125,7 +125,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lockb') }}
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
@@ -171,8 +171,8 @@ jobs:
       - name: Initialize Android project (if missing)
         run: test -d src-tauri/gen/android || bun run tauri android init
 
-      - name: Build Android APK (debug)
-        run: bun run tauri android build -- --apk
+      - name: Build Android APK (release)
+        run: bun run tauri android build --target aarch64 --apk
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 

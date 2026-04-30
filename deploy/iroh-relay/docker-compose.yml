@@ -1,6 +1,6 @@
 services:
   iroh-relay:
-    image: n0computer/iroh-relay:latest
+    image: n0computer/iroh-relay:v0.97.0
     restart: unless-stopped
     environment:
       - SERVICE_FQDN_IROHRELAY_3340
@@ -9,7 +9,7 @@ services:
       - "7842:7842/udp"
     command: ["--dev"]
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3340/generate_204 || exit 0"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3340/generate_204 >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 10

@@ -179,6 +179,28 @@ impl VideoLayerRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayStatusKind {
+    Starting,
+    Connecting,
+    Online,
+    Degraded,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerConnectionKind {
+    Idle,
+    Connecting,
+    Connected,
+    Suspect,
+    Reconnecting,
+    Disconnected,
+    Failed,
+}
+
 /// Events from Rust backend → frontend (via Tauri events)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -208,6 +230,11 @@ pub enum Event {
         peer_id: String,
         status: ConnectionStatusKind,
     },
+    PeerConnectionStatusChanged {
+        peer_id: String,
+        status: PeerConnectionKind,
+        reason: Option<String>,
+    },
     Error {
         message: String,
     },
@@ -217,6 +244,16 @@ pub enum Event {
         fps: u32,
         max_width: u32,
         max_height: u32,
+    },
+    RelayStatusChanged {
+        status: RelayStatusKind,
+        relay_url: String,
+        node_id: String,
+        ticket_available: bool,
+        message: Option<String>,
+    },
+    TicketRefreshed {
+        ticket: String,
     },
     DmReceived {
         peer_id: String,

@@ -1,7 +1,13 @@
+import type { RelayStatus } from "./useNodeRuntime";
+
+export type IdentityStatus = "loaded_persistent" | "created_persistent" | "reset_required";
+
 export interface AppSettings {
   displayName: string;
   persistentIdentity: boolean;
+  identityStatus: IdentityStatus | null;
   nodeId: string | null;
+  relayStatus: RelayStatus;
   preferredMic: string | null;
   preferredCamera: string | null;
   preferredSpeaker: string | null;
@@ -11,8 +17,10 @@ export interface AppSettings {
 
 const settings = ref<AppSettings>({
   displayName: "",
-  persistentIdentity: false,
+  persistentIdentity: true,
+  identityStatus: null,
   nodeId: null,
+  relayStatus: "starting",
   preferredMic: null,
   preferredCamera: null,
   preferredSpeaker: null,
@@ -36,13 +44,7 @@ export function useSettings() {
     await invoke("update_settings", { settings: patch }).catch(() => {});
   }
 
-  async function togglePersistentIdentity(enabled: boolean) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("toggle_persistent_identity", { enabled });
-    settings.value.persistentIdentity = enabled;
-  }
-
   if (!loaded.value) load();
 
-  return { settings, loaded, save, togglePersistentIdentity };
+  return { settings, loaded, save };
 }

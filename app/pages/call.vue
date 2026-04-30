@@ -34,7 +34,7 @@ let cleaned = false;
 
 const isLobby = computed(() => call.state.value !== "connected");
 
-const shareConnectionTicket = computed(() => call.shareTicket.value || call.ticket.value);
+const shareConnectionTicket = computed(() => call.shareTicket.value);
 const remoteGridClass = computed(() => {
   const count = call.peers.value.length;
   if (count <= 1) return "grid-cols-1";
