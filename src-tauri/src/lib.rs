@@ -568,7 +568,7 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     conn_manager_liveness.send_heartbeat_to_all().await;
-                    conn_manager_liveness.prune_stale_peers(15_000).await;
+                    conn_manager_liveness.maintain_peer_liveness().await;
                 }
             });
 

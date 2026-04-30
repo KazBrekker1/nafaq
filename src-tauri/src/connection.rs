@@ -57,6 +57,10 @@ const CALL_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const DM_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+const SUSPECT_AFTER_MS: u64 = 20_000;
+const RECONNECT_AFTER_MS: u64 = 35_000;
+const DISCONNECT_AFTER_MS: u64 = 120_000;
+const RECONNECT_RETRY_AFTER_MS: u64 = 15_000;
 
 async fn with_timeout<T, F>(
     timeout_duration: Duration,
@@ -334,6 +338,27 @@ fn should_replace_connection(
         && candidate_direction == preferred_connection_direction(local_node_id, remote_peer_id)
 }
 
+fn should_accept_call_connection_candidate(
+    local_node_id: Option<&str>,
+    remote_peer_id: &str,
+    existing_direction: ConnectionDirection,
+    existing_status: &PeerConnectionKind,
+    candidate_direction: ConnectionDirection,
+) -> bool {
+    if existing_status == &PeerConnectionKind::Reconnecting {
+        return true;
+    }
+
+    local_node_id.is_some_and(|local_id| {
+        should_replace_connection(
+            local_id,
+            remote_peer_id,
+            existing_direction,
+            candidate_direction,
+        )
+    })
+}
+
 struct PeerConnection {
     connection: Connection,
     direction: ConnectionDirection,
@@ -344,6 +369,7 @@ struct PeerConnection {
     requested_video_layer: Arc<AtomicU8>,
     pending_keyframe: Arc<AtomicBool>,
     last_activity_ms: Arc<AtomicU64>,
+    connection_status: PeerConnectionKind,
     /// Per-peer outbound bitrate override (0 = use global profile)
     outbound_bitrate_bps: Arc<AtomicU32>,
 }
@@ -584,9 +610,13 @@ impl ConnectionManager {
         let Some(existing) = peers.get(peer_id) else {
             return true;
         };
-        local_node_id.is_some_and(|local_id| {
-            should_replace_connection(&local_id, peer_id, existing.direction, direction)
-        })
+        should_accept_call_connection_candidate(
+            local_node_id.as_deref(),
+            peer_id,
+            existing.direction,
+            &existing.connection_status,
+            direction,
+        )
     }
 
     async fn should_accept_dm_connection(
@@ -932,6 +962,22 @@ impl ConnectionManager {
             .await
     }
 
+    pub async fn connect_to_peer_with_ticket(
+        &self,
+        endpoint: &iroh::Endpoint,
+        ticket: &str,
+    ) -> Result<String> {
+        let endpoint_ticket = crate::node::parse_ticket(ticket)?;
+        let addr = endpoint_ticket.endpoint_addr().clone();
+        let peer_id = addr.id.to_string();
+        self.upsert_peer_ticket(&peer_id, ticket).await;
+        let result = self.connect_to_peer(endpoint, addr).await;
+        if result.is_err() {
+            self.record_peer_ticket_dial_failure(&peer_id).await;
+        }
+        result
+    }
+
     async fn connect_to_peer_with_timeout(
         &self,
         endpoint: &iroh::Endpoint,
@@ -1022,6 +1068,7 @@ impl ConnectionManager {
             requested_video_layer: Arc::new(AtomicU8::new(0)),
             pending_keyframe: Arc::new(AtomicBool::new(false)),
             last_activity_ms: Arc::new(AtomicU64::new(Self::current_timestamp_ms())),
+            connection_status: PeerConnectionKind::Connected,
             outbound_bitrate_bps: Arc::new(AtomicU32::new(0)),
         };
 
@@ -1033,9 +1080,13 @@ impl ConnectionManager {
             let old = peers.len();
             let should_insert = match peers.get(&peer_id) {
                 None => true,
-                Some(existing) => local_node_id.as_ref().is_some_and(|local_id| {
-                    should_replace_connection(local_id, &peer_id, existing.direction, direction)
-                }),
+                Some(existing) => should_accept_call_connection_candidate(
+                    local_node_id.as_deref(),
+                    &peer_id,
+                    existing.direction,
+                    &existing.connection_status,
+                    direction,
+                ),
             };
 
             if !should_insert {
@@ -1712,25 +1763,165 @@ impl ConnectionManager {
         }
     }
 
-    pub async fn prune_stale_peers(&self, max_idle_ms: u64) {
-        let now = Self::current_timestamp_ms();
-        let stale_peer_ids: Vec<String> = {
-            let peers = self.peers.lock().await;
-            peers
-                .iter()
-                .filter_map(|(peer_id, peer)| {
-                    let idle_ms = now.saturating_sub(peer.last_activity_ms.load(Ordering::Relaxed));
-                    if idle_ms > max_idle_ms {
-                        Some(peer_id.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+    async fn latest_reconnect_ticket(&self, peer_id: &str, now: u64) -> Option<String> {
+        let tickets = self.peer_tickets.lock().await;
+        let record = tickets.get(peer_id)?;
+        if record
+            .last_dial_failed_ms
+            .is_some_and(|failed_at| now.saturating_sub(failed_at) < RECONNECT_RETRY_AFTER_MS)
+        {
+            return None;
+        }
+        Some(record.ticket.clone())
+    }
+
+    async fn spawn_peer_reconnect(&self, peer_id: String, ticket: String) {
+        let Some(endpoint) = self.endpoint.lock().await.clone() else {
+            return;
+        };
+        let Some(reservation) = self.reserve_call_connecting_guard(&peer_id).await else {
+            return;
         };
 
-        for peer_id in stale_peer_ids {
-            tracing::info!("Pruning stale peer {peer_id} after inactivity timeout");
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            let endpoint_ticket = match crate::node::parse_ticket(&ticket) {
+                Ok(endpoint_ticket) => endpoint_ticket,
+                Err(e) => {
+                    tracing::warn!("Reconnect: invalid ticket for {peer_id}: {e}");
+                    manager.record_peer_ticket_dial_failure(&peer_id).await;
+                    return;
+                }
+            };
+
+            let addr = endpoint_ticket.endpoint_addr().clone();
+            if addr.id.to_string() != peer_id {
+                tracing::warn!("Reconnect: ticket node id did not match peer {peer_id}");
+                manager.record_peer_ticket_dial_failure(&peer_id).await;
+                return;
+            }
+
+            match dial_peer_with_timeout(
+                &endpoint,
+                addr,
+                crate::node::NAFAQ_ALPN,
+                CALL_DIAL_TIMEOUT,
+                "timed out reconnecting peer",
+            )
+            .await
+            {
+                Ok(connection) => {
+                    if let Err(e) = manager.setup_outgoing_connection(connection).await {
+                        tracing::warn!("Reconnect: failed to set up peer {peer_id}: {e}");
+                        manager.record_peer_ticket_dial_failure(&peer_id).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Reconnect: failed to dial peer {peer_id}: {e}");
+                    manager.record_peer_ticket_dial_failure(&peer_id).await;
+                }
+            }
+        });
+    }
+
+    pub async fn maintain_peer_liveness(&self) {
+        let now = Self::current_timestamp_ms();
+        let mut suspect_peer_ids = Vec::new();
+        let mut suspect_reconnect_peer_ids = Vec::new();
+        let mut reconnect_peer_ids = Vec::new();
+        let mut connected_peer_ids = Vec::new();
+        let mut disconnected_peer_ids = Vec::new();
+
+        {
+            let mut peers = self.peers.lock().await;
+            for (peer_id, peer) in peers.iter_mut() {
+                let idle_ms = now.saturating_sub(peer.last_activity_ms.load(Ordering::Relaxed));
+                if idle_ms > DISCONNECT_AFTER_MS {
+                    disconnected_peer_ids.push(peer_id.clone());
+                } else {
+                    match peer.connection_status {
+                        PeerConnectionKind::Connected if idle_ms > SUSPECT_AFTER_MS => {
+                            peer.connection_status = PeerConnectionKind::Suspect;
+                            suspect_peer_ids.push(peer_id.clone());
+                        }
+                        PeerConnectionKind::Suspect if idle_ms > RECONNECT_AFTER_MS => {
+                            suspect_reconnect_peer_ids.push(peer_id.clone());
+                        }
+                        PeerConnectionKind::Reconnecting if idle_ms > RECONNECT_AFTER_MS => {
+                            reconnect_peer_ids.push(peer_id.clone());
+                        }
+                        _ if idle_ms <= SUSPECT_AFTER_MS
+                            && peer.connection_status != PeerConnectionKind::Connected =>
+                        {
+                            peer.connection_status = PeerConnectionKind::Connected;
+                            connected_peer_ids.push(peer_id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        for peer_id in suspect_peer_ids {
+            tracing::info!("Marking peer {peer_id} suspect after liveness timeout");
+            self.emit_peer_connection_status(
+                &peer_id,
+                PeerConnectionKind::Suspect,
+                Some("peer liveness is stale".to_string()),
+            );
+        }
+
+        for peer_id in connected_peer_ids {
+            self.emit_peer_connection_status(&peer_id, PeerConnectionKind::Connected, None);
+        }
+
+        for peer_id in suspect_reconnect_peer_ids {
+            let Some(ticket) = self.latest_reconnect_ticket(&peer_id, now).await else {
+                self.emit_peer_connection_status(
+                    &peer_id,
+                    PeerConnectionKind::Suspect,
+                    Some(
+                        "peer liveness is stale; waiting for fresh peer ticket or activity"
+                            .to_string(),
+                    ),
+                );
+                continue;
+            };
+
+            let mut should_reconnect = false;
+            {
+                let mut peers = self.peers.lock().await;
+                if let Some(peer) = peers.get_mut(&peer_id) {
+                    let idle_ms = now.saturating_sub(peer.last_activity_ms.load(Ordering::Relaxed));
+                    if peer.connection_status == PeerConnectionKind::Suspect
+                        && idle_ms > RECONNECT_AFTER_MS
+                        && idle_ms <= DISCONNECT_AFTER_MS
+                    {
+                        peer.connection_status = PeerConnectionKind::Reconnecting;
+                        should_reconnect = true;
+                    }
+                }
+            }
+
+            if should_reconnect {
+                self.emit_peer_connection_status(
+                    &peer_id,
+                    PeerConnectionKind::Reconnecting,
+                    Some("peer liveness is stale; attempting reconnect".to_string()),
+                );
+                self.spawn_peer_reconnect(peer_id, ticket).await;
+            }
+        }
+
+        for peer_id in reconnect_peer_ids {
+            if let Some(ticket) = self.latest_reconnect_ticket(&peer_id, now).await {
+                self.spawn_peer_reconnect(peer_id, ticket).await;
+            }
+        }
+
+        for peer_id in disconnected_peer_ids {
+            tracing::info!("Disconnecting stale peer {peer_id} after liveness timeout");
             Self::cleanup_peer_internal(
                 &peer_id,
                 &self.peers,
@@ -2023,6 +2214,59 @@ mod tests {
         ConnectionManager::new(event_tx, audio_tx, video_tx, Arc::new(Mutex::new(None)))
     }
 
+    async fn set_peer_liveness(
+        manager: &ConnectionManager,
+        peer_id: &str,
+        idle_ms: u64,
+        status: PeerConnectionKind,
+    ) {
+        let mut peers = manager.peers.lock().await;
+        let peer = peers.get_mut(peer_id).expect("test peer should exist");
+        peer.last_activity_ms.store(
+            ConnectionManager::current_timestamp_ms().saturating_sub(idle_ms),
+            Ordering::Relaxed,
+        );
+        peer.connection_status = status;
+    }
+
+    async fn connected_call_pair(
+        event_tx_a: broadcast::Sender<Event>,
+        event_tx_b: broadcast::Sender<Event>,
+    ) -> (
+        Arc<ConnectionManager>,
+        ConnectionManager,
+        iroh::Endpoint,
+        iroh::Endpoint,
+        Router,
+        String,
+    ) {
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a, audio_tx_a, video_tx_a));
+
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
+            .unwrap()
+            .endpoint_addr()
+            .clone();
+        let peer_id = mgr_b.connect_to_peer(&endpoint_b, addr_a).await.unwrap();
+
+        (mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id)
+    }
+
     #[test]
     fn duplicate_tie_break_prefers_outbound_for_higher_local_id() {
         assert_eq!(
@@ -2063,6 +2307,24 @@ mod tests {
             low,
             ConnectionDirection::Outbound,
             ConnectionDirection::Inbound
+        ));
+    }
+
+    #[test]
+    fn reconnecting_call_candidate_can_replace_same_direction_connection() {
+        assert!(should_accept_call_connection_candidate(
+            None,
+            "node-z",
+            ConnectionDirection::Outbound,
+            &PeerConnectionKind::Reconnecting,
+            ConnectionDirection::Outbound,
+        ));
+        assert!(!should_accept_call_connection_candidate(
+            None,
+            "node-z",
+            ConnectionDirection::Outbound,
+            &PeerConnectionKind::Connected,
+            ConnectionDirection::Outbound,
         ));
     }
 
@@ -2312,6 +2574,245 @@ mod tests {
         }
 
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_does_not_disconnect_after_legacy_fifteen_second_idle() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+
+        set_peer_liveness(&mgr_b, &peer_id, 15_001, PeerConnectionKind::Connected).await;
+        mgr_b.maintain_peer_liveness().await;
+
+        assert!(mgr_b.peers.lock().await.contains_key(&peer_id));
+        let disconnected = timeout(Duration::from_millis(250), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id }) => break Some(peer_id),
+                    Ok(_) => {}
+                    Err(_) => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            disconnected.is_err(),
+            "15s idle peer should not be disconnected"
+        );
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_marks_connected_peer_suspect_without_removing_it() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+
+        set_peer_liveness(
+            &mgr_b,
+            &peer_id,
+            SUSPECT_AFTER_MS + 1,
+            PeerConnectionKind::Connected,
+        )
+        .await;
+        mgr_b.maintain_peer_liveness().await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status,
+                        ..
+                    }) if id == peer_id && status == PeerConnectionKind::Suspect => {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for suspect status");
+        assert!(mgr_b.peers.lock().await.contains_key(&peer_id));
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_reconnecting_without_ticket_keeps_peer_until_final_timeout() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+        mgr_b.peer_tickets.lock().await.remove(&peer_id);
+
+        set_peer_liveness(
+            &mgr_b,
+            &peer_id,
+            RECONNECT_AFTER_MS + 1,
+            PeerConnectionKind::Suspect,
+        )
+        .await;
+        mgr_b.maintain_peer_liveness().await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status,
+                        reason,
+                    }) if id == peer_id && status == PeerConnectionKind::Suspect => {
+                        assert_eq!(
+                            reason.as_deref(),
+                            Some(
+                                "peer liveness is stale; waiting for fresh peer ticket or activity"
+                            )
+                        );
+                        break;
+                    }
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status,
+                        ..
+                    }) if id == peer_id && status == PeerConnectionKind::Reconnecting => {
+                        panic!("no-ticket suspect peer should not enter reconnecting status");
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for suspect no-ticket status");
+
+        {
+            let peers = mgr_b.peers.lock().await;
+            let peer = peers.get(&peer_id).expect("peer should remain cached");
+            assert_eq!(peer.connection_status, PeerConnectionKind::Suspect);
+        }
+
+        let no_reconnecting_or_disconnected = timeout(Duration::from_millis(250), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status: PeerConnectionKind::Reconnecting,
+                        ..
+                    }) if id == peer_id => break false,
+                    Ok(Event::PeerDisconnected { peer_id: id }) if id == peer_id => break false,
+                    Ok(_) => {}
+                    Err(_) => break true,
+                }
+            }
+        })
+        .await;
+        assert!(
+            no_reconnecting_or_disconnected.is_err(),
+            "no-ticket suspect peer should not emit reconnecting or disconnect immediately"
+        );
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_reconnect_attempt_uses_latest_cached_ticket_record() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b).await;
+
+        assert!(
+            mgr_b
+                .upsert_peer_ticket(&peer_id, &node::generate_ticket(&endpoint_a))
+                .await
+        );
+        assert!(
+            mgr_b
+                .upsert_peer_ticket(&peer_id, "not-a-valid-ticket")
+                .await
+        );
+        set_peer_liveness(
+            &mgr_b,
+            &peer_id,
+            RECONNECT_AFTER_MS + 1,
+            PeerConnectionKind::Reconnecting,
+        )
+        .await;
+
+        mgr_b.maintain_peer_liveness().await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let record = mgr_b
+                    .peer_tickets
+                    .lock()
+                    .await
+                    .get(&peer_id)
+                    .expect("ticket record should remain cached")
+                    .clone();
+                if record.ticket == "not-a-valid-ticket" && record.dial_failures == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for latest cached ticket reconnect attempt");
+        assert!(mgr_b.peers.lock().await.contains_key(&peer_id));
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn liveness_final_timeout_disconnects_and_removes_peer() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+
+        set_peer_liveness(
+            &mgr_b,
+            &peer_id,
+            DISCONNECT_AFTER_MS + 1,
+            PeerConnectionKind::Reconnecting,
+        )
+        .await;
+        mgr_b.maintain_peer_liveness().await;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id: id }) if id == peer_id => break,
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for final disconnect");
+        assert!(!mgr_b.peers.lock().await.contains_key(&peer_id));
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
     }
 
     #[tokio::test]

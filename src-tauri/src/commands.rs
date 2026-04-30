@@ -101,11 +101,9 @@ pub async fn join_call(
     if ticket.len() > MAX_TICKET_LEN {
         return Err("Ticket too large".into());
     }
-    let endpoint_ticket = node::parse_ticket(&ticket).map_err(|e| e.to_string())?;
-    let addr = endpoint_ticket.endpoint_addr().clone();
     let peer_id = state
         .conn_manager
-        .connect_to_peer(&state.endpoint, addr)
+        .connect_to_peer_with_ticket(&state.endpoint, &ticket)
         .await
         .map_err(|e| e.to_string())?;
     let _ = app.emit("peer-connected", &peer_id);
