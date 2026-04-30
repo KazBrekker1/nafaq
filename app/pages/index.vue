@@ -43,7 +43,7 @@ const onlineContacts = computed(() =>
 const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
 
 onMounted(() => {
-  if (contactNodeIds.value.length > 0) startProbing(contactNodeIds);
+  startProbing(contactNodeIds);
 });
 
 onUnmounted(() => {

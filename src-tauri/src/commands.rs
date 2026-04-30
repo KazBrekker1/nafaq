@@ -1,6 +1,13 @@
+use std::{
+    collections::HashMap,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
+
 use base64::Engine;
 use tauri::{ipc::Channel, Emitter, State};
 use tauri_plugin_store::StoreExt;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::identity;
@@ -20,6 +27,15 @@ const MAX_TICKET_LEN: usize = 4096;
 const MAX_CHAT_LEN: usize = 64 * 1024; // 64 KB
 const MAX_RESOLUTION: u32 = 4096;
 const PROBE_PEER_ID: &str = "__bridge_probe__";
+const PRESENCE_MAX_CONCURRENT_PROBES: usize = 3;
+const PRESENCE_PROBE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
+const PRESENCE_FAILURE_BACKOFF: Duration = Duration::from_secs(60);
+const PRESENCE_FAILURE_MAX_ENTRIES: usize = 1024;
+
+static PRESENCE_PROBE_LIMIT: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(PRESENCE_MAX_CONCURRENT_PROBES));
+static PRESENCE_FAILURES: LazyLock<TokioMutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| TokioMutex::new(HashMap::new()));
 
 #[derive(Clone, serde::Serialize)]
 struct ProbeAudioEvent {
@@ -379,12 +395,75 @@ pub async fn reinit_video_encoder_with_config(
 
 // ── Presence probing ────────────────────────────────────────────────
 
+fn relay_allows_presence_probe(status: &RelayStatusKind) -> bool {
+    matches!(status, RelayStatusKind::Online)
+}
+
+fn presence_backoff_active(failed_at: Instant, now: Instant) -> bool {
+    now.duration_since(failed_at) < PRESENCE_FAILURE_BACKOFF
+}
+
+fn prune_expired_presence_failures(failures: &mut HashMap<String, Instant>, now: Instant) {
+    failures.retain(|_, failed_at| presence_backoff_active(*failed_at, now));
+}
+
+fn prune_oldest_presence_failure(failures: &mut HashMap<String, Instant>) {
+    if let Some(oldest_node_id) = failures
+        .iter()
+        .min_by_key(|(_, failed_at)| **failed_at)
+        .map(|(node_id, _)| node_id.clone())
+    {
+        failures.remove(&oldest_node_id);
+    }
+}
+
+async fn peer_presence_backed_off(node_id: &str) -> bool {
+    let now = Instant::now();
+    let mut failures = PRESENCE_FAILURES.lock().await;
+    prune_expired_presence_failures(&mut failures, now);
+    failures.contains_key(node_id)
+}
+
+async fn record_presence_probe_result(node_id: &str, online: bool) {
+    let now = Instant::now();
+    let mut failures = PRESENCE_FAILURES.lock().await;
+    prune_expired_presence_failures(&mut failures, now);
+    if online {
+        failures.remove(node_id);
+    } else {
+        if !failures.contains_key(node_id) && failures.len() >= PRESENCE_FAILURE_MAX_ENTRIES {
+            prune_oldest_presence_failure(&mut failures);
+        }
+        failures.insert(node_id.to_string(), now);
+    }
+}
+
 #[tauri::command]
 pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Result<bool, String> {
+    let relay_status = state.relay_status.lock().await.clone();
+    if !relay_allows_presence_probe(&relay_status) {
+        return Ok(false);
+    }
+
+    if peer_presence_backed_off(&node_id).await {
+        return Ok(false);
+    }
+
+    let _permit = match tokio::time::timeout(
+        PRESENCE_PROBE_ACQUIRE_TIMEOUT,
+        PRESENCE_PROBE_LIMIT.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err("presence probe unavailable".into()),
+        Err(_) => return Err("presence probe busy".into()),
+    };
+
     let node_public_key: iroh::PublicKey = node_id.parse().map_err(|e| format!("{e}"))?;
     let addr = iroh::EndpointAddr::new(node_public_key)
         .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
-    match tokio::time::timeout(
+    let online = match tokio::time::timeout(
         crate::connection::DM_DIAL_TIMEOUT,
         state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
     )
@@ -393,9 +472,62 @@ pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Resu
         Ok(Ok(conn)) => {
             let conn: iroh::endpoint::Connection = conn;
             conn.close(0u32.into(), b"presence_probe");
-            Ok(true)
+            true
         }
-        _ => Ok(false),
+        _ => false,
+    };
+    record_presence_probe_result(&node_id, online).await;
+    Ok(online)
+}
+
+#[cfg(test)]
+mod check_presence_tests {
+    use super::*;
+
+    #[test]
+    fn check_presence_only_probes_when_relay_online() {
+        assert!(relay_allows_presence_probe(&RelayStatusKind::Online));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Starting));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Connecting));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Degraded));
+        assert!(!relay_allows_presence_probe(&RelayStatusKind::Offline));
+    }
+
+    #[test]
+    fn check_presence_failed_peer_backoff_expires() {
+        let now = Instant::now();
+        assert!(presence_backoff_active(now, now));
+        assert!(presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF + Duration::from_millis(1),
+            now,
+        ));
+        assert!(!presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF,
+            now
+        ));
+        assert!(!presence_backoff_active(
+            now - PRESENCE_FAILURE_BACKOFF - Duration::from_millis(1),
+            now,
+        ));
+    }
+
+    #[test]
+    fn check_presence_failure_cache_prunes_expired_and_oldest() {
+        let now = Instant::now();
+        let mut failures = HashMap::from([
+            ("expired".to_string(), now - PRESENCE_FAILURE_BACKOFF),
+            ("oldest".to_string(), now - Duration::from_secs(30)),
+            ("newest".to_string(), now - Duration::from_secs(1)),
+        ]);
+
+        prune_expired_presence_failures(&mut failures, now);
+        assert!(!failures.contains_key("expired"));
+        assert!(failures.contains_key("oldest"));
+        assert!(failures.contains_key("newest"));
+
+        prune_oldest_presence_failure(&mut failures);
+        assert!(!failures.contains_key("oldest"));
+        assert!(failures.contains_key("newest"));
     }
 }
 
