@@ -966,6 +966,7 @@ impl ConnectionManager {
         endpoint: &iroh::Endpoint,
         addr: iroh::EndpointAddr,
     ) -> Result<String> {
+        crate::node::validate_project_relay_addr(&addr)?;
         self.connect_to_peer_with_timeout(endpoint, addr, CALL_DIAL_TIMEOUT)
             .await
     }
@@ -975,7 +976,7 @@ impl ConnectionManager {
         endpoint: &iroh::Endpoint,
         ticket: &str,
     ) -> Result<String> {
-        let endpoint_ticket = crate::node::parse_ticket(ticket)?;
+        let endpoint_ticket = crate::node::parse_external_ticket(ticket)?;
         let addr = endpoint_ticket.endpoint_addr().clone();
         let peer_id = addr.id.to_string();
         self.upsert_peer_ticket(&peer_id, ticket).await;
@@ -992,6 +993,7 @@ impl ConnectionManager {
         addr: iroh::EndpointAddr,
         timeout: Duration,
     ) -> Result<String> {
+        crate::node::validate_project_relay_addr(&addr)?;
         let peer_id = addr.id.to_string();
 
         if self.call_peer_connected(&peer_id).await {
@@ -1217,6 +1219,15 @@ impl ConnectionManager {
             return;
         }
 
+        let endpoint_ticket = match crate::node::parse_external_ticket(&ticket) {
+            Ok(endpoint_ticket) => endpoint_ticket,
+            Err(e) => {
+                tracing::warn!("Mesh: rejected ticket for {announced_peer_id}: {e}");
+                return;
+            }
+        };
+        let addr = endpoint_ticket.endpoint_addr().clone();
+
         let ticket_changed = self.upsert_peer_ticket(&announced_peer_id, &ticket).await;
         if !ticket_changed {
             return;
@@ -1246,18 +1257,6 @@ impl ConnectionManager {
 
         let manager = self.clone();
         tokio::spawn(async move {
-            let endpoint_ticket = match crate::node::parse_ticket(&ticket) {
-                Ok(endpoint_ticket) => endpoint_ticket,
-                Err(e) => {
-                    tracing::warn!("Mesh: invalid ticket for {announced_peer_id}: {e}");
-                    manager
-                        .record_peer_ticket_dial_failure(&announced_peer_id)
-                        .await;
-                    return;
-                }
-            };
-
-            let addr = endpoint_ticket.endpoint_addr().clone();
             match manager
                 .connect_to_peer_with_timeout(&ep, addr, MESH_DIAL_TIMEOUT)
                 .await
@@ -1794,7 +1793,7 @@ impl ConnectionManager {
         let manager = self.clone();
         tokio::spawn(async move {
             let _reservation = reservation;
-            let endpoint_ticket = match crate::node::parse_ticket(&ticket) {
+            let endpoint_ticket = match crate::node::parse_external_ticket(&ticket) {
                 Ok(endpoint_ticket) => endpoint_ticket,
                 Err(e) => {
                     tracing::warn!("Reconnect: invalid ticket for {peer_id}: {e}");
@@ -2302,7 +2301,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::{endpoint::Connection, protocol::Router};
+    use iroh::{endpoint::Connection, protocol::Router, EndpointAddr, SecretKey, TransportAddr};
+    use iroh_tickets::{endpoint::EndpointTicket, Ticket};
     use tokio::time::timeout;
 
     use crate::node;
@@ -2314,6 +2314,15 @@ mod tests {
         video_tx: broadcast::Sender<VideoPacket>,
     ) -> ConnectionManager {
         ConnectionManager::new(event_tx, audio_tx, video_tx, Arc::new(Mutex::new(None)))
+    }
+
+    fn test_public_key() -> iroh::PublicKey {
+        let mut rng = rand::rng();
+        SecretKey::generate(&mut rng).public()
+    }
+
+    fn serialize_endpoint_addr(addr: EndpointAddr) -> String {
+        EndpointTicket::new(addr).serialize()
     }
 
     async fn set_peer_liveness(
@@ -2637,6 +2646,85 @@ mod tests {
         assert_eq!(record.ticket, "ticket-1");
         assert_eq!(record.last_dial_failed_ms, failed_at);
         assert_eq!(record.dial_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn foreign_relay_ticket_is_rejected_before_cache_or_dial() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+        let foreign_relay = "https://foreign-relay.example".parse().unwrap();
+        let addr =
+            EndpointAddr::from_parts(test_public_key(), [TransportAddr::Relay(foreign_relay)]);
+        let peer_id = addr.id.to_string();
+        let ticket = serialize_endpoint_addr(addr);
+
+        manager
+            .handle_peer_announce("sender", peer_id.clone(), ticket.clone())
+            .await;
+        assert!(
+            !manager.peer_tickets.lock().await.contains_key(&peer_id),
+            "foreign relay announce must not be cached"
+        );
+
+        let endpoint = iroh::Endpoint::empty_builder().bind().await.unwrap();
+        let err = manager
+            .connect_to_peer_with_ticket(&endpoint, &ticket)
+            .await
+            .expect_err("foreign relay ticket should be rejected before dialing");
+        assert!(err.to_string().contains("unsupported relay"));
+        assert!(
+            !manager.peer_tickets.lock().await.contains_key(&peer_id),
+            "foreign relay join ticket must not be cached"
+        );
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn own_relay_and_direct_only_tickets_are_accepted_for_cache() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        let own_relay_addr = EndpointAddr::from_parts(
+            test_public_key(),
+            [TransportAddr::Relay(node::RELAY_URL_PARSED.clone())],
+        );
+        let own_relay_peer_id = own_relay_addr.id.to_string();
+        let own_relay_ticket = serialize_endpoint_addr(own_relay_addr);
+        manager
+            .handle_peer_announce(
+                "sender",
+                own_relay_peer_id.clone(),
+                own_relay_ticket.clone(),
+            )
+            .await;
+
+        let direct_addr = EndpointAddr::from_parts(
+            test_public_key(),
+            [TransportAddr::Ip("127.0.0.1:12345".parse().unwrap())],
+        );
+        let direct_peer_id = direct_addr.id.to_string();
+        let direct_ticket = serialize_endpoint_addr(direct_addr);
+        manager
+            .handle_peer_announce("sender", direct_peer_id.clone(), direct_ticket.clone())
+            .await;
+
+        let tickets = manager.peer_tickets.lock().await;
+        assert_eq!(
+            tickets
+                .get(&own_relay_peer_id)
+                .map(|record| record.ticket.as_str()),
+            Some(own_relay_ticket.as_str())
+        );
+        assert_eq!(
+            tickets
+                .get(&direct_peer_id)
+                .map(|record| record.ticket.as_str()),
+            Some(direct_ticket.as_str())
+        );
     }
 
     #[test]

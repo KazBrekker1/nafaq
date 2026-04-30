@@ -1,5 +1,5 @@
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
 use std::sync::LazyLock;
@@ -31,7 +31,7 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<Endpoint>
 
     let relay_url = RELAY_URL_PARSED.clone();
 
-    let endpoint = Endpoint::builder(presets::N0)
+    let endpoint = Endpoint::empty_builder()
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
         .transport_config(transport_config)
         .relay_mode(RelayMode::custom([relay_url]))
@@ -86,9 +86,29 @@ pub async fn generate_ticket_when_online(endpoint: &Endpoint) -> Result<String> 
     Ok(EndpointTicket::new(addr).serialize())
 }
 
+/// Validate that an endpoint address only references the project relay.
+pub fn validate_project_relay_addr(addr: &iroh::EndpointAddr) -> Result<()> {
+    for transport_addr in &addr.addrs {
+        if let TransportAddr::Relay(url) = transport_addr {
+            if url != &*RELAY_URL_PARSED {
+                anyhow::bail!("ticket uses unsupported relay {url}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a ticket string back into an EndpointTicket.
 pub fn parse_ticket(ticket_str: &str) -> Result<EndpointTicket> {
     let ticket = EndpointTicket::deserialize(ticket_str)?;
+    Ok(ticket)
+}
+
+/// Parse and validate a ticket supplied by another peer.
+pub fn parse_external_ticket(ticket_str: &str) -> Result<EndpointTicket> {
+    let ticket = parse_ticket(ticket_str)?;
+    validate_project_relay_addr(ticket.endpoint_addr())?;
     Ok(ticket)
 }
 
