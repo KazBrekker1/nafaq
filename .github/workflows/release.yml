@@ -229,7 +229,7 @@ jobs:
           echo "password=$ANDROID_KEY_PASSWORD" >> keystore.properties
 
       - name: Build Android APK (release)
-        run: bun run tauri android build
+        run: bun run tauri android build --target aarch64
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 

@@ -172,7 +172,7 @@ jobs:
         run: test -d src-tauri/gen/android || bun run tauri android init
 
       - name: Build Android APK (release)
-        run: bun run tauri android build --apk
+        run: bun run tauri android build --target aarch64 --apk
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
