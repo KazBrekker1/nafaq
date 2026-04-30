@@ -187,7 +187,66 @@ mod tests {
     }
 
     #[test]
-    fn persistent_flag_without_key_returns_explicit_error() {
+    fn resilience_stable_identity_survives_restart_and_two_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("nafaq-identity-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("test temp dir should be created");
+        let path = dir.join("settings.json");
+
+        let first_node_id = {
+            let app = tauri::test::mock_builder()
+                .plugin(tauri_plugin_store::Builder::new().build())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .expect("mock app should build");
+            let store = app
+                .store_builder(&path)
+                .disable_auto_save()
+                .build()
+                .expect("store should build");
+            let loaded = load_or_create_from_store(&store).expect("identity should be created");
+            assert_eq!(loaded.status, IdentityStatus::CreatedPersistent);
+            loaded.secret_key.public().to_string()
+        };
+
+        let second_node_id = {
+            let app = tauri::test::mock_builder()
+                .plugin(tauri_plugin_store::Builder::new().build())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .expect("mock app should build");
+            let store = app
+                .store_builder(&path)
+                .disable_auto_save()
+                .build()
+                .expect("store should build");
+            let loaded = load_or_create_from_store(&store).expect("identity should load");
+            assert_eq!(loaded.status, IdentityStatus::LoadedPersistent);
+            loaded.secret_key.public().to_string()
+        };
+
+        let third_node_id = {
+            let app = tauri::test::mock_builder()
+                .plugin(tauri_plugin_store::Builder::new().build())
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .expect("mock app should build");
+            let store = app
+                .store_builder(&path)
+                .disable_auto_save()
+                .build()
+                .expect("store should build");
+            let loaded = load_or_create_from_store(&store).expect("identity should load again");
+            assert_eq!(loaded.status, IdentityStatus::LoadedPersistent);
+            loaded.secret_key.public().to_string()
+        };
+
+        assert_eq!(first_node_id, second_node_id);
+        assert_eq!(second_node_id, third_node_id);
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn resilience_missing_persisted_key_with_persistent_flag_errors() {
         let (app, path) = test_store();
         let store = app
             .store_builder(&path)

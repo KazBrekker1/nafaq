@@ -2552,7 +2552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_helper_returns_clear_error() {
+    async fn resilience_timeout_helper_returns_clear_error() {
         let err = with_timeout(
             Duration::from_millis(5),
             "timed out test helper",
@@ -2576,7 +2576,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_upsert_changed_ticket_updates_record() {
+    async fn resilience_ticket_upsert_changed_ticket_updates_record() {
         let (event_tx, _) = broadcast::channel::<Event>(8);
         let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
         let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
@@ -2653,7 +2653,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_latest_self_announce_uses_latest_ticket_only() {
+    async fn resilience_missing_ticket_or_endpoint_is_not_announced() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        assert!(manager.latest_self_announce_action().await.is_none());
+
+        *manager.latest_ticket.lock().await = Some("ticket-before-endpoint-ready".to_string());
+        assert!(manager.latest_self_announce_action().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resilience_ticket_latest_self_announce_uses_latest_ticket_only() {
         let (event_tx, _) = broadcast::channel::<Event>(8);
         let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
         let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
@@ -2883,7 +2896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn liveness_final_timeout_disconnects_and_removes_peer() {
+    async fn liveness_final_timeout_disconnects_and_removes_peer_with_reason() {
         let (event_tx_a, _) = broadcast::channel::<Event>(64);
         let (event_tx_b, _) = broadcast::channel::<Event>(64);
         let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
@@ -2900,16 +2913,31 @@ mod tests {
         mgr_b.maintain_peer_liveness().await;
 
         timeout(Duration::from_secs(2), async {
+            let mut saw_disconnect = false;
+            let mut saw_status_reason = false;
             loop {
                 match rx_b.recv().await {
-                    Ok(Event::PeerDisconnected { peer_id: id }) if id == peer_id => break,
+                    Ok(Event::PeerDisconnected { peer_id: id }) if id == peer_id => {
+                        saw_disconnect = true;
+                    }
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status: PeerConnectionKind::Disconnected,
+                        reason,
+                    }) if id == peer_id && reason.as_deref() == Some("peer timeout") => {
+                        saw_status_reason = true;
+                    }
                     Ok(_) => {}
                     Err(_) => {}
+                }
+
+                if saw_disconnect && saw_status_reason {
+                    break;
                 }
             }
         })
         .await
-        .expect("timed out waiting for final disconnect");
+        .expect("timed out waiting for final disconnect with reason");
         assert!(!mgr_b.peers.lock().await.contains_key(&peer_id));
 
         router_a.shutdown().await.ok();
