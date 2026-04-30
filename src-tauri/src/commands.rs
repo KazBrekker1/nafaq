@@ -5,9 +5,10 @@ use tauri_plugin_store::StoreExt;
 use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::identity;
 use crate::messages::{
-    Contact, ControlAction, DmMessage, MediaBridgeMode,
+    Contact, ControlAction, DmMessage, Event, MediaBridgeMode,
     MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
     MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode, MediaSessionProfile,
+    RelayStatusKind,
 };
 use crate::node;
 use crate::state::{AppState, MediaBridgeRegistration, MediaBridgeState};
@@ -52,27 +53,43 @@ fn validate_resolution(width: u32, height: u32) -> Result<(), String> {
 }
 
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeInfo {
     pub id: String,
-    pub ticket: String,
+    pub ticket: Option<String>,
+    pub relay_status: RelayStatusKind,
 }
 
 #[tauri::command]
 pub async fn get_node_info(state: State<'_, AppState>) -> Result<NodeInfo, String> {
-    let ticket = node::generate_ticket_when_online(&state.endpoint)
-        .await
-        .map_err(|e| e.to_string())?;
+    let ticket = state.latest_ticket.lock().await.clone();
+    let relay_status = state.relay_status.lock().await.clone();
     Ok(NodeInfo {
         id: state.endpoint.id().to_string(),
         ticket,
+        relay_status,
     })
 }
 
 #[tauri::command]
 pub async fn create_call(state: State<'_, AppState>) -> Result<String, String> {
-    node::generate_ticket_when_online(&state.endpoint)
+    if let Some(ticket) = state.latest_ticket.lock().await.clone() {
+        return Ok(ticket);
+    }
+
+    let ticket = node::generate_ticket_when_online(&state.endpoint)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    let mut latest_ticket = state.latest_ticket.lock().await;
+    if latest_ticket.as_deref() != Some(ticket.as_str()) {
+        *latest_ticket = Some(ticket.clone());
+        let _ = state.event_tx.send(Event::TicketRefreshed {
+            ticket: ticket.clone(),
+        });
+    }
+
+    Ok(ticket)
 }
 
 #[tauri::command]

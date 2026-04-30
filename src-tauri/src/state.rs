@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use crate::codec::{AudioCodecState, VideoCodecState};
 use crate::connection::ConnectionManager;
 use crate::identity::IdentityStatus;
-use crate::messages::{AudioPacket, Event, MediaSessionProfile, VideoPacket};
+use crate::messages::{AudioPacket, Event, MediaSessionProfile, RelayStatusKind, VideoPacket};
 
 #[derive(Clone)]
 pub struct MediaBridgeRegistration {
@@ -35,4 +35,6 @@ pub struct AppState {
     pub video_codec: Arc<VideoCodecState>,
     pub video_runtime: tokio::runtime::Handle,
     pub identity_status: IdentityStatus,
+    pub latest_ticket: Arc<Mutex<Option<String>>>,
+    pub relay_status: Arc<Mutex<RelayStatusKind>>,
 }
