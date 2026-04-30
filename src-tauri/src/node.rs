@@ -61,6 +61,7 @@ pub async fn create_test_endpoint() -> Result<Endpoint> {
 }
 
 /// Generate a shareable ticket string from the endpoint's current address.
+#[cfg(test)]
 pub fn generate_ticket(endpoint: &Endpoint) -> String {
     let ticket = EndpointTicket::new(endpoint.addr());
     ticket.serialize()

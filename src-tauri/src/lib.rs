@@ -131,6 +131,7 @@ pub fn run() {
                 event_tx.clone(),
                 audio_media_tx.clone(),
                 video_media_tx.clone(),
+                latest_ticket.clone(),
             ));
 
             let conn_manager_for_rt = conn_manager.clone();
@@ -276,6 +277,11 @@ pub fn run() {
                             tracing::debug!(
                                 "Peer {peer_id} requested keyframe for layer: {layer:?}"
                             );
+                        }
+                        Ok(Event::TicketRefreshed { ticket }) => {
+                            conn_manager_for_control
+                                .send_self_announce_to_all(ticket)
+                                .await;
                         }
                         Ok(_) => {} // ignore other events
                         Err(broadcast::error::RecvError::Lagged(n)) => {

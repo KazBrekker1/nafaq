@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -50,6 +50,20 @@ use crate::messages::{
     AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, VideoLayerRequest, VideoPacket,
     STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO,
 };
+
+const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn relay_targets_for_announce<'a>(
+    peer_ids: impl IntoIterator<Item = &'a String>,
+    sender_id: &str,
+    announced_peer_id: &str,
+) -> Vec<String> {
+    peer_ids
+        .into_iter()
+        .filter(|id| id.as_str() != sender_id && id.as_str() != announced_peer_id)
+        .cloned()
+        .collect()
+}
 
 struct ActiveFileReceive {
     file: tokio::fs::File,
@@ -285,11 +299,21 @@ pub struct NetworkPeerStats {
     pub latest_video_age_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PeerTicketRecord {
+    ticket: String,
+    last_updated_ms: u64,
+    last_dial_failed_ms: Option<u64>,
+    dial_failures: u32,
+}
+
+#[derive(Clone)]
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     dm_peers: Arc<Mutex<HashMap<String, DmPeerConnection>>>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
-    peer_tickets: Arc<Mutex<HashMap<String, String>>>,
+    latest_ticket: Arc<Mutex<Option<String>>>,
+    peer_tickets: Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
     audio_sequences: Arc<Mutex<HashMap<String, u16>>>,
     video_receive_state: Arc<Mutex<HashMap<String, VideoReceiveState>>>,
     event_tx: broadcast::Sender<Event>,
@@ -328,11 +352,13 @@ impl ConnectionManager {
         event_tx: broadcast::Sender<Event>,
         audio_media_tx: broadcast::Sender<AudioPacket>,
         video_media_tx: broadcast::Sender<VideoPacket>,
+        latest_ticket: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             dm_peers: Arc::new(Mutex::new(HashMap::new())),
             endpoint: Arc::new(Mutex::new(None)),
+            latest_ticket,
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
             audio_sequences: Arc::new(Mutex::new(HashMap::new())),
             video_receive_state: Arc::new(Mutex::new(HashMap::new())),
@@ -344,6 +370,69 @@ impl ConnectionManager {
 
     pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
         *self.endpoint.lock().await = Some(endpoint);
+    }
+
+    async fn upsert_peer_ticket(&self, peer_id: &str, ticket: &str) -> bool {
+        let mut tickets = self.peer_tickets.lock().await;
+        match tickets.get_mut(peer_id) {
+            Some(existing) if existing.ticket == ticket => false,
+            Some(existing) => {
+                existing.ticket = ticket.to_string();
+                existing.last_updated_ms = Self::current_timestamp_ms();
+                existing.last_dial_failed_ms = None;
+                existing.dial_failures = 0;
+                true
+            }
+            None => {
+                tickets.insert(
+                    peer_id.to_string(),
+                    PeerTicketRecord {
+                        ticket: ticket.to_string(),
+                        last_updated_ms: Self::current_timestamp_ms(),
+                        last_dial_failed_ms: None,
+                        dial_failures: 0,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    async fn record_peer_ticket_dial_failure(&self, peer_id: &str) {
+        let now = Self::current_timestamp_ms();
+        let mut tickets = self.peer_tickets.lock().await;
+        if let Some(record) = tickets.get_mut(peer_id) {
+            record.last_dial_failed_ms = Some(now);
+            record.dial_failures = record.dial_failures.saturating_add(1);
+        }
+    }
+
+    async fn latest_self_announce_action(&self) -> Option<ControlAction> {
+        let ticket = self.latest_ticket.lock().await.clone()?;
+        self.self_announce_action(ticket).await
+    }
+
+    async fn self_announce_action(&self, ticket: String) -> Option<ControlAction> {
+        let own_id = self.endpoint.lock().await.as_ref()?.id().to_string();
+        Some(ControlAction::PeerAnnounce {
+            peer_id: own_id,
+            ticket,
+        })
+    }
+
+    pub async fn send_self_announce_to_all(&self, ticket: String) {
+        let Some(announce_self) = self.self_announce_action(ticket).await else {
+            return;
+        };
+
+        let peer_ids: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers.keys().cloned().collect()
+        };
+
+        for peer_id in peer_ids {
+            let _ = self.send_control(&peer_id, &announce_self).await;
+        }
     }
 
     #[allow(dead_code)]
@@ -472,6 +561,23 @@ impl ConnectionManager {
         addr: iroh::EndpointAddr,
     ) -> Result<String> {
         let connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
+        self.setup_outgoing_connection(connection).await
+    }
+
+    async fn connect_to_peer_with_timeout(
+        &self,
+        endpoint: &iroh::Endpoint,
+        addr: iroh::EndpointAddr,
+        timeout: Duration,
+    ) -> Result<String> {
+        let connection =
+            tokio::time::timeout(timeout, endpoint.connect(addr, crate::node::NAFAQ_ALPN))
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out dialing peer"))??;
+        self.setup_outgoing_connection(connection).await
+    }
+
+    async fn setup_outgoing_connection(&self, connection: Connection) -> Result<String> {
         let peer_id = connection.remote_id().to_string();
         tracing::info!("Connected to peer {peer_id}");
         self.setup_connection(peer_id.clone(), connection).await?;
@@ -519,35 +625,24 @@ impl ConnectionManager {
 
         self.spawn_stream_receivers(peer_id.clone(), connection);
 
-        let endpoint_guard = self.endpoint.lock().await;
-        if let Some(endpoint) = endpoint_guard.as_ref() {
-            let own_ticket = crate::node::generate_ticket(endpoint);
-            let own_id = endpoint.id().to_string();
-            drop(endpoint_guard);
-
-            let announce_self = ControlAction::PeerAnnounce {
-                peer_id: own_id,
-                ticket: own_ticket,
-            };
+        if let Some(announce_self) = self.latest_self_announce_action().await {
             let _ = self.send_control(&peer_id, &announce_self).await;
+        }
 
-            let stored_tickets: Vec<(String, String)> = {
-                let tickets = self.peer_tickets.lock().await;
-                tickets
-                    .iter()
-                    .filter(|(id, _)| **id != peer_id)
-                    .map(|(id, t)| (id.clone(), t.clone()))
-                    .collect()
+        let stored_tickets: Vec<(String, String)> = {
+            let tickets = self.peer_tickets.lock().await;
+            tickets
+                .iter()
+                .filter(|(id, _)| **id != peer_id)
+                .map(|(id, record)| (id.clone(), record.ticket.clone()))
+                .collect()
+        };
+        for (stored_id, stored_ticket) in stored_tickets {
+            let announce = ControlAction::PeerAnnounce {
+                peer_id: stored_id,
+                ticket: stored_ticket,
             };
-            for (stored_id, stored_ticket) in stored_tickets {
-                let announce = ControlAction::PeerAnnounce {
-                    peer_id: stored_id,
-                    ticket: stored_ticket,
-                };
-                let _ = self.send_control(&peer_id, &announce).await;
-            }
-        } else {
-            drop(endpoint_guard);
+            let _ = self.send_control(&peer_id, &announce).await;
         }
 
         Ok(())
@@ -556,7 +651,7 @@ impl ConnectionManager {
     async fn cleanup_peer_internal(
         peer_id: &str,
         peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
-        peer_tickets: &Arc<Mutex<HashMap<String, String>>>,
+        peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
         audio_sequences: &Arc<Mutex<HashMap<String, u16>>>,
         video_receive_state: &Arc<Mutex<HashMap<String, VideoReceiveState>>>,
         event_tx: &broadcast::Sender<Event>,
@@ -605,49 +700,14 @@ impl ConnectionManager {
             return;
         }
 
-        let is_new = {
-            let mut tickets = self.peer_tickets.lock().await;
-            if tickets.contains_key(&announced_peer_id) {
-                false
-            } else {
-                tickets.insert(announced_peer_id.clone(), ticket.clone());
-                true
-            }
-        };
-        if !is_new {
+        let ticket_changed = self.upsert_peer_ticket(&announced_peer_id, &ticket).await;
+        if !ticket_changed {
             return;
-        }
-
-        let already_connected = self.peers.lock().await.contains_key(&announced_peer_id);
-        if !already_connected {
-            let endpoint = self.endpoint.lock().await.clone();
-            if let Some(ep) = endpoint {
-                match crate::node::parse_ticket(&ticket) {
-                    Ok(endpoint_ticket) => {
-                        let addr = endpoint_ticket.endpoint_addr().clone();
-                        match self.connect_to_peer(&ep, addr).await {
-                            Ok(_) => {
-                                tracing::info!(
-                                    "Mesh: auto-connected to announced peer {announced_peer_id}"
-                                )
-                            }
-                            Err(e) => tracing::warn!(
-                                "Mesh: failed to auto-connect to {announced_peer_id}: {e}"
-                            ),
-                        }
-                    }
-                    Err(e) => tracing::warn!("Mesh: invalid ticket for {announced_peer_id}: {e}"),
-                }
-            }
         }
 
         let relay_targets: Vec<String> = {
             let peers = self.peers.lock().await;
-            peers
-                .keys()
-                .filter(|id| *id != sender_id && *id != &announced_peer_id)
-                .cloned()
-                .collect()
+            relay_targets_for_announce(peers.keys(), sender_id, &announced_peer_id)
         };
         for target_id in relay_targets {
             let announce = ControlAction::PeerAnnounce {
@@ -656,6 +716,46 @@ impl ConnectionManager {
             };
             let _ = self.send_control(&target_id, &announce).await;
         }
+
+        let already_connected = self.peers.lock().await.contains_key(&announced_peer_id);
+        if already_connected {
+            return;
+        }
+
+        let endpoint = self.endpoint.lock().await.clone();
+        let Some(ep) = endpoint else {
+            return;
+        };
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let endpoint_ticket = match crate::node::parse_ticket(&ticket) {
+                Ok(endpoint_ticket) => endpoint_ticket,
+                Err(e) => {
+                    tracing::warn!("Mesh: invalid ticket for {announced_peer_id}: {e}");
+                    manager
+                        .record_peer_ticket_dial_failure(&announced_peer_id)
+                        .await;
+                    return;
+                }
+            };
+
+            let addr = endpoint_ticket.endpoint_addr().clone();
+            match manager
+                .connect_to_peer_with_timeout(&ep, addr, MESH_DIAL_TIMEOUT)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!("Mesh: auto-connected to announced peer {announced_peer_id}")
+                }
+                Err(e) => {
+                    tracing::warn!("Mesh: failed to auto-connect to {announced_peer_id}: {e}");
+                    manager
+                        .record_peer_ticket_dial_failure(&announced_peer_id)
+                        .await;
+                }
+            }
+        });
     }
 
     fn spawn_stream_receivers(&self, peer_id: String, connection: Connection) {
@@ -1425,21 +1525,128 @@ mod tests {
     use crate::node;
     use crate::protocol::{NafaqDmProtocol, NafaqProtocol};
 
+    fn test_manager(
+        event_tx: broadcast::Sender<Event>,
+        audio_tx: broadcast::Sender<AudioPacket>,
+        video_tx: broadcast::Sender<VideoPacket>,
+    ) -> ConnectionManager {
+        ConnectionManager::new(event_tx, audio_tx, video_tx, Arc::new(Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn ticket_upsert_changed_ticket_updates_record() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        assert!(manager.upsert_peer_ticket("peer-a", "ticket-1").await);
+        let first_updated = manager
+            .peer_tickets
+            .lock()
+            .await
+            .get("peer-a")
+            .expect("ticket record")
+            .last_updated_ms;
+
+        manager.record_peer_ticket_dial_failure("peer-a").await;
+        assert!(manager.upsert_peer_ticket("peer-a", "ticket-2").await);
+
+        let record = manager
+            .peer_tickets
+            .lock()
+            .await
+            .get("peer-a")
+            .expect("ticket record")
+            .clone();
+        assert_eq!(record.ticket, "ticket-2");
+        assert!(record.last_updated_ms >= first_updated);
+        assert_eq!(record.last_dial_failed_ms, None);
+        assert_eq!(record.dial_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn ticket_upsert_identical_ticket_preserves_failure_counters() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        assert!(manager.upsert_peer_ticket("peer-a", "ticket-1").await);
+        manager.record_peer_ticket_dial_failure("peer-a").await;
+        manager.record_peer_ticket_dial_failure("peer-a").await;
+        let failed_at = manager
+            .peer_tickets
+            .lock()
+            .await
+            .get("peer-a")
+            .expect("ticket record")
+            .last_dial_failed_ms;
+
+        assert!(!manager.upsert_peer_ticket("peer-a", "ticket-1").await);
+
+        let record = manager
+            .peer_tickets
+            .lock()
+            .await
+            .get("peer-a")
+            .expect("ticket record")
+            .clone();
+        assert_eq!(record.ticket, "ticket-1");
+        assert_eq!(record.last_dial_failed_ms, failed_at);
+        assert_eq!(record.dial_failures, 2);
+    }
+
+    #[test]
+    fn relay_target_selection_is_independent_of_auto_dial_outcome() {
+        let peers = vec![
+            "sender".to_string(),
+            "relay-target".to_string(),
+            "announced".to_string(),
+        ];
+
+        let relay_targets = relay_targets_for_announce(peers.iter(), "sender", "announced");
+
+        assert_eq!(relay_targets, vec!["relay-target".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ticket_latest_self_announce_uses_latest_ticket_only() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+        let endpoint = node::create_test_endpoint().await.unwrap();
+        let own_id = endpoint.id().to_string();
+        manager.set_endpoint(endpoint.clone()).await;
+
+        assert!(manager.latest_self_announce_action().await.is_none());
+
+        *manager.latest_ticket.lock().await = Some("stale-ticket".to_string());
+        *manager.latest_ticket.lock().await = Some("fresh-ticket".to_string());
+
+        match manager.latest_self_announce_action().await {
+            Some(ControlAction::PeerAnnounce { peer_id, ticket }) => {
+                assert_eq!(peer_id, own_id);
+                assert_eq!(ticket, "fresh-ticket");
+            }
+            other => panic!("expected fresh self PeerAnnounce, got {other:?}"),
+        }
+
+        endpoint.close().await;
+    }
+
     #[tokio::test]
     async fn emits_single_disconnect_when_remote_endpoint_closes() {
         let (event_tx_a, _) = broadcast::channel::<Event>(64);
         let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
         let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
-        let mgr_a = Arc::new(ConnectionManager::new(
-            event_tx_a.clone(),
-            audio_tx_a,
-            video_tx_a,
-        ));
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
 
         let (event_tx_b, _) = broadcast::channel::<Event>(64);
         let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
         let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
-        let mgr_b = Arc::new(ConnectionManager::new(event_tx_b, audio_tx_b, video_tx_b));
+        let mgr_b = Arc::new(test_manager(event_tx_b, audio_tx_b, video_tx_b));
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
