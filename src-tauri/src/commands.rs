@@ -387,7 +387,7 @@ pub async fn check_presence(node_id: String, state: State<'_, AppState>) -> Resu
     let addr = iroh::EndpointAddr::new(node_public_key)
         .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
     match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::connection::DM_DIAL_TIMEOUT,
         state.endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN),
     )
     .await

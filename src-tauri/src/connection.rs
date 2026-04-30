@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,7 +52,54 @@ use crate::messages::{
     STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO,
 };
 
+const CALL_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const DM_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+
+async fn with_timeout<T, F>(
+    timeout_duration: Duration,
+    timeout_message: impl Into<String>,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let timeout_message = timeout_message.into();
+    tokio::time::timeout(timeout_duration, future)
+        .await
+        .map_err(|_| anyhow::anyhow!(timeout_message))?
+}
+
+async fn dial_peer_with_timeout(
+    endpoint: &iroh::Endpoint,
+    addr: iroh::EndpointAddr,
+    alpn: &'static [u8],
+    timeout_duration: Duration,
+    timeout_message: &'static str,
+) -> Result<Connection> {
+    with_timeout(timeout_duration, timeout_message, async {
+        Ok(endpoint.connect(addr, alpn).await?)
+    })
+    .await
+}
+
+async fn open_typed_bi_stream(
+    connection: &Connection,
+    stream_type: u8,
+    stream_name: &'static str,
+) -> Result<(SendStream, RecvStream)> {
+    with_timeout(
+        STREAM_OPEN_TIMEOUT,
+        format!("timed out opening {stream_name} stream"),
+        async {
+            let (mut send, recv) = connection.open_bi().await?;
+            send.write_all(&[stream_type]).await?;
+            Ok((send, recv))
+        },
+    )
+    .await
+}
 
 fn relay_targets_for_announce<'a>(
     peer_ids: impl IntoIterator<Item = &'a String>,
@@ -560,8 +608,8 @@ impl ConnectionManager {
         endpoint: &iroh::Endpoint,
         addr: iroh::EndpointAddr,
     ) -> Result<String> {
-        let connection = endpoint.connect(addr, crate::node::NAFAQ_ALPN).await?;
-        self.setup_outgoing_connection(connection).await
+        self.connect_to_peer_with_timeout(endpoint, addr, CALL_DIAL_TIMEOUT)
+            .await
     }
 
     async fn connect_to_peer_with_timeout(
@@ -570,10 +618,14 @@ impl ConnectionManager {
         addr: iroh::EndpointAddr,
         timeout: Duration,
     ) -> Result<String> {
-        let connection =
-            tokio::time::timeout(timeout, endpoint.connect(addr, crate::node::NAFAQ_ALPN))
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out dialing peer"))??;
+        let connection = dial_peer_with_timeout(
+            endpoint,
+            addr,
+            crate::node::NAFAQ_ALPN,
+            timeout,
+            "timed out dialing peer",
+        )
+        .await?;
         self.setup_outgoing_connection(connection).await
     }
 
@@ -587,12 +639,11 @@ impl ConnectionManager {
     async fn setup_connection(&self, peer_id: String, connection: Connection) -> Result<()> {
         connection.set_max_concurrent_uni_streams(2048_u32.into());
 
-        let (mut chat_send, _) = connection.open_bi().await?;
-        chat_send.write_all(&[STREAM_CHAT]).await?;
+        let (chat_send, _) = open_typed_bi_stream(&connection, STREAM_CHAT, "chat").await?;
         chat_send.set_priority(10)?;
 
-        let (mut control_send, _) = connection.open_bi().await?;
-        control_send.write_all(&[STREAM_CONTROL]).await?;
+        let (control_send, _) =
+            open_typed_bi_stream(&connection, STREAM_CONTROL, "control").await?;
         control_send.set_priority(100)?;
 
         let peer_conn = PeerConnection {
@@ -1386,13 +1437,18 @@ impl ConnectionManager {
                 .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
         };
 
-        let connection: iroh::endpoint::Connection =
-            endpoint.connect(addr, crate::node::NAFAQ_DM_ALPN).await?;
+        let connection: iroh::endpoint::Connection = dial_peer_with_timeout(
+            &endpoint,
+            addr,
+            crate::node::NAFAQ_DM_ALPN,
+            DM_DIAL_TIMEOUT,
+            "timed out dialing DM peer",
+        )
+        .await?;
         let peer_id = connection.remote_id().to_string();
 
-        let (mut dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) =
-            connection.open_bi().await?;
-        dm_send.write_all(&[STREAM_DM]).await?;
+        let (dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) =
+            open_typed_bi_stream(&connection, STREAM_DM, "DM").await?;
 
         let dm_peer = DmPeerConnection {
             connection: connection.clone(),
@@ -1531,6 +1587,30 @@ mod tests {
         video_tx: broadcast::Sender<VideoPacket>,
     ) -> ConnectionManager {
         ConnectionManager::new(event_tx, audio_tx, video_tx, Arc::new(Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn timeout_helper_returns_clear_error() {
+        let err = with_timeout(
+            Duration::from_millis(5),
+            "timed out test helper",
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending future should time out");
+
+        assert_eq!(err.to_string(), "timed out test helper");
+    }
+
+    #[tokio::test]
+    async fn timeout_helper_returns_successful_result() {
+        let value = with_timeout(Duration::from_secs(1), "timed out test helper", async {
+            Ok(7usize)
+        })
+        .await
+        .expect("ready future should not time out");
+
+        assert_eq!(value, 7);
     }
 
     #[tokio::test]
