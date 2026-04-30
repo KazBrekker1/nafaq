@@ -1,8 +1,12 @@
+export type DmMessageStatus = "sending" | "sent" | "failed";
+
 export interface DmTextMessage {
   type: "text";
   content: string;
   timestamp: number;
   from: "self" | "peer";
+  status: DmMessageStatus;
+  clientId?: string;
 }
 
 export interface DmFileMessage {
@@ -43,6 +47,30 @@ function pushMessage(nodeId: string, msg: DmMessageItem) {
   }
 }
 
+function updateDmTextMessageStatus(
+  messages: DmMessageItem[],
+  target: DmTextMessage,
+  status: DmMessageStatus,
+): DmMessageItem[] {
+  return messages.map(message => {
+    if (
+      message.type === "text"
+      && (message === target || (target.clientId && message.clientId === target.clientId))
+    ) {
+      return { ...message, status };
+    }
+    return message;
+  });
+}
+
+function setDmTextStatus(nodeId: string, target: DmTextMessage, status: DmMessageStatus) {
+  const messages = conversations.value[nodeId] ?? [];
+  conversations.value = {
+    ...conversations.value,
+    [nodeId]: updateDmTextMessageStatus(messages, target, status),
+  };
+}
+
 async function initDmListeners() {
   if (dmListenerInitialized) return;
   dmListenerInitialized = true;
@@ -66,6 +94,7 @@ async function initDmListeners() {
         content: message.content,
         timestamp: message.timestamp,
         from: "peer",
+        status: "sent",
       });
     } else if (message.type === "file_start") {
       pushMessage(peer_id, {
@@ -89,6 +118,11 @@ async function initDmListeners() {
         fileMsg.progress = 1;
       }
     }
+  });
+
+  listen<any>("dm-connected", (event) => {
+    const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
+    if (pid) connectedPeers.add(pid);
   });
 
   listen<any>("dm-disconnected", (event) => {
@@ -125,11 +159,26 @@ export function useDM() {
   async function sendText(nodeId: string, content: string) {
     const { invoke } = await import("@tauri-apps/api/core");
     const timestamp = Date.now();
-    await invoke("send_dm", {
-      peerId: nodeId,
-      message: { type: "text", content, timestamp },
-    });
-    pushMessage(nodeId, { type: "text", content, timestamp, from: "self" });
+    const pendingMessage: DmTextMessage = {
+      type: "text",
+      content,
+      timestamp,
+      from: "self",
+      status: "sending",
+      clientId: `${timestamp}-${Math.random().toString(36).slice(2)}`,
+    };
+    pushMessage(nodeId, pendingMessage);
+
+    try {
+      await invoke("send_dm", {
+        peerId: nodeId,
+        message: { type: "text", content, timestamp },
+      });
+      setDmTextStatus(nodeId, pendingMessage, "sent");
+    } catch (error) {
+      setDmTextStatus(nodeId, pendingMessage, "failed");
+      throw error;
+    }
   }
 
   async function sendFile(nodeId: string, filePath: string) {

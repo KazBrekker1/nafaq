@@ -451,10 +451,19 @@ pub async fn send_file(
     }
     let id = uuid::Uuid::new_v4().to_string();
 
-    // Send FileStart
+    // File transfer receiver state is tied to a single DM stream, so ensure once
+    // and then use strict frame sends. A mid-transfer stream loss must be
+    // reported instead of reconnecting and retrying a chunk/end on a fresh stream
+    // without FileStart.
     state
         .conn_manager
-        .send_dm(
+        .ensure_dm_connected(&peer_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    state
+        .conn_manager
+        .send_dm_frame_strict(
             &peer_id,
             &DmMessage::FileStart {
                 name,
@@ -479,7 +488,7 @@ pub async fn send_file(
         }
         state
             .conn_manager
-            .send_dm(
+            .send_dm_frame_strict(
                 &peer_id,
                 &DmMessage::FileChunk {
                     id: id.clone(),
@@ -495,7 +504,7 @@ pub async fn send_file(
     // Send FileEnd
     state
         .conn_manager
-        .send_dm(&peer_id, &DmMessage::FileEnd { id: id.clone() })
+        .send_dm_frame_strict(&peer_id, &DmMessage::FileEnd { id: id.clone() })
         .await
         .map_err(|e| e.to_string())?;
 

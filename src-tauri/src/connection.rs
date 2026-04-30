@@ -57,6 +57,7 @@ const CALL_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const DM_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+const DM_CONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(21);
 const SUSPECT_AFTER_MS: u64 = 20_000;
 const RECONNECT_AFTER_MS: u64 = 35_000;
 const DISCONNECT_AFTER_MS: u64 = 120_000;
@@ -590,6 +591,13 @@ impl ConnectionManager {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(peer_id);
+    }
+
+    async fn dm_connect_in_progress(&self, peer_id: &str) -> bool {
+        self.dm_connecting
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(peer_id)
     }
 
     async fn call_peer_connected(&self, peer_id: &str) -> bool {
@@ -2147,7 +2155,52 @@ impl ConnectionManager {
         result
     }
 
-    pub async fn send_dm(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
+    async fn wait_for_dm_connecting_to_finish(&self, peer_id: &str) -> Result<()> {
+        with_timeout(
+            DM_CONNECT_WAIT_TIMEOUT,
+            format!("timed out waiting for DM connection to peer {peer_id}"),
+            async {
+                loop {
+                    if self.dm_peer_connected(peer_id).await
+                        || !self.dm_connect_in_progress(peer_id).await
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            },
+        )
+        .await
+    }
+
+    pub async fn ensure_dm_connected(&self, peer_id: &str) -> Result<()> {
+        loop {
+            if self.dm_peer_connected(peer_id).await {
+                return Ok(());
+            }
+
+            if self.dm_connect_in_progress(peer_id).await {
+                self.wait_for_dm_connecting_to_finish(peer_id).await?;
+                continue;
+            }
+
+            match self.connect_dm(peer_id).await {
+                Ok(()) => return Ok(()),
+                Err(_) if self.dm_peer_connected(peer_id).await => return Ok(()),
+                Err(err) if self.dm_connect_in_progress(peer_id).await => {
+                    tracing::debug!("DM connect for {peer_id} raced with another attempt: {err}");
+                    self.wait_for_dm_connecting_to_finish(peer_id).await?;
+                }
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to connect DM peer {peer_id}: {err}"
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn write_dm_frame(&self, peer_id: &str, data: &[u8]) -> Result<()> {
         let stream = {
             let dm_peers = self.dm_peers.lock().await;
             dm_peers.get(peer_id).map(|p| p.dm_send.clone())
@@ -2156,14 +2209,63 @@ impl ConnectionManager {
             anyhow::bail!("DM peer {peer_id} is not connected");
         };
 
-        let data = serde_json::to_vec(message)?;
         let mut guard = s.lock().await;
         if let Some(ref mut send) = *guard {
-            crate::messages::write_framed(send, &data).await?;
+            crate::messages::write_framed(send, data).await?;
+            Ok(())
         } else {
             anyhow::bail!("DM stream for peer {peer_id} is unavailable");
         }
-        Ok(())
+    }
+
+    /// Writes one DM frame to the current stream without connecting, reconnecting,
+    /// or retrying. Intended for multi-frame protocols whose receiver state is
+    /// stream-local after the caller has performed an initial connection ensure.
+    pub async fn send_dm_frame_strict(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
+        let data = serde_json::to_vec(message)?;
+        self.write_dm_frame(peer_id, &data).await.map_err(|err| {
+            anyhow::anyhow!("failed to send DM to peer {peer_id} without retry: {err}")
+        })
+    }
+
+    /// Sends one DM frame after ensuring a connection exists, without reconnecting
+    /// or retrying after a write failure.
+    #[cfg(test)]
+    async fn send_dm_no_retry(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
+        self.ensure_dm_connected(peer_id).await?;
+        self.send_dm_frame_strict(peer_id, message).await
+    }
+
+    pub async fn send_dm(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
+        self.ensure_dm_connected(peer_id).await?;
+
+        let data = serde_json::to_vec(message)?;
+        match self.write_dm_frame(peer_id, &data).await {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                tracing::warn!("DM write to peer {peer_id} failed; reconnecting once: {first_err}");
+                Self::cleanup_dm_internal(
+                    peer_id,
+                    &self.dm_peers,
+                    &self.event_tx,
+                    Some(b"dm_write_failed"),
+                    None,
+                )
+                .await;
+
+                self.ensure_dm_connected(peer_id).await.map_err(|reconnect_err| {
+                    anyhow::anyhow!(
+                        "failed to reconnect DM peer {peer_id} after write failure: {reconnect_err}; original write error: {first_err}"
+                    )
+                })?;
+
+                self.write_dm_frame(peer_id, &data).await.map_err(|retry_err| {
+                    anyhow::anyhow!(
+                        "failed to send DM to peer {peer_id} after reconnect retry: {retry_err}; original write error: {first_err}"
+                    )
+                })
+            }
+        }
     }
 
     pub async fn disconnect_dm(&self, peer_id: &str) {
@@ -2874,6 +2976,213 @@ mod tests {
         assert!(
             unexpected_peer_status.is_err(),
             "DM lifecycle should not emit peer-level connection status events"
+        );
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn send_dm_connects_before_writing() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        let mut rx_a = event_tx_a.subscribe();
+        mgr_b
+            .send_dm(
+                &endpoint_a.id().to_string(),
+                &DmMessage::Text {
+                    content: "hello without explicit connect".to_string(),
+                    timestamp: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::DmReceived {
+                        peer_id,
+                        message: DmMessage::Text { content, timestamp },
+                    }) if peer_id == endpoint_b.id().to_string()
+                        && content == "hello without explicit connect"
+                        && timestamp == 1 =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for ensured DM send");
+        assert!(mgr_b.dm_peer_connected(&endpoint_a.id().to_string()).await);
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn send_dm_reconnects_once_after_unavailable_stream() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        mgr_b
+            .connect_dm(&endpoint_a.id().to_string())
+            .await
+            .unwrap();
+        let stale_send = {
+            let dm_peers = mgr_b.dm_peers.lock().await;
+            dm_peers
+                .get(&endpoint_a.id().to_string())
+                .expect("DM peer should be connected")
+                .dm_send
+                .clone()
+        };
+        *stale_send.lock().await = None;
+
+        let mut rx_a = event_tx_a.subscribe();
+        mgr_b
+            .send_dm(
+                &endpoint_a.id().to_string(),
+                &DmMessage::Text {
+                    content: "retry after stale stream".to_string(),
+                    timestamp: 2,
+                },
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::DmReceived {
+                        peer_id,
+                        message: DmMessage::Text { content, timestamp },
+                    }) if peer_id == endpoint_b.id().to_string()
+                        && content == "retry after stale stream"
+                        && timestamp == 2 =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for retried DM send");
+        assert!(mgr_b.dm_peer_connected(&endpoint_a.id().to_string()).await);
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn send_dm_no_retry_surfaces_unavailable_stream_without_reconnect() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        mgr_b
+            .connect_dm(&endpoint_a.id().to_string())
+            .await
+            .unwrap();
+        let stale_send = {
+            let dm_peers = mgr_b.dm_peers.lock().await;
+            dm_peers
+                .get(&endpoint_a.id().to_string())
+                .expect("DM peer should be connected")
+                .dm_send
+                .clone()
+        };
+        *stale_send.lock().await = None;
+
+        let mut rx_a = event_tx_a.subscribe();
+        let err = mgr_b
+            .send_dm_no_retry(
+                &endpoint_a.id().to_string(),
+                &DmMessage::FileChunk {
+                    id: "strict-transfer".to_string(),
+                    offset: 0,
+                    data: b"chunk".to_vec(),
+                },
+            )
+            .await
+            .expect_err("strict DM send should surface stale stream failure");
+        assert!(
+            err.to_string().contains("without retry"),
+            "unexpected error: {err}"
+        );
+
+        let received_file_frame = timeout(Duration::from_millis(500), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::DmReceived {
+                        message: DmMessage::FileChunk { id, .. },
+                        ..
+                    }) if id == "strict-transfer" => break true,
+                    Ok(_) => {}
+                    Err(_) => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            received_file_frame.is_err(),
+            "strict file frame should not be retried onto a fresh DM stream"
         );
 
         router_a.shutdown().await.ok();

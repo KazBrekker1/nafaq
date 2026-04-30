@@ -50,7 +50,9 @@ async function send() {
   const text = inputText.value.trim();
   if (!text) return;
   inputText.value = "";
-  await sendText(peerId.value, text);
+  await sendText(peerId.value, text).catch((error) => {
+    console.warn("[dm] Send failed:", error);
+  });
 }
 
 // ── File attach ───────────────────────────────────────────
@@ -186,6 +188,13 @@ onUnmounted(() => {
             : 'border-l-2 border-[var(--color-accent)] pl-3'"
         >
           {{ msg.content }}
+        </div>
+        <div
+          v-if="msg.type === 'text' && msg.from === 'self' && msg.status !== 'sent'"
+          class="mt-1 text-[9px] font-mono tracking-widest"
+          :class="msg.status === 'failed' ? 'text-[var(--color-danger)]' : 'text-[var(--color-muted)]'"
+        >
+          {{ msg.status === "failed" ? "FAILED" : "SENDING…" }}
         </div>
 
         <!-- File message -->
