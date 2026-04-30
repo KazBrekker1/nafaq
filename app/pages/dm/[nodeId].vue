@@ -8,7 +8,7 @@ const peerId = computed(() => route.params.nodeId as string);
 const { conversations, connect, clearActiveConversation, sendText, sendFile, markRead } = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
-const { createCall, shareTicket } = useCall();
+const { createCall, error: callError } = useCall();
 
 const isContact = computed(() => contacts.value.some(c => c.node_id === peerId.value));
 const contactName = computed(() => resolveDisplayName(peerId.value));
@@ -71,15 +71,16 @@ async function openFilePicker() {
 
 async function initiateCall() {
   const { invoke } = await import("@tauri-apps/api/core");
-  // Create a call first, then send the ticket via DM
-  await createCall();
-  const t = shareTicket.value;
-  if (t) {
-    await invoke("send_dm", {
-      peerId: peerId.value,
-      message: { type: "call_invite", ticket: t },
-    }).catch(() => {});
+  // Create a call first, then send the ticket via DM.
+  const t = await createCall();
+  if (!t) {
+    console.warn("[dm] Call invite not sent:", callError.value || "ticket unavailable");
+    return;
   }
+  await invoke("send_dm", {
+    peerId: peerId.value,
+    message: { type: "call_invite", ticket: t },
+  }).catch(() => {});
   navigateTo("/call");
 }
 

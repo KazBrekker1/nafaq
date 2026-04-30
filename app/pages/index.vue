@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { truncateNodeId, formatTime, avatarLetter } from "~/utils/format";
 
-const { nodeId, displayName, connectionProgress } = useCall();
+const { nodeId, displayName, connectionProgress, relayStatus, nodeError } = useCall();
 const { contacts, displayName: contactDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { conversations, unreadCounts } = useDM();
@@ -20,6 +20,19 @@ function copyNodeId() {
 }
 
 const qrModalOpen = ref(false);
+
+const relayStatusLabel = computed(() => relayStatus.value.replace("_", " ").toUpperCase());
+const relayStatusClass = computed(() => {
+  switch (relayStatus.value) {
+    case "online":
+      return "text-[var(--color-accent)]";
+    case "degraded":
+    case "offline":
+      return "text-[var(--color-danger)]";
+    default:
+      return "text-[var(--color-muted)]";
+  }
+});
 
 // ── Online contacts ──────────────────────────────────────
 
@@ -118,8 +131,15 @@ const recentItems = computed<RecentItem[]>(() => {
             </div>
           </div>
 
-          <div class="mt-3">
+          <div class="mt-3 space-y-2">
             <ConnectionProgress :step="connectionProgress" />
+            <div class="flex items-center justify-between gap-3 text-[10px] font-mono tracking-wider">
+              <span class="text-[var(--color-muted)]">RELAY</span>
+              <span class="font-bold" :class="relayStatusClass">{{ relayStatusLabel }}</span>
+            </div>
+            <p v-if="nodeError" class="text-[10px] text-[var(--color-danger)] font-mono">
+              {{ nodeError }}
+            </p>
           </div>
         </div>
       </section>

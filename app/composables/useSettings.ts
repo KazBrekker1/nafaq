@@ -1,7 +1,13 @@
+import type { RelayStatus } from "./useNodeRuntime";
+
+export type IdentityStatus = "loaded_persistent" | "created_persistent" | "reset_required";
+
 export interface AppSettings {
   displayName: string;
   persistentIdentity: boolean;
+  identityStatus: IdentityStatus | null;
   nodeId: string | null;
+  relayStatus: RelayStatus;
   preferredMic: string | null;
   preferredCamera: string | null;
   preferredSpeaker: string | null;
@@ -12,7 +18,9 @@ export interface AppSettings {
 const settings = ref<AppSettings>({
   displayName: "",
   persistentIdentity: true,
+  identityStatus: null,
   nodeId: null,
+  relayStatus: "starting",
   preferredMic: null,
   preferredCamera: null,
   preferredSpeaker: null,

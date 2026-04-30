@@ -2,7 +2,7 @@
 import { truncateNodeId } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
-const { nodeId, displayName } = useCall();
+const { nodeId, displayName, relayStatus, nodeError, shareTicket } = useCall();
 const { settings, save } = useSettings();
 
 const truncatedNodeId = computed(() => {
@@ -16,6 +16,19 @@ function copyNodeId() {
 }
 
 const qrModalOpen = ref(false);
+
+const relayStatusLabel = computed(() => relayStatus.value.toUpperCase());
+const relayStatusClass = computed(() => {
+  switch (relayStatus.value) {
+    case "online":
+      return "text-[var(--color-accent)] border-[var(--color-accent)]";
+    case "degraded":
+    case "offline":
+      return "text-[var(--color-danger)] border-[var(--color-danger)]";
+    default:
+      return "text-[var(--color-muted)] border-[var(--color-border-muted)]";
+  }
+});
 
 // ── Devices ───────────────────────────────────────────────
 const media = useMedia();
@@ -142,6 +155,25 @@ onMounted(loadDevices);
               QR
             </button>
           </div>
+        </div>
+
+        <!-- Relay Runtime -->
+        <div class="px-4 sm:px-6 py-4 border-b border-[var(--color-border-muted)]">
+          <div class="flex items-center justify-between gap-4 mb-2">
+            <div>
+              <p class="label mb-1">RELAY STATUS</p>
+              <p class="text-xs text-[var(--color-muted)]">Tickets are available when the project relay is online.</p>
+            </div>
+            <div class="shrink-0 border-2 px-3 py-1 text-xs font-bold tracking-widest" :class="relayStatusClass">
+              {{ relayStatusLabel }}
+            </div>
+          </div>
+          <p class="text-[10px] text-[var(--color-muted)] font-mono">
+            {{ shareTicket ? "Share ticket ready" : "Share ticket unavailable until relay is online" }}
+          </p>
+          <p v-if="nodeError" class="text-[10px] text-[var(--color-danger)] font-mono mt-1">
+            {{ nodeError }}
+          </p>
         </div>
 
         <!-- Persistent Identity -->

@@ -20,6 +20,9 @@ function copyTicket() {
       <UButton class="w-full rounded-none font-mono" :disabled="disabled" @click="emit('create')">New Call</UButton>
     </div>
     <div v-else-if="state === 'creating'" class="text-[var(--color-muted)] text-xs tracking-widest">Creating...</div>
+    <div v-else-if="!ticket" class="text-[var(--color-muted)] text-xs tracking-widest">
+      Ticket unavailable — waiting for relay recovery.
+    </div>
     <div v-else-if="ticket" class="space-y-4">
       <div class="border-2 border-[var(--color-accent)] p-4 text-xs break-all text-[var(--color-border)] bg-[#111]">{{ ticket }}</div>
       <div class="flex gap-0">
