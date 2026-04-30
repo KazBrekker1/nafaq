@@ -132,7 +132,7 @@ pub fn run() {
 
             let conn_manager_for_rt = conn_manager.clone();
             let (endpoint, router) = tauri::async_runtime::handle().block_on(async {
-                let endpoint = node::create_endpoint_with_key(Some(secret_key))
+                let endpoint = node::create_endpoint_with_key(secret_key)
                     .await
                     .expect("Failed to create Iroh endpoint");
                 tracing::info!("Node ID: {}", endpoint.id());

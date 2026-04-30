@@ -1441,8 +1441,8 @@ mod tests {
         let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
         let mgr_b = Arc::new(ConnectionManager::new(event_tx_b, audio_tx_b, video_tx_b));
 
-        let endpoint_a = node::create_endpoint().await.unwrap();
-        let endpoint_b = node::create_endpoint().await.unwrap();
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
         mgr_a.set_endpoint(endpoint_a.clone()).await;
         mgr_b.set_endpoint(endpoint_b.clone()).await;
 
@@ -1525,8 +1525,8 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_connect_via_relay_only_addr() {
-        let endpoint_a = node::create_endpoint().await.unwrap();
-        let endpoint_b = node::create_endpoint().await.unwrap();
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
 
         let mut relay_only_addr = endpoint_a.addr();
         relay_only_addr.addrs.retain(|addr| addr.is_relay());
