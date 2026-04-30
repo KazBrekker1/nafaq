@@ -171,8 +171,8 @@ jobs:
       - name: Initialize Android project (if missing)
         run: test -d src-tauri/gen/android || bun run tauri android init
 
-      - name: Build Android APK (debug)
-        run: bun run tauri android build --debug --apk
+      - name: Build Android APK (release)
+        run: bun run tauri android build --apk
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
