@@ -35,6 +35,10 @@ const media = useMedia();
 const allDevices = ref<MediaDeviceInfo[]>([]);
 
 async function loadDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    allDevices.value = [];
+    return;
+  }
   try {
     // Request a brief getUserMedia to unlock device labels (browsers hide
     // labels until permission is granted), then immediately stop the tracks.

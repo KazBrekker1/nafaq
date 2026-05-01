@@ -605,7 +605,23 @@ impl ConnectionManager {
     }
 
     async fn dm_peer_connected(&self, peer_id: &str) -> bool {
-        self.dm_peers.lock().await.contains_key(peer_id)
+        let probe = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|peer| {
+                (
+                    peer.connection.close_reason().is_some(),
+                    peer.dm_send.clone(),
+                )
+            })
+        };
+        let Some((conn_closed, dm_send)) = probe else {
+            return false;
+        };
+        if conn_closed {
+            return false;
+        }
+        let guard = dm_send.lock().await;
+        guard.is_some()
     }
 
     async fn should_accept_call_connection(
@@ -633,12 +649,38 @@ impl ConnectionManager {
         direction: ConnectionDirection,
     ) -> bool {
         let local_node_id = self.local_node_id().await;
-        let dm_peers = self.dm_peers.lock().await;
-        let Some(existing) = dm_peers.get(peer_id) else {
+
+        let probe = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|existing| {
+                (
+                    existing.connection.close_reason().is_some(),
+                    existing.dm_send.clone(),
+                    existing.direction,
+                )
+            })
+        };
+
+        let Some((conn_closed, dm_send, existing_direction)) = probe else {
             return true;
         };
+
+        // The closed() cleanup task may not have fired yet; treat a dead
+        // connection or taken stream as already evicted.
+        if conn_closed || dm_send.lock().await.is_none() {
+            Self::cleanup_dm_internal(
+                peer_id,
+                &self.dm_peers,
+                &self.event_tx,
+                Some(b"stale_dm_connection"),
+                None,
+            )
+            .await;
+            return true;
+        }
+
         local_node_id.is_some_and(|local_id| {
-            should_replace_connection(&local_id, peer_id, existing.direction, direction)
+            should_replace_connection(&local_id, peer_id, existing_direction, direction)
         })
     }
 

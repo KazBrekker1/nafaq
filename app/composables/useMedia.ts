@@ -3,6 +3,8 @@ export interface MediaDevice {
   label: string;
 }
 
+const MEDIA_API_UNAVAILABLE = "Camera/mic API unavailable in this webview. On macOS, ensure the app has camera & microphone permissions.";
+
 // Singleton state — shared across lobby and call pages
 const localStream = ref<MediaStream | null>(null);
 const cameras = ref<MediaDevice[]>([]);
@@ -29,6 +31,10 @@ export function useMedia() {
   }
 
   async function enumerateDevices() {
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      error.value = MEDIA_API_UNAVAILABLE;
+      return;
+    }
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       cameras.value = devices
@@ -48,6 +54,11 @@ export function useMedia() {
 
   async function startPreview() {
     error.value = null;
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      error.value = MEDIA_API_UNAVAILABLE;
+      return;
+    }
 
     const videoConstraint = selectedCamera.value
       ? { deviceId: { exact: selectedCamera.value } }
