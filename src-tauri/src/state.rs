@@ -9,6 +9,7 @@ use crate::codec::{AudioCodecState, VideoCodecState};
 use crate::connection::ConnectionManager;
 use crate::identity::IdentityStatus;
 use crate::messages::{AudioPacket, Event, MediaSessionProfile, RelayStatusKind, VideoPacket};
+use crate::presence::PresenceManager;
 
 #[derive(Clone)]
 pub struct MediaBridgeRegistration {
@@ -37,4 +38,5 @@ pub struct AppState {
     pub identity_status: IdentityStatus,
     pub latest_ticket: Arc<Mutex<Option<String>>>,
     pub relay_status: Arc<Mutex<RelayStatusKind>>,
+    pub presence: Arc<PresenceManager>,
 }

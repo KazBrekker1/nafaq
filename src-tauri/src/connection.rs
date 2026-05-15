@@ -386,6 +386,7 @@ struct DmPeerConnection {
     direction: ConnectionDirection,
     dm_send: Arc<Mutex<Option<SendStream>>>,
     ownership: DmConnectionOwnership,
+    established_at: std::time::Instant,
 }
 
 impl DmPeerConnection {
@@ -477,7 +478,10 @@ pub struct ConnectionManager {
     event_tx: broadcast::Sender<Event>,
     audio_media_tx: broadcast::Sender<AudioPacket>,
     video_media_tx: broadcast::Sender<VideoPacket>,
+    presence: Arc<Mutex<Option<Arc<crate::presence::PresenceManager>>>>,
 }
+
+const DM_RECENT_NEIGHBOR_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl std::fmt::Debug for ConnectionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -525,11 +529,44 @@ impl ConnectionManager {
             event_tx,
             audio_media_tx,
             video_media_tx,
+            presence: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
         *self.endpoint.lock().await = Some(endpoint);
+    }
+
+    pub async fn set_presence(&self, presence: Arc<crate::presence::PresenceManager>) {
+        *self.presence.lock().await = Some(presence);
+    }
+
+    async fn peer_recently_rejoined_gossip(&self, peer_id: &str) -> bool {
+        let presence = self.presence.lock().await.clone();
+        match presence {
+            Some(p) => p.is_recent_neighbor(peer_id, DM_RECENT_NEIGHBOR_WINDOW).await,
+            None => false,
+        }
+    }
+
+    /// True if the existing DM entry for `peer_id` pre-dates the most recent
+    /// gossip NeighborUp signal for that peer. Indicates the entry is stale —
+    /// QUIC's idle timeout hasn't fired yet on a connection whose remote half
+    /// is already gone, but presence already told us the peer rebooted.
+    async fn dm_entry_predates_recent_rejoin(&self, peer_id: &str) -> bool {
+        let entry_established = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|p| p.established_at)
+        };
+        let Some(established_at) = entry_established else {
+            return false;
+        };
+        let presence = self.presence.lock().await.clone();
+        let Some(presence) = presence else { return false; };
+        match presence.last_neighbor_up(peer_id).await {
+            Some(up_at) => up_at > established_at,
+            None => false,
+        }
     }
 
     async fn local_node_id(&self) -> Option<String> {
@@ -604,7 +641,7 @@ impl ConnectionManager {
         self.peers.lock().await.contains_key(peer_id)
     }
 
-    async fn dm_peer_connected(&self, peer_id: &str) -> bool {
+    pub async fn dm_peer_connected(&self, peer_id: &str) -> bool {
         let probe = {
             let dm_peers = self.dm_peers.lock().await;
             dm_peers.get(peer_id).map(|peer| {
@@ -679,6 +716,25 @@ impl ConnectionManager {
             return true;
         }
 
+        // Gossip presence reported this peer as freshly online within the recent
+        // window — strong signal the remote restarted and its old QUIC connection
+        // is dead on its side but iroh's idle timeout hasn't fired here yet.
+        // Prefer the new inbound and evict the stale entry without falling
+        // through to the lexicographic tiebreak.
+        if matches!(direction, ConnectionDirection::Inbound)
+            && self.peer_recently_rejoined_gossip(peer_id).await
+        {
+            Self::cleanup_dm_internal(
+                peer_id,
+                &self.dm_peers,
+                &self.event_tx,
+                Some(b"peer_rejoined_gossip"),
+                None,
+            )
+            .await;
+            return true;
+        }
+
         local_node_id.is_some_and(|local_id| {
             should_replace_connection(&local_id, peer_id, existing_direction, direction)
         })
@@ -732,6 +788,7 @@ impl ConnectionManager {
             direction,
             dm_send: dm_send.clone(),
             ownership,
+            established_at: std::time::Instant::now(),
         };
 
         let old_dm_peer = {
@@ -2217,6 +2274,25 @@ impl ConnectionManager {
     pub async fn ensure_dm_connected(&self, peer_id: &str) -> Result<()> {
         loop {
             if self.dm_peer_connected(peer_id).await {
+                // Gossip presence may have observed the remote rejoin AFTER this
+                // entry was established — meaning the existing QUIC stream points
+                // at a dead remote that iroh's idle timeout hasn't yet noticed.
+                // Writes to that stream would silently succeed locally and drop
+                // bytes on the floor. Evict and redial.
+                if self.dm_entry_predates_recent_rejoin(peer_id).await {
+                    tracing::info!(
+                        "DM entry for {peer_id} pre-dates recent gossip rejoin; evicting + redialing"
+                    );
+                    Self::cleanup_dm_internal(
+                        peer_id,
+                        &self.dm_peers,
+                        &self.event_tx,
+                        Some(b"dm_entry_predates_rejoin"),
+                        None,
+                    )
+                    .await;
+                    continue;
+                }
                 return Ok(());
             }
 
@@ -2280,6 +2356,13 @@ impl ConnectionManager {
     pub async fn send_dm(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
         self.ensure_dm_connected(peer_id).await?;
 
+        // Capture the connection id we're about to write on, so a write-failure
+        // cleanup can't accidentally evict a fresher entry that landed mid-flight.
+        let active_connection_id = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|p| p.connection.stable_id())
+        };
+
         let data = serde_json::to_vec(message)?;
         match self.write_dm_frame(peer_id, &data).await {
             Ok(()) => Ok(()),
@@ -2290,7 +2373,7 @@ impl ConnectionManager {
                     &self.dm_peers,
                     &self.event_tx,
                     Some(b"dm_write_failed"),
-                    None,
+                    active_connection_id,
                 )
                 .await;
 

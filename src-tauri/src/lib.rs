@@ -4,9 +4,15 @@ mod connection;
 mod identity;
 mod messages;
 mod node;
+mod presence;
 mod protocol;
 mod relay;
 mod state;
+
+#[cfg(test)]
+mod scenarios;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,9 +21,12 @@ use base64::Engine;
 use codec::{AudioCodecState, AudioDecoder, VideoCodecState};
 use connection::ConnectionManager;
 use iroh::protocol::Router;
-use messages::{AudioPacket, ControlAction, Event, RelayStatusKind, VideoPacket};
+use iroh_gossip::net::Gossip;
+use messages::{AudioPacket, Contact, ControlAction, Event, RelayStatusKind, VideoPacket};
+use presence::PresenceManager;
 use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
+use tauri_plugin_store::StoreExt;
 use tauri::{Emitter, Manager};
 use tokio::sync::{broadcast, Mutex};
 
@@ -135,14 +144,28 @@ pub fn run() {
             ));
 
             let conn_manager_for_rt = conn_manager.clone();
-            let (endpoint, router) = tauri::async_runtime::handle().block_on(async {
-                let endpoint = node::create_endpoint_with_key(secret_key)
+            let event_tx_for_presence = event_tx.clone();
+            let (endpoint, router, presence) = tauri::async_runtime::handle().block_on(async {
+                let node::NafaqEndpoint {
+                    endpoint,
+                    address_lookup,
+                } = node::create_endpoint_with_key(secret_key)
                     .await
                     .expect("Failed to create Iroh endpoint");
                 tracing::info!("Node ID: {}", endpoint.id());
 
                 // Give connection manager a reference to the endpoint for mesh formation
                 conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
+
+                let gossip = Gossip::builder().spawn(endpoint.clone());
+                let local_id = endpoint.id();
+                let presence = Arc::new(PresenceManager::new(
+                    gossip.clone(),
+                    local_id,
+                    event_tx_for_presence,
+                    address_lookup,
+                ));
+                conn_manager_for_rt.set_presence(presence.clone()).await;
 
                 let router = Router::builder(endpoint.clone())
                     .accept(
@@ -153,9 +176,10 @@ pub fn run() {
                         node::NAFAQ_DM_ALPN,
                         NafaqDmProtocol::new(conn_manager_for_rt.clone()),
                     )
+                    .accept(iroh_gossip::ALPN, gossip)
                     .spawn();
 
-                (endpoint, router)
+                (endpoint, router, presence)
             });
 
             let audio_codec = Arc::new(AudioCodecState::new());
@@ -190,12 +214,38 @@ pub fn run() {
                 identity_status,
                 latest_ticket,
                 relay_status,
+                presence: presence.clone(),
             };
 
             let media_bridge_ref = media_bridge.current.clone();
 
             app.manage(app_state);
             app.manage(media_bridge);
+
+            // Track presence for every contact on startup.
+            let presence_for_bootstrap = presence.clone();
+            let app_handle_for_bootstrap = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let store = match app_handle_for_bootstrap.store("contacts.json") {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("contacts store unavailable for presence bootstrap: {e}");
+                        return;
+                    }
+                };
+                let contacts: Vec<Contact> = store
+                    .get("contacts")
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                for contact in contacts {
+                    if let Err(e) = presence_for_bootstrap.track_contact(&contact.node_id).await {
+                        tracing::warn!(
+                            "presence track failed for {}: {e}",
+                            contact.node_id
+                        );
+                    }
+                }
+            });
 
             // Spawn event forwarder (broadcast -> Tauri events)
             let app_handle = app.handle().clone();
@@ -223,6 +273,7 @@ pub fn run() {
                                 Event::DmDisconnected { .. } => "dm-disconnected",
                                 Event::CallInviteReceived { .. } => "call-invite-received",
                                 Event::DmFileSaved { .. } => "dm-file-saved",
+                                Event::PresenceChanged { .. } => "presence-changed",
                                 Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);
@@ -601,7 +652,7 @@ pub fn run() {
             commands::get_contacts,
             commands::add_contact,
             commands::remove_contact,
-            commands::check_presence,
+            commands::get_presence_snapshot,
             commands::connect_dm,
             commands::send_dm,
             commands::send_file,

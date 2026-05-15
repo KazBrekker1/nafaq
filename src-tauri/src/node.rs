@@ -1,4 +1,5 @@
 use anyhow::Result;
+use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use iroh_tickets::endpoint::EndpointTicket;
 use iroh_tickets::Ticket;
@@ -13,7 +14,12 @@ pub static RELAY_URL_PARSED: LazyLock<RelayUrl> =
     LazyLock::new(|| RELAY_URL.parse().expect("invalid relay URL"));
 const TICKET_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<Endpoint> {
+pub struct NafaqEndpoint {
+    pub endpoint: Endpoint,
+    pub address_lookup: MemoryLookup,
+}
+
+pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndpoint> {
     use noq_proto::congestion::BbrConfig;
     use std::sync::Arc;
 
@@ -30,11 +36,13 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<Endpoint>
         .build();
 
     let relay_url = RELAY_URL_PARSED.clone();
+    let address_lookup = MemoryLookup::new();
 
     let endpoint = Endpoint::empty_builder()
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
         .transport_config(transport_config)
         .relay_mode(RelayMode::custom([relay_url]))
+        .address_lookup(address_lookup.clone())
         .secret_key(secret_key)
         .bind()
         .await?;
@@ -51,13 +59,18 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<Endpoint>
     }
 
     tracing::info!("Iroh endpoint started with ID: {}", endpoint.id());
-    Ok(endpoint)
+    Ok(NafaqEndpoint {
+        endpoint,
+        address_lookup,
+    })
 }
 
 #[cfg(test)]
 pub async fn create_test_endpoint() -> Result<Endpoint> {
     let mut rng = rand::rng();
-    create_endpoint_with_key(SecretKey::generate(&mut rng)).await
+    Ok(create_endpoint_with_key(SecretKey::generate(&mut rng))
+        .await?
+        .endpoint)
 }
 
 /// Generate a shareable ticket string from the endpoint's current address.

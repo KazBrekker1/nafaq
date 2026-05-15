@@ -274,6 +274,10 @@ pub enum Event {
         file_id: String,
         local_path: String,
     },
+    PresenceChanged {
+        peer_id: String,
+        online: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
