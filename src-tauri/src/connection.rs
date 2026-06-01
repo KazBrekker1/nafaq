@@ -123,7 +123,6 @@ struct ActiveFileReceive {
     file: tokio::fs::File,
     temp_path: std::path::PathBuf,
     final_name: String,
-    #[allow(dead_code)]
     expected_size: u64,
     received_bytes: u64,
 }
@@ -166,6 +165,15 @@ async fn handle_dm_file_message(
 
     match dm_msg {
         DmMessage::FileStart { name, size, id } => {
+            // Bound concurrent in-flight transfers so a peer can't exhaust file
+            // descriptors / memory by opening unbounded FileStarts without ends.
+            const MAX_CONCURRENT_TRANSFERS: usize = 16;
+            if active_files.len() >= MAX_CONCURRENT_TRANSFERS && !active_files.contains_key(id) {
+                tracing::warn!(
+                    "Rejecting file transfer {id} from {peer_id}: too many concurrent transfers"
+                );
+                return false;
+            }
             let temp_dir = std::env::temp_dir();
             let temp_path = temp_dir.join(format!("nafaq_recv_{id}"));
             match tokio::fs::File::create(&temp_path).await {
@@ -188,6 +196,22 @@ async fn handle_dm_file_message(
             false // still emit DmReceived so frontend shows the file
         }
         DmMessage::FileChunk { id, offset, data } => {
+            // Reject writes that would extend the file past its declared size —
+            // prevents a peer inflating an "8 KB" transfer into a disk-filling
+            // write via large offsets.
+            let over_declared = active_files
+                .get(id)
+                .is_some_and(|recv| offset.saturating_add(data.len() as u64) > recv.expected_size);
+            if over_declared {
+                tracing::warn!(
+                    "FileChunk for {id} exceeds declared size; dropping transfer"
+                );
+                if let Some(recv) = active_files.remove(id) {
+                    drop(recv.file);
+                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                }
+                return true;
+            }
             if let Some(recv) = active_files.get_mut(id) {
                 // Seek to the correct offset and write
                 if recv
@@ -201,12 +225,22 @@ async fn handle_dm_file_message(
                     } else {
                         recv.received_bytes =
                             (*offset + data.len() as u64).max(recv.received_bytes);
+                        // Tiny progress ping (no payload) so the receiver's
+                        // progress bar advances without re-streaming the chunk.
+                        let _ = event_tx.send(Event::DmFileProgress {
+                            peer_id: peer_id.to_string(),
+                            file_id: id.clone(),
+                            received: recv.received_bytes,
+                        });
                     }
                 }
             } else {
                 tracing::debug!("FileChunk for unknown transfer {id}, ignoring");
             }
-            false
+            // Chunks are persisted to disk here; the raw payload must NOT also be
+            // re-emitted as a DmReceived IPC event (that floods the bridge with
+            // the full file, e.g. ~68 MB for a 50 MB file).
+            true
         }
         DmMessage::FileEnd { id } => {
             if let Some(mut recv) = active_files.remove(id) {
@@ -294,11 +328,14 @@ async fn run_dm_reader(
                             ticket: ticket.clone(),
                         });
                     }
-                    handle_dm_file_message(&dm_msg, peer_id, &mut active_files, event_tx).await;
-                    let _ = event_tx.send(Event::DmReceived {
-                        peer_id: peer_id.to_string(),
-                        message: dm_msg,
-                    });
+                    let skip_dm_event =
+                        handle_dm_file_message(&dm_msg, peer_id, &mut active_files, event_tx).await;
+                    if !skip_dm_event {
+                        let _ = event_tx.send(Event::DmReceived {
+                            peer_id: peer_id.to_string(),
+                            message: dm_msg,
+                        });
+                    }
                 }
             }
             Ok(None) => break,
@@ -309,6 +346,12 @@ async fn run_dm_reader(
         tracing::debug!("Cleaning up incomplete file transfer {id}");
         drop(recv.file);
         let _ = tokio::fs::remove_file(&recv.temp_path).await;
+        // The stream dropped mid-transfer — tell the frontend so it can mark the
+        // file failed instead of leaving it stuck at partial progress forever.
+        let _ = event_tx.send(Event::DmFileTransferFailed {
+            peer_id: peer_id.to_string(),
+            file_id: id,
+        });
     }
 }
 
@@ -895,9 +938,13 @@ impl ConnectionManager {
             let should_insert = match dm_peers.get(peer_id) {
                 None => true,
                 Some(existing) if existing.connection.stable_id() == connection.stable_id() => {
-                    let existing_send = existing.dm_send.clone();
-                    drop(dm_peers);
-                    *existing_send.lock().await = dm_send.lock().await.take();
+                    // Same underlying QUIC connection re-presented its DM stream.
+                    // Swap the new SendStream in while STILL holding dm_peers, so
+                    // a concurrent cleanup_dm_internal can't remove the entry
+                    // between our check and the write — which would leave the new
+                    // stream stranded on an orphaned entry and silently drop DMs.
+                    let new_send = dm_send.lock().await.take();
+                    *existing.dm_send.lock().await = new_send;
                     return true;
                 }
                 Some(existing) => local_node_id.as_ref().is_some_and(|local_id| {
@@ -1717,12 +1764,19 @@ impl ConnectionManager {
                                     ticket: ticket.clone(),
                                 });
                             }
-                            handle_dm_file_message(&dm_msg, peer_id, &mut active_files, &event_tx)
-                                .await;
-                            let _ = event_tx.send(Event::DmReceived {
-                                peer_id: peer_id.to_string(),
-                                message: dm_msg,
-                            });
+                            let skip_dm_event = handle_dm_file_message(
+                                &dm_msg,
+                                peer_id,
+                                &mut active_files,
+                                &event_tx,
+                            )
+                            .await;
+                            if !skip_dm_event {
+                                let _ = event_tx.send(Event::DmReceived {
+                                    peer_id: peer_id.to_string(),
+                                    message: dm_msg,
+                                });
+                            }
                         }
                     }
                     _ => tracing::warn!("Unknown bi stream type: {stream_type}"),
@@ -1740,6 +1794,10 @@ impl ConnectionManager {
             tracing::debug!("Cleaning up incomplete file transfer {id}");
             drop(recv.file);
             let _ = tokio::fs::remove_file(&recv.temp_path).await;
+            let _ = event_tx.send(Event::DmFileTransferFailed {
+                peer_id: peer_id.to_string(),
+                file_id: id,
+            });
         }
     }
 

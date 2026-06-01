@@ -5,7 +5,7 @@ import { formatTime } from "~/utils/format";
 const route = useRoute();
 const peerId = computed(() => route.params.nodeId as string);
 
-const { conversations, connect, clearActiveConversation, sendText, sendFile, markRead } = useDM();
+const { conversations, connect, clearActiveConversation, sendText, resend, sendFile, markRead } = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { createCall, error: callError } = useCall();
@@ -190,12 +190,19 @@ onUnmounted(() => {
         >
           {{ msg.content }}
         </div>
-        <div
-          v-if="msg.type === 'text' && msg.from === 'self' && msg.status !== 'sent'"
-          class="mt-1 text-[9px] font-mono tracking-widest"
-          :class="msg.status === 'failed' ? 'text-[var(--color-danger)]' : 'text-[var(--color-muted)]'"
+        <button
+          v-if="msg.type === 'text' && msg.from === 'self' && msg.status === 'failed'"
+          class="mt-1 text-[9px] font-mono tracking-widest text-[var(--color-danger)] hover:underline"
+          title="Tap to resend"
+          @click="resend(peerId, msg)"
         >
-          {{ msg.status === "failed" ? "FAILED" : "SENDING…" }}
+          FAILED · TAP TO RESEND
+        </button>
+        <div
+          v-else-if="msg.type === 'text' && msg.from === 'self' && msg.status !== 'sent'"
+          class="mt-1 text-[9px] font-mono tracking-widest text-[var(--color-muted)]"
+        >
+          SENDING…
         </div>
 
         <!-- File message -->
@@ -206,6 +213,7 @@ onUnmounted(() => {
           :progress="msg.progress"
           :local-path="msg.localPath"
           :from="msg.from"
+          :failed="msg.failed"
         />
       </div>
 

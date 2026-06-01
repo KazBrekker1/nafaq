@@ -273,6 +273,8 @@ pub fn run() {
                                 Event::DmDisconnected { .. } => "dm-disconnected",
                                 Event::CallInviteReceived { .. } => "call-invite-received",
                                 Event::DmFileSaved { .. } => "dm-file-saved",
+                                Event::DmFileTransferFailed { .. } => "dm-file-transfer-failed",
+                                Event::DmFileProgress { .. } => "dm-file-progress",
                                 Event::PresenceChanged { .. } => "presence-changed",
                                 Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };

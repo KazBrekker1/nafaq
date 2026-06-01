@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { formatSize } from "~/utils/format";
 
-const { progress, localPath } = defineProps<{
+const { progress, localPath, failed } = defineProps<{
   name: string;
   size: number;
   progress: number;
   localPath: string | null;
   from: "self" | "peer";
+  failed?: boolean;
 }>();
 
 const isComplete = computed(() => progress >= 1);
@@ -37,9 +38,19 @@ async function openFile() {
       </div>
     </div>
 
+    <!-- Failed transfer -->
+    <div
+      v-if="failed && !isComplete"
+      class="border-t border-[var(--color-danger)]/60 px-3 py-1.5"
+    >
+      <p class="text-[10px] font-bold tracking-widest text-[var(--color-danger)] font-mono">
+        TRANSFER FAILED
+      </p>
+    </div>
+
     <!-- Progress bar -->
     <div
-      v-if="!isComplete"
+      v-else-if="!isComplete"
       class="border-t border-[var(--color-accent)]/40 px-3 py-2"
     >
       <div class="h-1 bg-[var(--color-surface-alt)] w-full">

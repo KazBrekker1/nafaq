@@ -274,6 +274,15 @@ pub enum Event {
         file_id: String,
         local_path: String,
     },
+    DmFileTransferFailed {
+        peer_id: String,
+        file_id: String,
+    },
+    DmFileProgress {
+        peer_id: String,
+        file_id: String,
+        received: u64,
+    },
     PresenceChanged {
         peer_id: String,
         online: bool,
