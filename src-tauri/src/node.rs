@@ -27,7 +27,14 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndp
         .congestion_controller_factory(Arc::new(BbrConfig::default()))
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
-        .max_concurrent_uni_streams(1024_u32.into())
+        // Bound concurrent uni-streams at the QUIC layer. A peer's stream-open
+        // blocks once it hits the cap, which in turn bounds how many
+        // accept_uni/tokio::spawn reader tasks we can be pushed into — a peer
+        // can't flood us into unbounded task growth. 256 is ample headroom for
+        // pipelined video while far below the old effectively-unbounded value.
+        // (Bidi streams are already bounded by quinn's default cap of 100, and
+        // legitimate use needs only a few: chat/control/dm.)
+        .max_concurrent_uni_streams(256_u32.into())
         .stream_receive_window((2 * 1024 * 1024_u32).into())
         .receive_window((8 * 1024 * 1024_u32).into())
         .send_window(8 * 1024 * 1024)

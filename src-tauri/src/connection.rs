@@ -1304,7 +1304,9 @@ impl ConnectionManager {
             return Ok(());
         }
 
-        connection.set_max_concurrent_uni_streams(2048_u32.into());
+        // Keep the transport-level uni-stream cap (256) — do NOT raise it back
+        // to thousands here, which reopened the unbounded-accept-task DoS the
+        // transport config closes. 256 is ample headroom for pipelined video.
 
         let (chat_send, _) = open_typed_bi_stream(&connection, STREAM_CHAT, "chat").await?;
         chat_send.set_priority(10)?;
