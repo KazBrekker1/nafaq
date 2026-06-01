@@ -18,12 +18,15 @@ export function uniquePresenceIds(nodeIds: string[]): string[] {
 export function peerConnectionStatusToPresence(status: PeerConnectionStatus | undefined): boolean | null {
   switch (status) {
     case "connected":
-    case "suspect":
-    case "reconnecting":
       return true;
     case "disconnected":
     case "failed":
       return false;
+    // "suspect"/"reconnecting" mean the call peer has gone silent for 20–35s+.
+    // Don't assert "online" from that — return null so gossip's fresher
+    // presence signal (which may already know the peer left) wins via isOnline.
+    case "suspect":
+    case "reconnecting":
     default:
       return null;
   }

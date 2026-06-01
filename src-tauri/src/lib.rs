@@ -385,13 +385,32 @@ pub fn run() {
                             }
                             last_active.insert(peer_id.clone(), now_inst);
 
+                            // Wrapping-aware high-water-mark. QUIC datagrams are
+                            // unordered, so a reordered packet (seq 5,7,6) must
+                            // still be decoded — it can fill the gap / carry Opus
+                            // FEC — rather than being dropped as "<= previous".
+                            // Only exact duplicates are discarded.
                             let packet_lost =
-                                match last_sequence.insert(peer_id.clone(), packet.sequence) {
-                                    Some(previous) if packet.sequence <= previous => {
-                                        continue;
+                                match last_sequence.get(&peer_id).copied() {
+                                    None => {
+                                        last_sequence.insert(peer_id.clone(), packet.sequence);
+                                        false
                                     }
-                                    Some(previous) => packet.sequence != previous.wrapping_add(1),
-                                    None => false,
+                                    Some(previous) => {
+                                        let advance = packet.sequence.wrapping_sub(previous);
+                                        if advance == 0 {
+                                            // Exact duplicate.
+                                            continue;
+                                        } else if advance < 0x8000 {
+                                            // Forward progress; a gap (>1) is loss.
+                                            last_sequence.insert(peer_id.clone(), packet.sequence);
+                                            advance != 1
+                                        } else {
+                                            // Reordered/late: decode but keep the
+                                            // high-water mark and don't flag loss.
+                                            false
+                                        }
+                                    }
                                 };
 
                             // Lightweight energy proxy from Opus payload size (no decode needed).

@@ -1923,6 +1923,16 @@ impl ConnectionManager {
             let peers_guard = self.peers.lock().await;
             peers_guard
                 .values()
+                // Skip peers the liveness ticker has flagged as silent
+                // (Suspect/Reconnecting). Their QUIC connection may not be
+                // closed yet, so open_uni() would succeed and we'd waste
+                // CPU/bandwidth encoding frames into a dead connection.
+                .filter(|p| {
+                    matches!(
+                        p.connection_status,
+                        PeerConnectionKind::Connected | PeerConnectionKind::Connecting
+                    )
+                })
                 .map(|p| p.video_writer.clone())
                 .collect()
         };

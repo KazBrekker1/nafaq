@@ -25,10 +25,14 @@ const incomingInvite = ref<{ peerId: string; ticket: string } | null>(null);
 const missedCall = ref<{ callerName: string; timestamp: number } | null>(null);
 const lastDisconnectedPeer = ref<{ id: string; name: string } | null>(null);
 const allPeersLeft = ref(false);
+// Remote peers' mute / camera-off state, driven by their control messages.
+const peerMuted = ref<Record<string, boolean>>({});
+const peerVideoOff = ref<Record<string, boolean>>({});
 
 let ringingTimer: ReturnType<typeof setTimeout> | null = null;
 let missedCallTimer: ReturnType<typeof setTimeout> | null = null;
 let initialized = false;
+let callUnlisteners: Array<() => void> = [];
 
 function showMissedCall(callerName: string) {
   missedCall.value = { callerName, timestamp: Date.now() };
@@ -140,6 +144,8 @@ export function useCall() {
     peerId.value = null;
     peers.value = [];
     peerNames.value = {};
+    peerMuted.value = {};
+    peerVideoOff.value = {};
     ticket.value = null;
     incomingInvite.value = null;
     allPeersLeft.value = false;
@@ -179,6 +185,8 @@ export function useCall() {
     error,
     displayName,
     peerNames,
+    peerMuted,
+    peerVideoOff,
     connectionProgress,
     incomingInvite,
     missedCall,
@@ -202,7 +210,7 @@ async function initCallListeners() {
     const { invoke } = await import("@tauri-apps/api/core");
     const { listen } = await import("@tauri-apps/api/event");
 
-    listen<any>("peer-connected", async (event) => {
+    callUnlisteners.push(await listen<any>("peer-connected", async (event) => {
       const data = event.payload;
       const pid = typeof data === "string" ? data : data?.peer_id;
       if (pid && !peers.value.includes(pid)) {
@@ -219,14 +227,21 @@ async function initCallListeners() {
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
       }
-    });
+    }));
 
-    listen<any>("peer-disconnected", (event) => {
+    callUnlisteners.push(await listen<any>("peer-disconnected", (event) => {
       const data = event.payload;
       const pid = typeof data === "string" ? data : data?.peer_id;
       const peerName = peerNames.value[pid] || pid?.slice(0, 12) || "Peer";
       const idx = peers.value.indexOf(pid);
       if (idx >= 0) peers.value.splice(idx, 1);
+      // Drop the departed peer's media state.
+      if (pid && (pid in peerMuted.value || pid in peerVideoOff.value)) {
+        const { [pid]: _m, ...restMuted } = peerMuted.value;
+        const { [pid]: _v, ...restVideo } = peerVideoOff.value;
+        peerMuted.value = restMuted;
+        peerVideoOff.value = restVideo;
+      }
 
       lastDisconnectedPeer.value = { id: pid, name: peerName };
       setTimeout(() => {
@@ -238,18 +253,23 @@ async function initCallListeners() {
       if (peers.value.length === 0) {
         allPeersLeft.value = true;
       }
-    });
+    }));
 
-    listen<any>("control-received", (event) => {
+    callUnlisteners.push(await listen<any>("control-received", (event) => {
       const data = event.payload;
       const pid = data?.peer_id;
       const action = data?.action;
-      if (pid && action?.action === "set_display_name" && typeof action.name === "string") {
+      if (!pid || !action) return;
+      if (action.action === "set_display_name" && typeof action.name === "string") {
         peerNames.value = { ...peerNames.value, [pid]: action.name };
+      } else if (action.action === "mute" && typeof action.muted === "boolean") {
+        peerMuted.value = { ...peerMuted.value, [pid]: action.muted };
+      } else if (action.action === "video_off" && typeof action.off === "boolean") {
+        peerVideoOff.value = { ...peerVideoOff.value, [pid]: action.off };
       }
-    });
+    }));
 
-    listen<any>("call-invite-received", (event) => {
+    callUnlisteners.push(await listen<any>("call-invite-received", (event) => {
       const data = event.payload;
       const pid = typeof data === "string" ? data : data?.peer_id;
       const inviteTicket = data?.ticket;
@@ -278,12 +298,28 @@ async function initCallListeners() {
         const callerName = peerNames.value[pid] || pid.slice(0, 12);
         showMissedCall(callerName);
       }
-    });
+    }));
 
-    listen<any>("nafaq-error", (event) => {
+    callUnlisteners.push(await listen<any>("nafaq-error", (event) => {
       error.value = event.payload?.message || String(event.payload);
-    });
+    }));
   } catch {
     nodeRuntime.nodeError.value = "Could not initialize call event listeners.";
   }
+}
+
+function destroyCallListeners() {
+  for (const un of callUnlisteners) un();
+  callUnlisteners = [];
+  initialized = false;
+}
+
+// HMR-safe: drop the singleton listeners so a reloaded module doesn't stack a
+// second copy that double-fires every call event.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    destroyCallListeners();
+    peerMuted.value = {};
+    peerVideoOff.value = {};
+  });
 }

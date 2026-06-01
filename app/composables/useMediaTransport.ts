@@ -125,6 +125,7 @@ const BRIDGE_PROBE_PEER_ID = "__bridge_probe__";
 let playbackCtx: AudioContext | null = null;
 let captureCtx: AudioContext | null = null;
 let captureVideoEl: HTMLVideoElement | null = null;
+let captureRafId: number | null = null;
 let captureCanvas: OffscreenCanvas | HTMLCanvasElement | null = null;
 let captureCanvasCtx: OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null = null;
 let activeCaptureStream: MediaStream | null = null;
@@ -162,11 +163,17 @@ const peerNetworkStats = new Map<string, PeerNetworkStats>();
 const initialKeyframeRequests = new Set<string>();
 
 const peerVideoDecoders = new Map<string, VideoDecoder>();
+// Peers whose decoder hasn't yet seen its first keyframe. Feeding a fresh H.264
+// decoder a delta frame before an IDR produces a decode error and a black
+// canvas, so we drop deltas until the keyframe (which syncSubscriptions
+// requests on join) arrives.
+const peersAwaitingKeyframe = new Set<string>();
 
 function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): VideoDecoder {
   let decoder = peerVideoDecoders.get(peerId);
   if (decoder) return decoder;
 
+  peersAwaitingKeyframe.add(peerId);
   const ctx = canvas.getContext("2d")!;
   decoder = new VideoDecoder({
     output(frame: VideoFrame) {
@@ -193,6 +200,7 @@ function destroyVideoDecoder(peerId: string) {
     decoder.close();
   }
   peerVideoDecoders.delete(peerId);
+  peersAwaitingKeyframe.delete(peerId);
 }
 
 const corePromise = import("@tauri-apps/api/core");
@@ -421,7 +429,15 @@ function scheduleAudioBuffer(peerState: PeerMediaState, buffer: AudioBuffer, cap
   source.connect(peerState.audioGainNode);
 
   const ctxNow = playbackCtx.currentTime;
-  if (peerState.nextPlayTime < ctxNow - jitterBufferSec) {
+  // Resync the playback cursor if it has fallen behind (a gap) OR drifted too
+  // far ahead. A burst of packets arriving faster than real time pushes
+  // nextPlayTime past the clock; without an upper clamp that lead is permanent
+  // and shows up as growing audio latency / A/V skew until the next gap.
+  const maxLeadSec = jitterBufferSec + 0.2;
+  if (
+    peerState.nextPlayTime < ctxNow - jitterBufferSec
+    || peerState.nextPlayTime > ctxNow + maxLeadSec
+  ) {
     peerState.nextPlayTime = ctxNow + jitterBufferSec;
   }
   const scheduledAt = Math.max(peerState.nextPlayTime, ctxNow + jitterBufferSec);
@@ -772,6 +788,13 @@ async function setupReceiveBridge(forceEventMode = false) {
         if (!peerState.canvas) return;
         const decoder = getOrCreateVideoDecoder(peerId, peerState.canvas);
         if (decoder.state === "closed") return;
+        if (isKeyframe) {
+          peersAwaitingKeyframe.delete(peerId);
+        } else if (peersAwaitingKeyframe.has(peerId)) {
+          // Still waiting for the first IDR — dropping this delta avoids a
+          // decoder error and the black frame it would cause.
+          return;
+        }
         try {
           decoder.decode(new EncodedVideoChunk({
             type: isKeyframe ? "key" : "delta",
@@ -1080,6 +1103,7 @@ export function useMediaTransport() {
       // requestVideoFrameCallback exists in WKWebView but never fires for
       // programmatically-created video elements, so RAF is more reliable.
       const rafCaptureLoop = () => {
+        captureRafId = null;
         if (!encoding.value || !captureVideoEl) return;
 
         const now = performance.now();
@@ -1091,7 +1115,6 @@ export function useMediaTransport() {
             const imageData = ctx.getImageData(0, 0, currentWidth, currentHeight);
             const keyframe = frameCount === 0 || frameCount % 48 === 0;
             frameCount += 1;
-            const frameSize = currentWidth * currentHeight * 4;
             if (!videoFrameBufferPool) {
               videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
             }
@@ -1112,13 +1135,13 @@ export function useMediaTransport() {
           }
         }
 
-        requestAnimationFrame(rafCaptureLoop);
+        captureRafId = requestAnimationFrame(rafCaptureLoop);
       };
 
       const startCaptureLoop = () => {
         if (captureLoopStarted || !captureVideoEl) return;
         captureLoopStarted = true;
-        requestAnimationFrame(rafCaptureLoop);
+        captureRafId = requestAnimationFrame(rafCaptureLoop);
       };
 
       if (captureVideoEl.readyState >= HTMLMediaElement.HAVE_METADATA) {
@@ -1273,6 +1296,10 @@ export function useMediaTransport() {
 
   function teardownCapture() {
     encoding.value = false;
+    if (captureRafId !== null) {
+      cancelAnimationFrame(captureRafId);
+      captureRafId = null;
+    }
     activeCaptureStream = null;
     mediaUploader?.close();
     mediaUploader = null;
@@ -1336,6 +1363,16 @@ export function useMediaTransport() {
 
     for (const peerId of peerVideoDecoders.keys()) {
       destroyVideoDecoder(peerId);
+    }
+
+    // Release the Rust-side per-peer Opus/H.264 codec state too; the frontend
+    // decoders above are separate, and without this the backend maps leak
+    // across calls.
+    try {
+      const invoke = await invokePromise;
+      await invoke("destroy_codecs");
+    } catch (e) {
+      console.warn("[transport] destroy_codecs failed:", e);
     }
 
     peerMediaStates.clear();

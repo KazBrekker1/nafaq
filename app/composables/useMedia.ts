@@ -146,14 +146,31 @@ export function useMedia() {
     localStream.value?.getVideoTracks().forEach((t) => { t.enabled = !videoMuted.value; });
   }
 
+  // Tell connected call peers about a local mute / camera-off change so their
+  // UI can reflect it (the local track toggle alone is invisible to them).
+  async function broadcastControl(action: Record<string, unknown>) {
+    try {
+      const { peers } = useCall();
+      if (!peers.value.length) return;
+      const { invoke } = await import("@tauri-apps/api/core");
+      for (const p of peers.value) {
+        invoke("send_control", { peerId: p, action }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn("[media] broadcastControl failed:", e);
+    }
+  }
+
   function toggleAudio() {
     audioMuted.value = !audioMuted.value;
     applyMuteState();
+    void broadcastControl({ action: "mute", muted: audioMuted.value });
   }
 
   function toggleVideo() {
     videoMuted.value = !videoMuted.value;
     applyMuteState();
+    void broadcastControl({ action: "video_off", off: videoMuted.value });
   }
 
   async function switchCamera(deviceId: string) {
