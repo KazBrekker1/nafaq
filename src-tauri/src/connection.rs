@@ -327,6 +327,9 @@ async fn run_dm_reader(
                             peer_id: peer_id.to_string(),
                             ticket: ticket.clone(),
                         });
+                        // Handled as a call invite — don't also emit it as a
+                        // generic DmReceived (it carries no chat content).
+                        continue;
                     }
                     let skip_dm_event =
                         handle_dm_file_message(&dm_msg, peer_id, &mut active_files, event_tx).await;
@@ -1765,6 +1768,9 @@ impl ConnectionManager {
                                     peer_id: peer_id.to_string(),
                                     ticket: ticket.clone(),
                                 });
+                                // Handled as a call invite — don't also emit a
+                                // generic DmReceived for it.
+                                continue;
                             }
                             let skip_dm_event = handle_dm_file_message(
                                 &dm_msg,
@@ -2240,12 +2246,21 @@ impl ConnectionManager {
     }
 
     pub async fn snapshot_network_stats(&self) -> Vec<NetworkPeerStats> {
+        // Snapshot video-receive ages into a local map and release that lock
+        // before taking `peers`. Otherwise both mutexes are held for the entire
+        // stats pass (which queries QUIC path stats per peer under lock),
+        // needlessly contending writers and risking lock-ordering issues.
+        let video_ages: HashMap<String, u64> = {
+            let video_state = self.video_receive_state.lock().await;
+            video_state
+                .iter()
+                .map(|(id, state)| {
+                    (id.clone(), state.last_received.elapsed().as_millis() as u64)
+                })
+                .collect()
+        };
+
         let peers = self.peers.lock().await;
-        let video_state = self.video_receive_state.lock().await;
-        let _now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
 
         peers
             .iter()
@@ -2269,10 +2284,7 @@ impl ConnectionManager {
                     .unwrap_or_default();
                 let lost_packets = path_stats.map(|path| path.lost_packets).unwrap_or_default();
                 let lost_bytes = path_stats.map(|path| path.lost_bytes).unwrap_or_default();
-                let latest_video_age_ms = video_state
-                    .get(peer_id)
-                    .map(|state| state.last_received.elapsed().as_millis() as u64)
-                    .unwrap_or_default();
+                let latest_video_age_ms = video_ages.get(peer_id).copied().unwrap_or_default();
 
                 NetworkPeerStats {
                     peer_id: peer_id.clone(),

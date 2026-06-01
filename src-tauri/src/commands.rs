@@ -98,7 +98,6 @@ pub async fn create_call(state: State<'_, AppState>) -> Result<String, String> {
 pub async fn join_call(
     ticket: String,
     state: State<'_, AppState>,
-    app: tauri::AppHandle,
 ) -> Result<String, String> {
     if ticket.len() > MAX_TICKET_LEN {
         return Err("Ticket too large".into());
@@ -108,7 +107,9 @@ pub async fn join_call(
         .connect_to_peer_with_ticket(&state.endpoint, &ticket)
         .await
         .map_err(|e| e.to_string())?;
-    let _ = app.emit("peer-connected", &peer_id);
+    // Do NOT emit "peer-connected" here: setup_connection already broadcasts
+    // Event::PeerConnected, which the event forwarder emits to the frontend.
+    // A second emit double-fired the joiner's listener.
     Ok(peer_id)
 }
 

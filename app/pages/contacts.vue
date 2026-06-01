@@ -113,24 +113,22 @@ onUnmounted(() => {
               </p>
             </div>
 
-            <!-- Action buttons -->
-            <div
-              class="flex gap-0 shrink-0 transition-opacity"
-              :class="isOnline(contact.node_id) ? 'opacity-100' : 'opacity-40'"
-            >
-              <UTooltip :text="isOnline(contact.node_id) ? 'Message' : 'Offline'">
+            <!-- Action buttons. Presence (the online dot) is a soft hint, not a
+                 hard gate: a brief gossip blip can mark a reachable peer
+                 "offline", so keep the actions enabled — opening a DM dials on
+                 demand and succeeds even when presence lags. -->
+            <div class="flex gap-0 shrink-0">
+              <UTooltip text="Message">
                 <button
                   class="border-2 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                  :disabled="!isOnline(contact.node_id)"
                   @click="navigateTo('/dm/' + contact.node_id)"
                 >
                   ✉
                 </button>
               </UTooltip>
-              <UTooltip :text="isOnline(contact.node_id) ? 'Call' : 'Offline'">
+              <UTooltip text="Call">
                 <button
                   class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                  :disabled="!isOnline(contact.node_id)"
                   @click="navigateTo('/dm/' + contact.node_id)"
                 >
                   ☎
