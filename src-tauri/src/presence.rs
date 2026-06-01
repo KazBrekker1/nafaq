@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{EndpointAddr, PublicKey};
-use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
+use iroh_gossip::api::{Event as GossipEvent, GossipReceiver};
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
 use tokio::sync::{broadcast, Mutex};
@@ -17,10 +17,11 @@ use crate::node::RELAY_URL_PARSED;
 
 const DOMAIN_SEPARATOR: &[u8] = b"nafaq-presence-v1";
 
-/// Tracks an active gossip subscription to one contact-pair topic.
+/// Tracks an active gossip subscription to one contact-pair topic. The task is
+/// a supervisor that re-subscribes on failure, so the entry stays valid for the
+/// lifetime of the contact and is only torn down on `untrack_contact`.
 struct ContactSubscription {
     task: JoinHandle<()>,
-    _sender: GossipSender,
 }
 
 impl Drop for ContactSubscription {
@@ -68,9 +69,15 @@ impl PresenceManager {
         }
 
         {
-            let subs = self.subscriptions.lock().await;
-            if subs.contains_key(remote_id_str) {
-                return Ok(());
+            let mut subs = self.subscriptions.lock().await;
+            if let Some(existing) = subs.get(remote_id_str) {
+                if !existing.task.is_finished() {
+                    return Ok(());
+                }
+                // The supervisor task exited unexpectedly (e.g. panic). Drop the
+                // dead entry and re-spawn below so presence self-heals instead of
+                // staying silently blocked behind a stale map entry.
+                subs.remove(remote_id_str);
             }
         }
 
@@ -82,13 +89,7 @@ impl PresenceManager {
         self.address_lookup.add_endpoint_info(peer_addr);
 
         let topic = derive_topic(&self.local_id, &remote_id);
-        let gossip_topic = self
-            .gossip
-            .subscribe(topic, vec![remote_id])
-            .await
-            .with_context(|| format!("subscribe to presence topic for {remote_id_str}"))?;
-        let (sender, receiver) = gossip_topic.split();
-
+        let gossip = self.gossip.clone();
         let remote_id_owned = remote_id_str.to_string();
         let event_tx = self.event_tx.clone();
         let online = self.online.clone();
@@ -96,10 +97,11 @@ impl PresenceManager {
         let expected_neighbor = remote_id;
 
         let task = tokio::spawn(async move {
-            run_subscription_loop(
-                remote_id_owned,
+            supervise_subscription(
+                gossip,
+                topic,
                 expected_neighbor,
-                receiver,
+                remote_id_owned,
                 event_tx,
                 online,
                 recent_ups,
@@ -108,13 +110,7 @@ impl PresenceManager {
         });
 
         let mut subs = self.subscriptions.lock().await;
-        subs.insert(
-            remote_id_str.to_string(),
-            ContactSubscription {
-                task,
-                _sender: sender,
-            },
-        );
+        subs.insert(remote_id_str.to_string(), ContactSubscription { task });
 
         Ok(())
     }
@@ -155,6 +151,70 @@ impl PresenceManager {
     /// Used by the outbound DM path to detect stale DM entries that pre-date a remote restart.
     pub async fn last_neighbor_up(&self, remote_id_str: &str) -> Option<Instant> {
         self.recent_neighbor_ups.lock().await.get(remote_id_str).copied()
+    }
+}
+
+/// Supervises a single contact-pair subscription. Subscribes, runs the event
+/// loop until the gossip stream errors/lags/ends, then re-subscribes with
+/// exponential backoff. Runs forever until the task is aborted (untrack).
+/// This makes presence resilient to transient gossip stream failures, which
+/// would otherwise silently and permanently disable presence + restart
+/// detection for the peer.
+async fn supervise_subscription(
+    gossip: Gossip,
+    topic: TopicId,
+    expected_neighbor: PublicKey,
+    remote_id_str: String,
+    event_tx: broadcast::Sender<Event>,
+    online: Arc<Mutex<HashMap<String, bool>>>,
+    recent_ups: Arc<Mutex<HashMap<String, Instant>>>,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match gossip.subscribe(topic, vec![expected_neighbor]).await {
+            Ok(gossip_topic) => {
+                backoff = Duration::from_secs(1);
+                // The sender half must stay alive for the duration of the inner
+                // loop to keep the subscription open; we never broadcast on it.
+                let (_sender, receiver) = gossip_topic.split();
+                run_subscription_loop(
+                    remote_id_str.clone(),
+                    expected_neighbor,
+                    receiver,
+                    event_tx.clone(),
+                    online.clone(),
+                    recent_ups.clone(),
+                )
+                .await;
+                drop(_sender);
+            }
+            Err(e) => {
+                tracing::warn!("gossip presence subscribe failed for {remote_id_str}: {e}");
+            }
+        }
+        // We are detached from the mesh until the next subscribe succeeds —
+        // fail safe by reporting the peer offline rather than leaving a stale
+        // "online" hanging.
+        mark_offline(&online, &event_tx, &remote_id_str).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+async fn mark_offline(
+    online: &Arc<Mutex<HashMap<String, bool>>>,
+    event_tx: &broadcast::Sender<Event>,
+    remote_id_str: &str,
+) {
+    let changed = {
+        let mut map = online.lock().await;
+        map.insert(remote_id_str.to_string(), false) != Some(false)
+    };
+    if changed {
+        let _ = event_tx.send(Event::PresenceChanged {
+            peer_id: remote_id_str.to_string(),
+            online: false,
+        });
     }
 }
 
@@ -213,23 +273,22 @@ async fn run_subscription_loop(
                 // No message-level payload yet; reserved for future use.
             }
             Ok(GossipEvent::Lagged) => {
-                tracing::warn!("gossip presence stream lagged for {remote_id_str}");
+                // The bounded gossip channel overflowed and dropped events — we
+                // may have missed a NeighborDown (peer left) or NeighborUp.
+                // Tear down and let the supervisor re-subscribe for a fresh mesh
+                // view rather than trusting now-possibly-stale online state.
+                tracing::warn!(
+                    "gossip presence stream lagged for {remote_id_str}; resubscribing"
+                );
+                return;
             }
             Err(e) => {
                 tracing::warn!("gossip presence stream error for {remote_id_str}: {e}");
-                break;
+                return;
             }
         }
     }
-    // Stream ended — mark offline.
-    let mut map = online.lock().await;
-    if map.insert(remote_id_str.clone(), false) != Some(false) {
-        drop(map);
-        let _ = event_tx.send(Event::PresenceChanged {
-            peer_id: remote_id_str,
-            online: false,
-        });
-    }
+    // Stream ended; the supervisor marks the peer offline and re-subscribes.
 }
 
 /// Derive a deterministic, symmetric topic id for the pair (a, b).

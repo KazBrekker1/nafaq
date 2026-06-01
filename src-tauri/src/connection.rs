@@ -371,6 +371,9 @@ struct PeerConnection {
     pending_keyframe: Arc<AtomicBool>,
     last_activity_ms: Arc<AtomicU64>,
     connection_status: PeerConnectionKind,
+    /// When this call entry was established. Used to detect entries that
+    /// pre-date a remote restart (gossip NeighborUp newer than this).
+    established_at: std::time::Instant,
     /// Per-peer outbound bitrate override (0 = use global profile)
     outbound_bitrate_bps: Arc<AtomicU32>,
 }
@@ -481,6 +484,11 @@ pub struct ConnectionManager {
     presence: Arc<Mutex<Option<Arc<crate::presence::PresenceManager>>>>,
 }
 
+/// A NeighborUp this recent is treated as "the peer is freshly reachable", used
+/// as one (lenient) trigger for evicting a stale DM entry on an inbound
+/// reconnect. The unbounded `*_predates_recent_rejoin` checks additionally
+/// cover the case where the NeighborUp is older than this window but still
+/// newer than the stale entry (slow-relay reconnect past QUIC's idle timeout).
 const DM_RECENT_NEIGHBOR_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl std::fmt::Debug for ConnectionManager {
@@ -661,21 +669,103 @@ impl ConnectionManager {
         guard.is_some()
     }
 
+    /// True if the existing call entry for `peer_id` was established before the
+    /// most recent gossip NeighborUp for that peer — i.e. the remote restarted
+    /// and the entry we hold is stale even though QUIC's idle timeout hasn't
+    /// fired yet. Mirrors `dm_entry_predates_recent_rejoin` for the call path.
+    async fn call_entry_predates_recent_rejoin(&self, peer_id: &str) -> bool {
+        let established_at = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|p| p.established_at)
+        };
+        let Some(established_at) = established_at else {
+            return false;
+        };
+        let presence = self.presence.lock().await.clone();
+        let Some(presence) = presence else {
+            return false;
+        };
+        match presence.last_neighbor_up(peer_id).await {
+            Some(up_at) => up_at > established_at,
+            None => false,
+        }
+    }
+
+    /// Evict a stale call peer entry (closing the old connection) without
+    /// forgetting its ticket, so a reconnect can proceed immediately.
+    async fn evict_stale_call_peer(
+        &self,
+        peer_id: &str,
+        expected_connection_id: usize,
+        reason: &'static [u8],
+    ) {
+        Self::cleanup_peer_internal(
+            peer_id,
+            &self.peers,
+            &self.peer_tickets,
+            &self.audio_sequences,
+            &self.video_receive_state,
+            &self.event_tx,
+            Some(reason),
+            Some(expected_connection_id),
+            true, // reconnecting peer — keep its ticket
+        )
+        .await;
+    }
+
     async fn should_accept_call_connection(
         &self,
         peer_id: &str,
         direction: ConnectionDirection,
     ) -> bool {
         let local_node_id = self.local_node_id().await;
-        let peers = self.peers.lock().await;
-        let Some(existing) = peers.get(peer_id) else {
+
+        let probe = {
+            let peers = self.peers.lock().await;
+            peers.get(peer_id).map(|existing| {
+                (
+                    existing.connection.close_reason().is_some(),
+                    existing.direction,
+                    existing.connection_status.clone(),
+                    existing.connection.stable_id(),
+                )
+            })
+        };
+
+        let Some((conn_closed, existing_direction, existing_status, existing_conn_id)) = probe
+        else {
             return true;
         };
+
+        // The closed() cleanup task may not have fired yet; treat a dead
+        // connection as already evicted so a returning peer isn't rejected
+        // during the QUIC idle-timeout window.
+        if conn_closed {
+            self.evict_stale_call_peer(peer_id, existing_conn_id, b"stale_call_connection")
+                .await;
+            return true;
+        }
+
+        // Gossip presence shows the peer is freshly reachable — the remote
+        // restarted and its old QUIC connection is dead on its side. Prefer the
+        // new inbound and evict the stale entry instead of rejecting it via the
+        // lexicographic tiebreak. Same dual trigger as the DM path: recent
+        // NeighborUp (short window) or any NeighborUp newer than this entry
+        // (unbounded, covers a slow reconnect past QUIC's idle timeout).
+        if matches!(direction, ConnectionDirection::Inbound)
+            && (self.peer_recently_rejoined_gossip(peer_id).await
+                || self.call_entry_predates_recent_rejoin(peer_id).await)
+        {
+            self.evict_stale_call_peer(peer_id, existing_conn_id, b"peer_rejoined_gossip")
+                .await;
+            return true;
+        }
+
         should_accept_call_connection_candidate(
             local_node_id.as_deref(),
             peer_id,
-            existing.direction,
-            &existing.connection_status,
+            existing_direction,
+            &existing_status,
             direction,
         )
     }
@@ -721,8 +811,16 @@ impl ConnectionManager {
         // is dead on its side but iroh's idle timeout hasn't fired here yet.
         // Prefer the new inbound and evict the stale entry without falling
         // through to the lexicographic tiebreak.
+        // Evict the stale entry and accept the new inbound when gossip says the
+        // peer is freshly reachable. Two complementary triggers:
+        //  - recent NeighborUp within the short window (covers normal setup), or
+        //  - any NeighborUp newer than the existing entry, unbounded (covers a
+        //    slow-relay reconnect that lands after the 10s window but is still a
+        //    genuine restart — the case the bounded window alone wrongly rejected
+        //    because it was shorter than QUIC's 30s idle timeout).
         if matches!(direction, ConnectionDirection::Inbound)
-            && self.peer_recently_rejoined_gossip(peer_id).await
+            && (self.peer_recently_rejoined_gossip(peer_id).await
+                || self.dm_entry_predates_recent_rejoin(peer_id).await)
         {
             Self::cleanup_dm_internal(
                 peer_id,
@@ -1178,6 +1276,7 @@ impl ConnectionManager {
             pending_keyframe: Arc::new(AtomicBool::new(false)),
             last_activity_ms: Arc::new(AtomicU64::new(Self::current_timestamp_ms())),
             connection_status: PeerConnectionKind::Connected,
+            established_at: std::time::Instant::now(),
             outbound_bitrate_bps: Arc::new(AtomicU32::new(0)),
         };
 
@@ -1262,6 +1361,7 @@ impl ConnectionManager {
         event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
         expected_connection_id: Option<usize>,
+        preserve_ticket: bool,
     ) -> bool {
         let (removed, old_count, new_count) = {
             let mut peers = peers.lock().await;
@@ -1285,7 +1385,13 @@ impl ConnectionManager {
             peer.connection.close(0u32.into(), reason);
         }
 
-        peer_tickets.lock().await.remove(peer_id);
+        // Keep the cached ticket when the connection merely dropped (e.g. QUIC
+        // idle timeout) so the liveness/reconnect path can still re-dial the
+        // peer. Only forget it on a deliberate teardown (user ended the call,
+        // or the peer was given up on after exhausting reconnect attempts).
+        if !preserve_ticket {
+            peer_tickets.lock().await.remove(peer_id);
+        }
         audio_sequences.lock().await.remove(peer_id);
         video_receive_state.lock().await.remove(peer_id);
         let _ = event_tx.send(Event::PeerDisconnected {
@@ -1510,6 +1616,7 @@ impl ConnectionManager {
                 &event_tx_cleanup_closed,
                 None,
                 Some(connection_closed_id),
+                true, // preserve ticket so the peer can be re-dialed after a drop
             )
             .await;
         });
@@ -2037,6 +2144,7 @@ impl ConnectionManager {
                 &self.event_tx,
                 Some(b"peer timeout"),
                 None,
+                false, // reconnect attempts exhausted — forget the ticket
             )
             .await;
         }
@@ -2413,6 +2521,7 @@ impl ConnectionManager {
             &self.event_tx,
             Some(b"call ended"),
             None,
+            false, // user ended the call — forget the ticket
         )
         .await;
         Ok(())
