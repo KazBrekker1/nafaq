@@ -29,13 +29,23 @@ const settings = ref<AppSettings>({
 });
 
 const loaded = ref(false);
+let loadPromise: Promise<void> | null = null;
 
 export function useSettings() {
-  async function load() {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const stored = await invoke<Partial<AppSettings>>("get_settings").catch(() => ({}));
-    Object.assign(settings.value, stored);
-    loaded.value = true;
+  function load(): Promise<void> {
+    // Cache the in-flight promise so concurrent useSettings() callers at
+    // startup share one get_settings invoke instead of racing several.
+    if (!loadPromise) {
+      loadPromise = (async () => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const stored = await invoke<Partial<AppSettings>>("get_settings").catch(() => ({}));
+        Object.assign(settings.value, stored);
+        loaded.value = true;
+      })().finally(() => {
+        loadPromise = null;
+      });
+    }
+    return loadPromise;
   }
 
   async function save(patch: Partial<AppSettings>) {
@@ -44,7 +54,7 @@ export function useSettings() {
     await invoke("update_settings", { settings: patch }).catch(() => {});
   }
 
-  if (!loaded.value) load();
+  if (!loaded.value) void load();
 
   return { settings, loaded, save };
 }

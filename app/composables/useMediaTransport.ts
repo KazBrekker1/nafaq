@@ -856,6 +856,17 @@ async function setupReceiveBridge(forceEventMode = false) {
   }
 }
 
+function disposeReceiveListeners() {
+  unlistenDisconnect?.();
+  unlistenDisconnect = null;
+  unlistenStats?.();
+  unlistenStats = null;
+  unlistenQuality?.();
+  unlistenQuality = null;
+  stopQualityWatch?.();
+  stopQualityWatch = null;
+}
+
 async function teardownReceiveBridge(clearBackend = true) {
   const sessionId = transportStatus.value.sessionId;
 
@@ -1005,6 +1016,18 @@ export function useMediaTransport() {
     encoding.value = true;
     activeCaptureStream = stream;
 
+    try {
+      await startSendingInner(stream);
+    } catch (error) {
+      // Release everything the partial setup created (capture AudioContext,
+      // off-screen video element, worklet) — otherwise a failed start leaks
+      // them and blocks the next attempt.
+      teardownCapture();
+      throw error;
+    }
+  }
+
+  async function startSendingInner(stream: MediaStream) {
     const invoke = await invokePromise;
     mediaUploader = createMediaUploader(invoke);
 
@@ -1036,8 +1059,11 @@ export function useMediaTransport() {
       const blobUrl = URL.createObjectURL(
         new Blob([WORKLET_CODE], { type: "application/javascript" }),
       );
-      await captureCtx.audioWorklet.addModule(blobUrl);
-      URL.revokeObjectURL(blobUrl);
+      try {
+        await captureCtx.audioWorklet.addModule(blobUrl);
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
 
       sourceNode = captureCtx.createMediaStreamSource(new MediaStream([audioTrack]));
       workletNode = new AudioWorkletNode(captureCtx, "capture");
@@ -1084,6 +1110,8 @@ export function useMediaTransport() {
       if (captureVideoEl) {
         captureVideoEl.pause();
         captureVideoEl.srcObject = null;
+        // Detach the old element too, or it stays orphaned in the DOM forever.
+        captureVideoEl.remove();
       }
       captureVideoEl = document.createElement("video");
       captureVideoEl.srcObject = stream;
@@ -1175,6 +1203,23 @@ export function useMediaTransport() {
       lastFailure: null,
     };
 
+    // A previous run that failed mid-setup (or a stale degraded session) may
+    // have left listeners or the quality watcher behind — dispose them before
+    // registering new ones so they never stack.
+    disposeReceiveListeners();
+
+    try {
+      await startReceivingInner(getPeerIds);
+    } catch (error) {
+      // Leave nothing half-registered so a later retry starts clean.
+      disposeReceiveListeners();
+      await teardownReceiveBridge(true).catch(() => {});
+      transportStatus.value = { ...transportStatus.value, state: "idle" };
+      throw error;
+    }
+  }
+
+  async function startReceivingInner(getPeerIds: () => string[]) {
     await ensurePlaybackContext();
     bridgeFallbackUsed = false;
     await teardownReceiveBridge(false);
@@ -1352,8 +1397,7 @@ export function useMediaTransport() {
       clearInterval(activeSpeakerInterval);
       activeSpeakerInterval = null;
     }
-    stopQualityWatch?.();
-    stopQualityWatch = null;
+    disposeReceiveListeners();
 
     for (const [, state] of peerMediaStates) {
       if (state.audioGainNode) {
@@ -1382,12 +1426,6 @@ export function useMediaTransport() {
     peerSpeakingMap.value = {};
     peerIdsProvider = null;
 
-    unlistenDisconnect?.();
-    unlistenStats?.();
-    unlistenQuality?.();
-    unlistenDisconnect = null;
-    unlistenStats = null;
-    unlistenQuality = null;
     connectionQuality.value = "good";
     audioBufferPool = null;
     videoFrameBufferPool = null;

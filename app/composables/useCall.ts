@@ -134,10 +134,16 @@ export function useCall() {
   async function endCall() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
+      // Per-peer: one failed end_call must not leave the remaining peers'
+      // backend sessions orphaned.
       for (const p of peers.value) {
-        await invoke("end_call", { peerId: p });
+        await invoke("end_call", { peerId: p }).catch((e) => {
+          console.warn(`[call] end_call failed for ${p}:`, e);
+        });
       }
-    } catch {}
+    } catch (e) {
+      console.warn("[call] end_call cleanup failed:", e);
+    }
     useMedia().stopPreview();
     clearRingingTimer();
     state.value = "idle";
@@ -303,8 +309,13 @@ async function initCallListeners() {
     callUnlisteners.push(await listen<any>("nafaq-error", (event) => {
       error.value = event.payload?.message || String(event.payload);
     }));
-  } catch {
-    nodeRuntime.nodeError.value = "Could not initialize call event listeners.";
+  } catch (e) {
+    console.warn("[call] listener init failed:", e);
+    // Surface on the call error ref — nodeError belongs to useNodeRuntime and
+    // clobbering it would mask a genuine runtime failure.
+    error.value = "Could not initialize call event listeners.";
+    // Allow a later useCall() to retry instead of staying half-initialized.
+    destroyCallListeners();
   }
 }
 

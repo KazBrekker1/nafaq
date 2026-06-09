@@ -80,23 +80,35 @@ function setDmTextStatus(nodeId: string, target: DmTextMessage, status: DmMessag
   };
 }
 
+// Deliveries currently in flight, keyed by clientId. Prevents a manual resend
+// racing the automatic retry on reconnect for the same message — both would
+// write the final status, and the loser's verdict would win.
+const inFlightTexts = new Set<string>();
+
 // Deliver an existing text message (already in the conversation) and resolve its
 // status to "sent" or "failed". Shared by sendText, manual resend, and the
 // automatic retry on reconnect. Never throws — failure is surfaced via status.
 async function deliverText(nodeId: string, message: DmTextMessage): Promise<boolean> {
-  const { invoke } = await import("@tauri-apps/api/core");
-  setDmTextStatus(nodeId, message, "sending");
+  const flightKey = message.clientId ?? `${nodeId}:${message.timestamp}`;
+  if (inFlightTexts.has(flightKey)) return false;
+  inFlightTexts.add(flightKey);
   try {
-    await invoke("send_dm", {
-      peerId: nodeId,
-      message: { type: "text", content: message.content, timestamp: message.timestamp },
-    });
-    setDmTextStatus(nodeId, message, "sent");
-    return true;
-  } catch (error) {
-    console.warn("[dm] send failed:", error);
-    setDmTextStatus(nodeId, message, "failed");
-    return false;
+    const { invoke } = await import("@tauri-apps/api/core");
+    setDmTextStatus(nodeId, message, "sending");
+    try {
+      await invoke("send_dm", {
+        peerId: nodeId,
+        message: { type: "text", content: message.content, timestamp: message.timestamp },
+      });
+      setDmTextStatus(nodeId, message, "sent");
+      return true;
+    } catch (error) {
+      console.warn("[dm] send failed:", error);
+      setDmTextStatus(nodeId, message, "failed");
+      return false;
+    }
+  } finally {
+    inFlightTexts.delete(flightKey);
   }
 }
 

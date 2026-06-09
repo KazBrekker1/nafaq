@@ -21,11 +21,11 @@ watch(() => open.value, async (isOpen) => {
 async function startScanner() {
   if (!videoRef.value) return;
 
-  scanner.value = new QrScanner(
+  const instance = new QrScanner(
     videoRef.value,
     (result) => {
       if (result.data) {
-        scanner.value?.stop();
+        instance.stop();
         emit("scan", result.data);
         open.value = false;
       }
@@ -36,11 +36,22 @@ async function startScanner() {
       highlightCodeOutline: true,
     },
   );
+  scanner.value = instance;
 
   try {
-    await scanner.value.start();
+    await instance.start();
+    // The modal may have closed while start() was in flight — destroyScanner
+    // already ran, and a started orphan would hold the camera indefinitely.
+    if (scanner.value !== instance) {
+      instance.destroy();
+      return;
+    }
     streaming.value = true;
   } catch {
+    if (scanner.value !== instance) {
+      instance.destroy();
+      return;
+    }
     error.value = "Camera access denied.";
   }
 }

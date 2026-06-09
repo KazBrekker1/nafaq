@@ -10,12 +10,22 @@ export interface Contact {
 
 const contacts = ref<Contact[]>([]);
 const loaded = ref(false);
+let loadPromise: Promise<void> | null = null;
 
 export function useContacts() {
-  async function load() {
-    const { invoke } = await import("@tauri-apps/api/core");
-    contacts.value = await invoke<Contact[]>("get_contacts").catch(() => []);
-    loaded.value = true;
+  function load(): Promise<void> {
+    // Cache the in-flight promise: several composables call useContacts() at
+    // startup and would otherwise each fire their own get_contacts invoke.
+    if (!loadPromise) {
+      loadPromise = (async () => {
+        const { invoke } = await import("@tauri-apps/api/core");
+        contacts.value = await invoke<Contact[]>("get_contacts").catch(() => []);
+        loaded.value = true;
+      })().finally(() => {
+        loadPromise = null;
+      });
+    }
+    return loadPromise;
   }
 
   async function add(contact: Contact) {
@@ -26,8 +36,14 @@ export function useContacts() {
 
   async function remove(nodeId: string) {
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("remove_contact", { nodeId });
-    contacts.value = contacts.value.filter(c => c.node_id !== nodeId);
+    try {
+      await invoke("remove_contact", { nodeId });
+      contacts.value = contacts.value.filter(c => c.node_id !== nodeId);
+    } catch (e) {
+      // Backend still has the contact; reload instead of showing a ghost removal.
+      console.warn("[contacts] remove failed:", e);
+      await load();
+    }
   }
 
   async function starFromCall(nodeId: string, displayName: string) {
@@ -46,7 +62,7 @@ export function useContacts() {
     return truncateNodeId(nodeId);
   }
 
-  if (!loaded.value) load();
+  if (!loaded.value) void load();
 
   return { contacts, loaded, add, remove, starFromCall, displayName };
 }

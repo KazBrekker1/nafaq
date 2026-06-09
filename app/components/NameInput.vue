@@ -39,6 +39,8 @@ watch(() => model.value, (name) => {
     } catch {}
   }, 400);
 });
+
+onUnmounted(() => clearTimeout(persistTimer));
 </script>
 
 <template>

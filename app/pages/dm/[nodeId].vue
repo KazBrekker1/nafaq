@@ -8,7 +8,7 @@ const peerId = computed(() => route.params.nodeId as string);
 const { conversations, connect, clearActiveConversation, sendText, resend, sendFile, markRead } = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
-const { createCall, error: callError } = useCall();
+const { createCall, error: callError, state: callState } = useCall();
 
 const isContact = computed(() => contacts.value.some(c => c.node_id === peerId.value));
 const contactName = computed(() => resolveDisplayName(peerId.value));
@@ -77,10 +77,19 @@ async function initiateCall() {
     console.warn("[dm] Call invite not sent:", callError.value || "ticket unavailable");
     return;
   }
-  await invoke("send_dm", {
-    peerId: peerId.value,
-    message: { type: "call_invite", ticket: t },
-  }).catch(() => {});
+  try {
+    await invoke("send_dm", {
+      peerId: peerId.value,
+      message: { type: "call_invite", ticket: t },
+    });
+  } catch (e) {
+    // The callee never received the invite — navigating to /call would just
+    // wait forever. Reset the half-created call and surface the failure.
+    console.warn("[dm] Call invite delivery failed:", e);
+    callError.value = "Could not deliver the call invite. Check the connection and try again.";
+    callState.value = "idle";
+    return;
+  }
   navigateTo("/call");
 }
 

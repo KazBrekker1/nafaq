@@ -53,3 +53,12 @@ export function useNotificationSounds() {
 
   return { playPeerConnected, playPeerLeft, playMessageReceived, playIncomingRing };
 }
+
+// Browsers cap concurrent AudioContexts (~6 in Chromium); a reloaded module
+// would otherwise strand the old context until GC and eventually starve the app.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    audioCtx?.close().catch(() => {});
+    audioCtx = null;
+  });
+}

@@ -122,6 +122,9 @@ onMounted(async () => {
 
 // ── Transition: lobby → active call when state becomes connected ─────
 watch(() => call.state.value, async (newState, oldState) => {
+  // The watcher can fire while an unmount-triggered cleanup is in progress;
+  // starting transport after cleanup would leak it with no owner to stop it.
+  if (cleaned) return;
   if (newState === "connected" && oldState !== "connected") {
     // Clean up any previous instances (e.g. peer reconnect scenario)
     if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
@@ -137,7 +140,9 @@ watch(() => call.state.value, async (newState, oldState) => {
     }, { threshold: 0.1 });
 
     await transport.initCodecs(media.localStream.value);
+    if (cleaned) return;
     await transport.startReceiving(() => call.peers.value);
+    if (cleaned) return;
 
     if (media.localStream.value && call.peers.value.length > 0) {
       await transport.startSending(media.localStream.value);
@@ -164,7 +169,9 @@ watch([() => media.localStream.value, localVideoEl], ([stream, el]) => {
 }, { immediate: true });
 
 watch(() => call.peers.value, async (peerIds, oldPeerIds) => {
+  if (cleaned) return;
   await transport.syncSubscriptions(peerIds);
+  if (cleaned) return;
   if (media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
     await transport.startSending(media.localStream.value);
   }
@@ -176,13 +183,21 @@ watch(() => call.peers.value, async (peerIds, oldPeerIds) => {
 // Restart transport when device is switched mid-call.
 let wasEncoding = false;
 watch(() => media.localStream.value, async (newStream) => {
+  if (cleaned) return;
   if (!newStream) {
     wasEncoding = transport.encoding.value;
     return;
   }
-  if (wasEncoding && call.peers.value.length > 0) {
-    wasEncoding = false;
-    await transport.restartSending(newStream);
+  // Reset unconditionally — a stale true (stream arrived with no peers yet)
+  // must not trigger a restart on a later, unrelated stream change.
+  const shouldRestart = wasEncoding && call.peers.value.length > 0;
+  wasEncoding = false;
+  if (shouldRestart) {
+    try {
+      await transport.restartSending(newStream);
+    } catch (e) {
+      console.warn("[call] restartSending failed:", e);
+    }
   }
 });
 
@@ -211,10 +226,12 @@ onUnmounted(() => {
   document.removeEventListener("fullscreenchange", onFullscreenChange);
 });
 
-function handleEndCall() {
-  cleanup();
+async function handleEndCall() {
+  // Finish transport/media teardown before endCall navigates away, so DOM
+  // cleanup (canvas dereg, capture element removal) isn't racing navigation.
+  await cleanup();
   chat.clearMessages();
-  call.endCall();
+  await call.endCall();
 }
 
 function handleSendChat(text: string) {

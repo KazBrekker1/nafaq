@@ -19,6 +19,11 @@ const error = ref<string | null>(null);
 let micLevelRafId: number | null = null;
 let audioContext: AudioContext | null = null;
 
+// Invalidates in-flight getUserMedia attempts: a startPreview that resolves
+// after a newer startPreview/stopPreview must discard (and stop) its stream,
+// not leak a live camera/mic capture.
+let previewGeneration = 0;
+
 let prefsLoaded = false;
 
 export function useMedia() {
@@ -60,6 +65,8 @@ export function useMedia() {
       return;
     }
 
+    const generation = ++previewGeneration;
+
     const videoConstraint = selectedCamera.value
       ? { deviceId: { exact: selectedCamera.value } }
       : true;
@@ -97,6 +104,12 @@ export function useMedia() {
     }
 
     if (stream) {
+      if (generation !== previewGeneration) {
+        // A newer startPreview/stopPreview superseded this attempt while
+        // getUserMedia was in flight — release the orphaned capture.
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       stopPreview();
       localStream.value = stream;
       await enumerateDevices();
@@ -135,6 +148,7 @@ export function useMedia() {
   }
 
   function stopPreview() {
+    previewGeneration++;
     localStream.value?.getTracks().forEach((t) => t.stop());
     localStream.value = null;
     stopMicLevelMonitor();

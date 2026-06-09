@@ -39,14 +39,16 @@ async function loadDevices() {
     allDevices.value = [];
     return;
   }
+  // Request a brief getUserMedia to unlock device labels (browsers hide
+  // labels until permission is granted), then always stop the tracks — even
+  // if enumeration throws, or the camera LED stays on.
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
   try {
-    // Request a brief getUserMedia to unlock device labels (browsers hide
-    // labels until permission is granted), then immediately stop the tracks.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
     allDevices.value = await navigator.mediaDevices.enumerateDevices();
-    stream?.getTracks().forEach(t => t.stop());
   } catch {
     allDevices.value = [];
+  } finally {
+    stream?.getTracks().forEach(t => t.stop());
   }
 }
 

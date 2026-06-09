@@ -43,6 +43,7 @@ const peerConnectionStatuses = ref<Record<string, PeerConnectionStatus>>({});
 let initialized = false;
 let initPromise: Promise<void> | null = null;
 let runtimeEventRevision = 0;
+let unlisteners: Array<() => void> = [];
 
 function normalizeRelayStatus(value: unknown): RelayStatus | null {
   if (
@@ -107,24 +108,24 @@ async function init(): Promise<void> {
       const { invoke } = await import("@tauri-apps/api/core");
       const { listen } = await import("@tauri-apps/api/event");
 
-      await listen<RelayStatusChangedPayload>("relay-status-changed", (event) => {
+      unlisteners.push(await listen<RelayStatusChangedPayload>("relay-status-changed", (event) => {
         runtimeEventRevision += 1;
         applyRelayStatus(event.payload ?? {});
-      });
+      }));
 
-      await listen<TicketRefreshedPayload>("ticket-refreshed", (event) => {
+      unlisteners.push(await listen<TicketRefreshedPayload>("ticket-refreshed", (event) => {
         runtimeEventRevision += 1;
         applyTicket(event.payload ?? {});
-      });
+      }));
 
-      await listen<PeerConnectionStatusChangedPayload>("peer-connection-status-changed", (event) => {
+      unlisteners.push(await listen<PeerConnectionStatusChangedPayload>("peer-connection-status-changed", (event) => {
         const payload = event.payload ?? {};
         const peerId = payload.peerId ?? payload.peer_id;
         const status = normalizePeerStatus(payload.status);
         if (peerId && status) {
           peerConnectionStatuses.value = { ...peerConnectionStatuses.value, [peerId]: status };
         }
-      });
+      }));
 
       const snapshotRevision = runtimeEventRevision;
       const info = await invoke<NodeInfoResponse>("get_node_info");
@@ -141,10 +142,22 @@ async function init(): Promise<void> {
     } catch (error) {
       nodeError.value = `Could not load node runtime: ${error}`;
       relayStatus.value = "offline";
+      // Allow a later call to retry instead of permanently caching the failure.
+      for (const unlisten of unlisteners.splice(0)) unlisten();
+      initialized = false;
+      initPromise = null;
     }
   })();
 
   return initPromise;
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    for (const unlisten of unlisteners.splice(0)) unlisten();
+    initialized = false;
+    initPromise = null;
+  });
 }
 
 export function useNodeRuntime() {
