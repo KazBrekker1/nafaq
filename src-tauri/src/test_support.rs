@@ -30,8 +30,7 @@ pub struct TestNode {
 
 impl TestNode {
     pub async fn new() -> Result<Self> {
-        let mut rng = rand::rng();
-        let key = SecretKey::generate(&mut rng);
+        let key = SecretKey::generate();
         Self::with_key(key).await
     }
 

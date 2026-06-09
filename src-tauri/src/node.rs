@@ -45,7 +45,9 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndp
     let relay_url = RELAY_URL_PARSED.clone();
     let address_lookup = MemoryLookup::new();
 
-    let endpoint = Endpoint::empty_builder()
+    // Minimal = mandatory options only (rustls crypto provider), no n0
+    // discovery/relay defaults — the 0.98 equivalent of the old empty_builder.
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .alpns(vec![NAFAQ_ALPN.to_vec(), NAFAQ_DM_ALPN.to_vec()])
         .transport_config(transport_config)
         .relay_mode(RelayMode::custom([relay_url]))
@@ -74,8 +76,7 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndp
 
 #[cfg(test)]
 pub async fn create_test_endpoint() -> Result<Endpoint> {
-    let mut rng = rand::rng();
-    Ok(create_endpoint_with_key(SecretKey::generate(&mut rng))
+    Ok(create_endpoint_with_key(SecretKey::generate())
         .await?
         .endpoint)
 }

@@ -316,8 +316,7 @@ mod tests {
     use iroh::SecretKey;
 
     fn random_key() -> PublicKey {
-        let mut rng = rand::rng();
-        SecretKey::generate(&mut rng).public()
+        SecretKey::generate().public()
     }
 
     #[test]

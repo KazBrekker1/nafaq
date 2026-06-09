@@ -19,19 +19,20 @@ const MAX_OPUS_PACKET: usize = 4000;
 
 pub struct AudioEncoder {
     encoder: OpusEncoder,
+    /// Reused per-call scratch; encode() returns a right-sized copy of the
+    /// encoded prefix instead of a 4 KB allocation per 20 ms frame.
+    scratch: Vec<u8>,
 }
 
 impl AudioEncoder {
-    pub fn new() -> Self {
-        let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Voip)
-            .expect("failed to create Opus encoder");
-        encoder
-            .set_inband_fec(true)
-            .expect("failed to enable Opus FEC");
-        encoder
-            .set_packet_loss_perc(5)
-            .expect("failed to set packet loss %");
-        Self { encoder }
+    pub fn new() -> anyhow::Result<Self> {
+        let mut encoder = OpusEncoder::new(SAMPLE_RATE, CHANNELS, Application::Voip)?;
+        encoder.set_inband_fec(true)?;
+        encoder.set_packet_loss_perc(5)?;
+        Ok(Self {
+            encoder,
+            scratch: vec![0u8; MAX_OPUS_PACKET],
+        })
     }
 
     pub fn encode(&mut self, pcm: &[i16]) -> Option<Vec<u8>> {
@@ -42,12 +43,8 @@ impl AudioEncoder {
             );
             return None;
         }
-        let mut buf = vec![0u8; MAX_OPUS_PACKET];
-        match self.encoder.encode(pcm, &mut buf) {
-            Ok(n) => {
-                buf.truncate(n);
-                Some(buf)
-            }
+        match self.encoder.encode(pcm, &mut self.scratch) {
+            Ok(n) => Some(self.scratch[..n].to_vec()),
             Err(e) => {
                 tracing::warn!("Opus encode error: {e}");
                 None
@@ -60,22 +57,23 @@ impl AudioEncoder {
 
 pub struct AudioDecoder {
     decoder: OpusDecoder,
+    /// Reused per-call scratch; decode() returns a right-sized copy so callers
+    /// keep an owned frame without a full-frame zeroed allocation per packet.
+    scratch: Vec<i16>,
 }
 
 impl AudioDecoder {
-    pub fn new() -> Self {
-        let decoder =
-            OpusDecoder::new(SAMPLE_RATE, CHANNELS).expect("failed to create Opus decoder");
-        Self { decoder }
+    pub fn new() -> anyhow::Result<Self> {
+        let decoder = OpusDecoder::new(SAMPLE_RATE, CHANNELS)?;
+        Ok(Self {
+            decoder,
+            scratch: vec![0i16; OPUS_FRAME_SIZE],
+        })
     }
 
     pub fn decode(&mut self, opus_data: &[u8], packet_lost: bool) -> Option<Vec<i16>> {
-        let mut pcm = vec![0i16; OPUS_FRAME_SIZE];
-        match self.decoder.decode(opus_data, &mut pcm, packet_lost) {
-            Ok(n) => {
-                pcm.truncate(n);
-                Some(pcm)
-            }
+        match self.decoder.decode(opus_data, &mut self.scratch, packet_lost) {
+            Ok(n) => Some(self.scratch[..n].to_vec()),
             Err(e) => {
                 tracing::warn!("Opus decode error: {e}");
                 None
@@ -90,25 +88,68 @@ pub struct VideoEncoder {
     encoder: H264Encoder,
     width: u32,
     height: u32,
+    /// Bitrate the encoder was configured with (the frontend's quality profile).
+    base_bitrate_bps: u32,
+    /// Bitrate the inner encoder is currently running at (base, or an override).
+    active_bitrate_bps: u32,
+    fps: f32,
 }
 
 impl VideoEncoder {
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
         Self::new_with_config(width, height, 400_000, 12.0)
     }
 
-    pub fn new_with_config(width: u32, height: u32, bitrate_bps: u32, fps: f32) -> Self {
+    pub fn new_with_config(
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        fps: f32,
+    ) -> anyhow::Result<Self> {
+        let encoder = Self::build_encoder(bitrate_bps, fps)?;
+        Ok(Self {
+            encoder,
+            width,
+            height,
+            base_bitrate_bps: bitrate_bps,
+            active_bitrate_bps: bitrate_bps,
+            fps,
+        })
+    }
+
+    fn build_encoder(bitrate_bps: u32, fps: f32) -> anyhow::Result<H264Encoder> {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .bitrate(openh264::encoder::BitRate::from_bps(bitrate_bps))
             .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate);
-        let encoder =
-            H264Encoder::with_api_config(api, config).expect("failed to create H264 encoder");
-        Self {
-            encoder,
-            width,
-            height,
+        H264Encoder::with_api_config(api, config)
+            .map_err(|e| anyhow::anyhow!("failed to create H264 encoder: {e}"))
+    }
+
+    /// Apply a temporary bitrate cap (0 clears it, restoring the base bitrate).
+    /// openh264 has no safe runtime bitrate setter, so this rebuilds the inner
+    /// encoder; the next encoded frame starts a fresh IDR/SPS sequence, which
+    /// receivers handle the same way as any keyframe.
+    pub fn apply_bitrate_override(&mut self, override_bps: u32) {
+        let target = if override_bps == 0 {
+            self.base_bitrate_bps
+        } else {
+            override_bps.min(self.base_bitrate_bps)
+        };
+        if target == self.active_bitrate_bps {
+            return;
+        }
+        match Self::build_encoder(target, self.fps) {
+            Ok(encoder) => {
+                tracing::info!(
+                    "Video encoder bitrate {} -> {target} bps",
+                    self.active_bitrate_bps
+                );
+                self.encoder = encoder;
+                self.active_bitrate_bps = target;
+            }
+            Err(e) => tracing::warn!("Failed to apply bitrate override: {e}"),
         }
     }
 
@@ -135,6 +176,8 @@ impl VideoEncoder {
             }
         }
 
+        // Bookkeeping only: openh264's Encoder re-initializes itself when the
+        // incoming frame dimensions change (see openh264 encoder.rs reinit).
         if width != self.width || height != self.height {
             self.width = width;
             self.height = height;
@@ -171,9 +214,10 @@ pub struct VideoDecoder {
 }
 
 impl VideoDecoder {
-    pub fn new() -> Self {
-        let decoder = H264Decoder::new().expect("failed to create H264 decoder");
-        Self { decoder }
+    pub fn new() -> anyhow::Result<Self> {
+        let decoder = H264Decoder::new()
+            .map_err(|e| anyhow::anyhow!("failed to create H264 decoder: {e}"))?;
+        Ok(Self { decoder })
     }
 
     pub fn decode_rgba(&mut self, h264_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
@@ -296,8 +340,8 @@ mod tests {
 
     #[test]
     fn test_audio_roundtrip() {
-        let mut enc = AudioEncoder::new();
-        let mut dec = AudioDecoder::new();
+        let mut enc = AudioEncoder::new().expect("encoder init");
+        let mut dec = AudioDecoder::new().expect("decoder init");
         let pcm: Vec<i16> = (0..960)
             .map(|i| {
                 (f64::sin(2.0 * std::f64::consts::PI * 440.0 * i as f64 / 48000.0) * 16000.0) as i16
@@ -311,13 +355,13 @@ mod tests {
 
     #[test]
     fn test_audio_rejects_wrong_frame_size() {
-        let mut enc = AudioEncoder::new();
+        let mut enc = AudioEncoder::new().expect("encoder init");
         assert!(enc.encode(&vec![0i16; 128]).is_none());
     }
 
     #[test]
     fn test_video_encode() {
-        let mut enc = VideoEncoder::new(320, 240);
+        let mut enc = VideoEncoder::new(320, 240).expect("encoder init");
         let mut rgba = vec![0u8; (320 * 240 * 4) as usize];
         for y in 0..240u32 {
             for x in 0..320u32 {
@@ -334,8 +378,8 @@ mod tests {
 
     #[test]
     fn test_video_decode_and_jpeg_encode() {
-        let mut enc = VideoEncoder::new(320, 240);
-        let mut dec = VideoDecoder::new();
+        let mut enc = VideoEncoder::new(320, 240).expect("encoder init");
+        let mut dec = VideoDecoder::new().expect("decoder init");
         let mut rgba = vec![0u8; (320 * 240 * 4) as usize];
         for y in 0..240u32 {
             for x in 0..320u32 {

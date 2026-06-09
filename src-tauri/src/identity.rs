@@ -60,8 +60,7 @@ fn load_or_create_from_store<R: Runtime>(store: &Store<R>) -> Result<LoadedIdent
             "persistent node identity is enabled but no secret key was found; explicit reset required"
         ),
         None => {
-            let mut rng = rand::rng();
-            let key = SecretKey::generate(&mut rng);
+            let key = SecretKey::generate();
             persist_secret_key(store, &key)?;
             Ok(LoadedIdentity {
                 secret_key: key,

@@ -82,7 +82,15 @@ pub async fn monitor_relay(
                 .checked_mul(2)
                 .unwrap_or(MAX_RETRY_BACKOFF)
                 .min(MAX_RETRY_BACKOFF);
-            current
+            // Jitter up to +25% so clients that lost the relay together (e.g.
+            // a relay restart) don't all retry on the same deterministic ticks.
+            let jitter_ms = if current.as_millis() > 0 {
+                use rand::Rng;
+                rand::rng().random_range(0..=(current.as_millis() as u64 / 4))
+            } else {
+                0
+            };
+            current + std::time::Duration::from_millis(jitter_ms)
         };
 
         tokio::select! {
@@ -171,8 +179,7 @@ mod tests {
     use iroh::{EndpointAddr, SecretKey, TransportAddr};
 
     fn public_key() -> iroh::PublicKey {
-        let mut rng = rand::rng();
-        SecretKey::generate(&mut rng).public()
+        SecretKey::generate().public()
     }
 
     #[test]

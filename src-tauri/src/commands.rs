@@ -21,6 +21,7 @@ const MAX_PEER_ID_LEN: usize = 256;
 const MAX_TICKET_LEN: usize = 4096;
 const MAX_CHAT_LEN: usize = 64 * 1024; // 64 KB
 const MAX_RESOLUTION: u32 = 4096;
+const MAX_DISPLAY_NAME_LEN: usize = 64;
 const PROBE_PEER_ID: &str = "__bridge_probe__";
 
 #[derive(Clone, serde::Serialize)]
@@ -158,6 +159,21 @@ pub async fn send_control(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_peer_id(&peer_id)?;
+    // The webview may only send user-facing call controls. PeerAnnounce and
+    // PerPeerQualityBps are backend-originated mesh/QoS signaling — letting a
+    // compromised webview send them would allow ticket spoofing into the mesh.
+    match &action {
+        ControlAction::Mute { .. }
+        | ControlAction::VideoOff { .. }
+        | ControlAction::VideoQualityRequest { .. }
+        | ControlAction::KeyframeRequest { .. } => {}
+        ControlAction::SetDisplayName { name } => {
+            if name.len() > MAX_DISPLAY_NAME_LEN {
+                return Err("Display name too long".into());
+            }
+        }
+        _ => return Err("Control action not allowed from frontend".into()),
+    }
     state
         .conn_manager
         .send_control(&peer_id, &action)
@@ -332,9 +348,10 @@ pub async fn init_codecs(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.audio_codec.encoder.lock().await = Some(AudioEncoder::new());
+    *state.audio_codec.encoder.lock().await = Some(AudioEncoder::new().map_err(|e| e.to_string())?);
     // Audio decoders are created per-peer on demand — no init needed
-    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new(width, height));
+    *state.video_codec.encoder.lock().await =
+        Some(VideoEncoder::new(width, height).map_err(|e| e.to_string())?);
     tracing::info!("Codecs initialized: {width}x{height}");
     Ok(())
 }
@@ -356,7 +373,8 @@ pub async fn reinit_video_encoder(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new(width, height));
+    *state.video_codec.encoder.lock().await =
+        Some(VideoEncoder::new(width, height).map_err(|e| e.to_string())?);
     tracing::info!("Video encoder reinitialized: {width}x{height}");
     Ok(())
 }
@@ -370,12 +388,10 @@ pub async fn reinit_video_encoder_with_config(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.video_codec.encoder.lock().await = Some(VideoEncoder::new_with_config(
-        width,
-        height,
-        bitrate_bps,
-        fps,
-    ));
+    *state.video_codec.encoder.lock().await = Some(
+        VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
+            .map_err(|e| e.to_string())?,
+    );
     tracing::info!("Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps");
     Ok(())
 }
@@ -504,6 +520,7 @@ pub async fn send_file(
 
 #[tauri::command]
 pub async fn connect_dm(node_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_peer_id(&node_id)?;
     state
         .conn_manager
         .connect_dm(&node_id)
@@ -517,6 +534,7 @@ pub async fn send_dm(
     message: serde_json::Value,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    validate_peer_id(&peer_id)?;
     let dm_msg: DmMessage = serde_json::from_value(message).map_err(|e| e.to_string())?;
     if let DmMessage::Text { ref content, .. } = dm_msg {
         if content.len() > MAX_CHAT_LEN {
@@ -532,6 +550,7 @@ pub async fn send_dm(
 
 #[tauri::command]
 pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_peer_id(&peer_id)?;
     state.conn_manager.disconnect_dm(&peer_id).await;
     Ok(())
 }
@@ -566,6 +585,19 @@ pub async fn get_settings(
     Ok(settings)
 }
 
+/// Settings keys the webview is allowed to persist. Everything else is either
+/// backend-owned (identityStatus, persistentIdentity) or unknown — letting
+/// arbitrary keys through would let a compromised webview poison the store.
+const ALLOWED_SETTINGS_KEYS: &[&str] = &[
+    "displayName",
+    "preferredMic",
+    "preferredCamera",
+    "preferredSpeaker",
+    "videoQuality",
+    "dataSaver",
+];
+const MAX_SETTINGS_VALUE_LEN: usize = 1024;
+
 #[tauri::command]
 pub async fn update_settings(
     settings: serde_json::Value,
@@ -577,6 +609,14 @@ pub async fn update_settings(
         (&mut current, &settings)
     {
         for (k, v) in patch {
+            if !ALLOWED_SETTINGS_KEYS.contains(&k.as_str()) {
+                tracing::warn!("update_settings: ignoring unknown key {k}");
+                continue;
+            }
+            let scalar = v.is_null() || v.is_boolean() || v.is_number() || v.is_string();
+            if !scalar || v.as_str().is_some_and(|s| s.len() > MAX_SETTINGS_VALUE_LEN) {
+                return Err(format!("Invalid value for settings key {k}"));
+            }
             current_obj.insert(k.clone(), v.clone());
         }
     }
@@ -599,6 +639,15 @@ pub async fn add_contact(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    // Reject malformed ids before persisting — otherwise an invalid contact is
+    // saved to disk and only fails later at presence.track_contact.
+    contact
+        .node_id
+        .parse::<iroh::PublicKey>()
+        .map_err(|_| "Invalid contact node id".to_string())?;
+    if contact.display_name.len() > MAX_DISPLAY_NAME_LEN {
+        return Err("Display name too long".into());
+    }
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
     let mut contacts = load_contacts(&store);
     let node_id = contact.node_id.clone();
@@ -684,6 +733,9 @@ pub async fn set_pinned_name(
     name: Option<String>,
     pinned: bool,
 ) -> Result<(), String> {
+    if name.as_deref().is_some_and(|n| n.len() > MAX_DISPLAY_NAME_LEN) {
+        return Err("Display name too long".into());
+    }
     let store = app.store("settings.json").map_err(|e| e.to_string())?;
     store.set("name_pinned", serde_json::json!(pinned));
     if let Some(n) = name {

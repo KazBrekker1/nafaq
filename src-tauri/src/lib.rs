@@ -14,7 +14,7 @@ mod scenarios;
 #[cfg(test)]
 mod test_support;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -129,7 +129,10 @@ pub fn run() {
             // Initialize Iroh synchronously on the async runtime
             let (event_tx, _) = broadcast::channel::<Event>(256);
             let (audio_media_tx, _) = broadcast::channel::<AudioPacket>(256);
-            let (video_media_tx, _) = broadcast::channel::<VideoPacket>(16);
+            // 64 frames ≈ 5s headroom at 12fps. The old capacity of 16 let a
+            // brief decode/JPEG stall drop frames — including keyframes, which
+            // froze video until the next one arrived.
+            let (video_media_tx, _) = broadcast::channel::<VideoPacket>(64);
             let latest_ticket = Arc::new(Mutex::new(None));
             let relay_status = Arc::new(Mutex::new(RelayStatusKind::Starting));
 
@@ -334,6 +337,24 @@ pub fn run() {
                                 "Peer {peer_id} requested keyframe for layer: {layer:?}"
                             );
                         }
+                        Ok(Event::ControlReceived {
+                            peer_id,
+                            action: ControlAction::PerPeerQualityBps { bitrate_bps },
+                        }) => {
+                            // Clamp so a misbehaving peer can't force the encoder
+                            // to a useless bitrate; 0 clears the override.
+                            let clamped = if bitrate_bps == 0 {
+                                0
+                            } else {
+                                bitrate_bps.clamp(50_000, 2_000_000)
+                            };
+                            conn_manager_for_control
+                                .set_peer_outbound_bitrate(&peer_id, clamped)
+                                .await;
+                            tracing::debug!(
+                                "Peer {peer_id} requested outbound bitrate {clamped} bps"
+                            );
+                        }
                         Ok(Event::TicketRefreshed { ticket }) => {
                             conn_manager_for_control
                                 .send_self_announce_to_all(ticket)
@@ -390,11 +411,11 @@ pub fn run() {
                             // still be decoded — it can fill the gap / carry Opus
                             // FEC — rather than being dropped as "<= previous".
                             // Only exact duplicates are discarded.
-                            let packet_lost =
+                            let lost_count =
                                 match last_sequence.get(&peer_id).copied() {
                                     None => {
                                         last_sequence.insert(peer_id.clone(), packet.sequence);
-                                        false
+                                        0u16
                                     }
                                     Some(previous) => {
                                         let advance = packet.sequence.wrapping_sub(previous);
@@ -404,19 +425,22 @@ pub fn run() {
                                         } else if advance < 0x8000 {
                                             // Forward progress; a gap (>1) is loss.
                                             last_sequence.insert(peer_id.clone(), packet.sequence);
-                                            advance != 1
+                                            advance - 1
                                         } else {
                                             // Reordered/late: decode but keep the
                                             // high-water mark and don't flag loss.
-                                            false
+                                            0
                                         }
                                     }
                                 };
 
-                            // Lightweight energy proxy from Opus payload size (no decode needed).
-                            // Updated after the sequence guard so out-of-order/duplicate packets
-                            // don't skew the energy estimate.
-                            let energy_proxy = payload.len() as f32;
+                            // Lightweight energy proxy from Opus payload size (no decode
+                            // needed), smoothed with an EWMA so one large packet (e.g. a
+                            // DTX burst) can't instantly displace a genuinely loud
+                            // speaker. Updated after the sequence guard so out-of-order/
+                            // duplicate packets don't skew the estimate.
+                            let prev_energy = peer_energy.get(&peer_id).copied().unwrap_or(0.0);
+                            let energy_proxy = 0.3 * payload.len() as f32 + 0.7 * prev_energy;
                             peer_energy.insert(peer_id.clone(), energy_proxy);
 
                             // Selective decode at 5+ peers: skip quiet speakers
@@ -443,40 +467,71 @@ pub fn run() {
                                 }
                             }
 
-                            let mut decoders = codec_audio.decoders.lock().await;
-                            let decoder = decoders
-                                .entry(peer_id.clone())
-                                .or_insert_with(AudioDecoder::new);
+                            // Decode while holding the decoders lock, but dispatch to
+                            // the bridge after releasing it — holding it across the
+                            // IPC below would stall destroy_codecs and peer cleanup.
+                            let pcm_frames: Vec<Vec<i16>> = {
+                                let mut decoders = codec_audio.decoders.lock().await;
+                                let decoder = match decoders.entry(peer_id.clone()) {
+                                    Entry::Occupied(entry) => entry.into_mut(),
+                                    Entry::Vacant(entry) => match AudioDecoder::new() {
+                                        Ok(decoder) => entry.insert(decoder),
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Opus decoder init failed for {peer_id}: {e}"
+                                            );
+                                            continue;
+                                        }
+                                    },
+                                };
+                                let mut frames = Vec::with_capacity(2);
+                                if lost_count > 0 {
+                                    // Opus in-band FEC can only reconstruct the single
+                                    // frame preceding this packet. Step the decoder
+                                    // through PLC for earlier missing frames (capped —
+                                    // long gaps aren't worth filling with concealment),
+                                    // then recover the last one from FEC.
+                                    for _ in 0..(lost_count - 1).min(2) {
+                                        if let Some(pcm) = decoder.decode(&[], true) {
+                                            frames.push(pcm);
+                                        }
+                                    }
+                                    if let Some(pcm) = decoder.decode(&payload, true) {
+                                        frames.push(pcm);
+                                    }
+                                }
+                                if let Some(pcm) = decoder.decode(&payload, false) {
+                                    frames.push(pcm);
+                                }
+                                frames
+                            };
 
-                            if let Some(pcm) = decoder.decode(&payload, packet_lost) {
+                            if pcm_frames.is_empty() {
+                                continue;
+                            }
+                            let registration = audio_bridge.lock().await.clone();
+                            let channel = registration.and_then(|r| r.audio_channel);
+                            let total = pcm_frames.len() as u64;
+                            for (i, pcm) in pcm_frames.iter().enumerate() {
+                                // Concealment frames precede the real one; back-date
+                                // them one 20ms frame each so playback order holds.
+                                let ts = timestamp.saturating_sub(20 * (total - 1 - i as u64));
                                 let raw: Vec<u8> =
                                     pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                                let registration = audio_bridge.lock().await.clone();
-                                if let Some(registration) = registration {
-                                    if let Some(channel) = registration.audio_channel {
-                                        let Some(channel_payload) =
-                                            pack_audio_channel_packet(&peer_id, timestamp, &raw)
-                                        else {
-                                            continue;
-                                        };
-                                        let _ = channel.send(channel_payload);
-                                    } else {
-                                        let _ = app_handle_audio.emit(
-                                            "audio-received",
-                                            AudioEvent {
-                                                peer_id: peer_id.clone(),
-                                                data: B64.encode(&raw),
-                                                timestamp,
-                                            },
-                                        );
-                                    }
+                                if let Some(channel) = &channel {
+                                    let Some(channel_payload) =
+                                        pack_audio_channel_packet(&peer_id, ts, &raw)
+                                    else {
+                                        continue;
+                                    };
+                                    let _ = channel.send(channel_payload);
                                 } else {
                                     let _ = app_handle_audio.emit(
                                         "audio-received",
                                         AudioEvent {
                                             peer_id: peer_id.clone(),
                                             data: B64.encode(&raw),
-                                            timestamp,
+                                            timestamp: ts,
                                         },
                                     );
                                 }
@@ -495,6 +550,7 @@ pub fn run() {
             let codec_video = video_codec.clone();
             let video_bridge = media_bridge_ref.clone();
             let video_runtime_handle = video_runtime_handle.clone();
+            let conn_manager_video = conn_manager.clone();
 
             tauri::async_runtime::spawn(async move {
                 let mut video_rx = video_media_tx_for_setup.subscribe();
@@ -529,9 +585,16 @@ pub fn run() {
                             let jpeg_result = video_runtime_handle
                                 .spawn(async move {
                                     let mut decoders = codec_video_clone.decoders.lock().await;
-                                    let decoder = decoders
-                                        .entry(peer_id_clone)
-                                        .or_insert_with(codec::VideoDecoder::new);
+                                    let decoder = match decoders.entry(peer_id_clone) {
+                                        Entry::Occupied(entry) => entry.into_mut(),
+                                        Entry::Vacant(entry) => match codec::VideoDecoder::new() {
+                                            Ok(decoder) => entry.insert(decoder),
+                                            Err(e) => {
+                                                tracing::warn!("H264 decoder init failed: {e}");
+                                                return None;
+                                            }
+                                        },
+                                    };
                                     decoder.decode_rgba(&payload).and_then(|(rgba, w, h)| {
                                         codec::encode_jpeg(&rgba, w, h, 70).map(|j| (j, w, h))
                                     })
@@ -581,6 +644,9 @@ pub fn run() {
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Video forwarder lagged by {n} frames");
+                            // A dropped keyframe stalls decoding until the next
+                            // IDR; ask peers for one now instead of waiting.
+                            conn_manager_video.request_keyframes_from_all_peers().await;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     }
@@ -608,14 +674,26 @@ pub fn run() {
 
             let app_handle_stats = app.handle().clone();
             let conn_manager_stats = conn_manager.clone();
+            let video_codec_stats = video_codec.clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // lost_packets from path stats is cumulative over the connection
+                // lifetime; degradation must be judged on the per-tick delta or a
+                // peer stays "degraded" forever after its 51st lifetime loss.
+                let mut last_lost: HashMap<String, u64> = HashMap::new();
                 loop {
                     interval.tick().await;
-                    for stats in conn_manager_stats.snapshot_network_stats().await {
+                    let snapshot = conn_manager_stats.snapshot_network_stats().await;
+                    let mut seen: HashSet<String> = HashSet::with_capacity(snapshot.len());
+                    for stats in &snapshot {
+                        seen.insert(stats.peer_id.clone());
+                        let prev = last_lost
+                            .insert(stats.peer_id.clone(), stats.lost_packets)
+                            .unwrap_or(stats.lost_packets);
+                        let lost_delta = stats.lost_packets.saturating_sub(prev);
                         // Per-peer quality adaptation
-                        let target = if stats.rtt_ms > 200 || stats.lost_packets > 50 {
+                        let target = if stats.rtt_ms > 200 || lost_delta > 50 {
                             100_000 // 100kbps for degraded peers
                         } else {
                             0 // Use global profile (no override)
@@ -623,12 +701,22 @@ pub fn run() {
                         let current = conn_manager_stats
                             .get_peer_outbound_bitrate(&stats.peer_id)
                             .await;
-                        if current != target {
+                        // Only touch values this loop owns (0 or the degraded cap) —
+                        // a peer-requested PerPeerQualityBps override wins.
+                        let managed = current == 0 || current == 100_000;
+                        if managed && current != target {
                             conn_manager_stats
                                 .set_peer_outbound_bitrate(&stats.peer_id, target)
                                 .await;
                         }
                         let _ = app_handle_stats.emit("network-stats", &stats);
+                    }
+                    last_lost.retain(|peer_id, _| seen.contains(peer_id));
+                    // The encoder is shared across peers, so apply the strictest
+                    // active per-peer cap (0 = none, restores the base profile).
+                    let cap = conn_manager_stats.min_peer_outbound_bitrate().await;
+                    if let Some(encoder) = video_codec_stats.encoder.lock().await.as_mut() {
+                        encoder.apply_bitrate_override(cap);
                     }
                 }
             });

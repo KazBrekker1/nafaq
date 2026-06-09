@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,8 +41,12 @@ impl PeerVideoWriter {
         };
         if should_replace {
             *pending = Some(frame);
+            drop(pending);
+            // Only wake the writer when the slot actually changed — a rejected
+            // delta (keyframe already queued) would otherwise cause a spurious
+            // wakeup per frame per peer.
+            self.notify.notify_one();
         }
-        self.notify.notify_one();
     }
 }
 
@@ -127,6 +131,39 @@ struct ActiveFileReceive {
     received_bytes: u64,
 }
 
+/// Maximum size a peer may declare for an inbound transfer. Mirrors the
+/// sender-side cap in `send_file`; without this a peer can declare an
+/// arbitrarily large file and legitimately stream it until the disk fills.
+const MAX_INCOMING_FILE_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Transfer ids are embedded in temp-file names, so anything outside a
+/// UUID-ish charset is a path-injection attempt.
+fn is_valid_transfer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Reduce a peer-supplied file name to a safe basename. `Path::join` with an
+/// absolute path replaces the base entirely, so the raw name must never reach
+/// a join — strip directories, control chars, and leading dots.
+fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
+    let trimmed = cleaned.trim_start_matches(['.', ' ']).trim_end();
+    if trimmed.is_empty() {
+        "download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Resolve a unique file path in the target directory, appending `(N)` if needed.
 fn unique_file_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let candidate = dir.join(name);
@@ -165,6 +202,19 @@ async fn handle_dm_file_message(
 
     match dm_msg {
         DmMessage::FileStart { name, size, id } => {
+            // Protocol-violation rejects suppress the DmReceived event entirely
+            // (return true) so a malicious FileStart can't spam phantom file
+            // cards in the frontend.
+            if !is_valid_transfer_id(id) {
+                tracing::warn!("Rejecting file transfer from {peer_id}: invalid transfer id");
+                return true;
+            }
+            if *size > MAX_INCOMING_FILE_SIZE {
+                tracing::warn!(
+                    "Rejecting file transfer {id} from {peer_id}: declared size {size} exceeds {MAX_INCOMING_FILE_SIZE}"
+                );
+                return true;
+            }
             // Bound concurrent in-flight transfers so a peer can't exhaust file
             // descriptors / memory by opening unbounded FileStarts without ends.
             const MAX_CONCURRENT_TRANSFERS: usize = 16;
@@ -183,7 +233,7 @@ async fn handle_dm_file_message(
                         ActiveFileReceive {
                             file,
                             temp_path,
-                            final_name: name.clone(),
+                            final_name: sanitize_file_name(name),
                             expected_size: *size,
                             received_bytes: 0,
                         },
@@ -422,6 +472,9 @@ struct PeerConnection {
     established_at: std::time::Instant,
     /// Per-peer outbound bitrate override (0 = use global profile)
     outbound_bitrate_bps: Arc<AtomicU32>,
+    /// Outbound audio datagram sequence counter. Lives on the peer entry so
+    /// the audio hot path never needs a separate map lock.
+    audio_sequence: Arc<AtomicU16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -450,10 +503,17 @@ struct ConnectingReservation {
     reservations: Arc<StdMutex<HashSet<String>>>,
     peer_id: String,
     active: bool,
+    /// Woken when the reservation releases, so waiters polling "is a connect
+    /// still in progress?" can block on a Notify instead of busy-sleeping.
+    release_notify: Option<Arc<Notify>>,
 }
 
 impl ConnectingReservation {
-    fn try_reserve(reservations: Arc<StdMutex<HashSet<String>>>, peer_id: &str) -> Option<Self> {
+    fn try_reserve(
+        reservations: Arc<StdMutex<HashSet<String>>>,
+        peer_id: &str,
+        release_notify: Option<Arc<Notify>>,
+    ) -> Option<Self> {
         let inserted = {
             let mut guard = reservations
                 .lock()
@@ -465,6 +525,7 @@ impl ConnectingReservation {
             reservations,
             peer_id: peer_id.to_string(),
             active: true,
+            release_notify,
         })
     }
 }
@@ -478,6 +539,9 @@ impl Drop for ConnectingReservation {
                 .unwrap_or_else(|poison| poison.into_inner());
             guard.remove(&self.peer_id);
             self.active = false;
+            if let Some(notify) = &self.release_notify {
+                notify.notify_waiters();
+            }
         }
     }
 }
@@ -519,10 +583,12 @@ pub struct ConnectionManager {
     dm_peers: Arc<Mutex<HashMap<String, DmPeerConnection>>>,
     call_connecting: Arc<StdMutex<HashSet<String>>>,
     dm_connecting: Arc<StdMutex<HashSet<String>>>,
+    /// Woken whenever a DM connect attempt finishes (reservation released) or
+    /// a DM connection is stored — lets waiters block instead of polling.
+    dm_connect_done: Arc<Notify>,
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     latest_ticket: Arc<Mutex<Option<String>>>,
     peer_tickets: Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-    audio_sequences: Arc<Mutex<HashMap<String, u16>>>,
     video_receive_state: Arc<Mutex<HashMap<String, VideoReceiveState>>>,
     event_tx: broadcast::Sender<Event>,
     audio_media_tx: broadcast::Sender<AudioPacket>,
@@ -575,10 +641,10 @@ impl ConnectionManager {
             dm_peers: Arc::new(Mutex::new(HashMap::new())),
             call_connecting: Arc::new(StdMutex::new(HashSet::new())),
             dm_connecting: Arc::new(StdMutex::new(HashSet::new())),
+            dm_connect_done: Arc::new(Notify::new()),
             endpoint: Arc::new(Mutex::new(None)),
             latest_ticket,
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
-            audio_sequences: Arc::new(Mutex::new(HashMap::new())),
             video_receive_state: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audio_media_tx,
@@ -653,7 +719,7 @@ impl ConnectionManager {
     }
 
     async fn reserve_call_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
-        ConnectingReservation::try_reserve(self.call_connecting.clone(), peer_id)
+        ConnectingReservation::try_reserve(self.call_connecting.clone(), peer_id, None)
     }
 
     #[cfg(test)]
@@ -673,7 +739,11 @@ impl ConnectionManager {
     }
 
     async fn reserve_dm_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
-        ConnectingReservation::try_reserve(self.dm_connecting.clone(), peer_id)
+        ConnectingReservation::try_reserve(
+            self.dm_connecting.clone(),
+            peer_id,
+            Some(self.dm_connect_done.clone()),
+        )
     }
 
     #[cfg(test)]
@@ -748,8 +818,8 @@ impl ConnectionManager {
         Self::cleanup_peer_internal(
             peer_id,
             &self.peers,
+            &self.dm_peers,
             &self.peer_tickets,
-            &self.audio_sequences,
             &self.video_receive_state,
             &self.event_tx,
             Some(reason),
@@ -803,6 +873,18 @@ impl ConnectionManager {
                 || self.call_entry_predates_recent_rejoin(peer_id).await)
         {
             self.evict_stale_call_peer(peer_id, existing_conn_id, b"peer_rejoined_gossip")
+                .await;
+            return true;
+        }
+
+        // A duplicate in the SAME direction can't be the crossed simultaneous-
+        // dial race (those produce one inbound + one outbound). It means the
+        // initiating side re-dialed, and it only does that once it considers
+        // the old path dead — e.g. its CONNECTION_CLOSE to us was lost, which
+        // QUIC does not retransmit. The newest connection wins; rejecting it
+        // would strand both sides on a half-dead connection until idle timeout.
+        if existing_direction == direction {
+            self.evict_stale_call_peer(peer_id, existing_conn_id, b"superseded_by_redial")
                 .await;
             return true;
         }
@@ -879,6 +961,23 @@ impl ConnectionManager {
             return true;
         }
 
+        // Same-direction duplicate: not the crossed-dial race (that pairs one
+        // inbound with one outbound) — the initiator re-dialed because it
+        // considers the old path dead (e.g. its CONNECTION_CLOSE to us was
+        // lost). Newest wins; rejecting it strands both sides until the QUIC
+        // idle timeout.
+        if existing_direction == direction {
+            Self::cleanup_dm_internal(
+                peer_id,
+                &self.dm_peers,
+                &self.event_tx,
+                Some(b"superseded_by_redial"),
+                None,
+            )
+            .await;
+            return true;
+        }
+
         local_node_id.is_some_and(|local_id| {
             should_replace_connection(&local_id, peer_id, existing_direction, direction)
         })
@@ -946,10 +1045,20 @@ impl ConnectionManager {
                     // a concurrent cleanup_dm_internal can't remove the entry
                     // between our check and the write — which would leave the new
                     // stream stranded on an orphaned entry and silently drop DMs.
+                    //
+                    // LOCK ORDER INVARIANT: dm_peers may be held while acquiring a
+                    // dm_send lock (here), so no code path may acquire dm_peers
+                    // while holding a dm_send lock — every sender must clone the
+                    // dm_send Arc under dm_peers, release dm_peers, then lock it.
                     let new_send = dm_send.lock().await.take();
                     *existing.dm_send.lock().await = new_send;
+                    self.dm_connect_done.notify_waiters();
                     return true;
                 }
+                // Same-direction duplicate: the initiator re-dialed, which only
+                // happens once it considers the old connection dead — replace
+                // rather than reject (see should_accept_dm_connection).
+                Some(existing) if existing.direction == direction => true,
                 Some(existing) => local_node_id.as_ref().is_some_and(|local_id| {
                     should_replace_connection(local_id, peer_id, existing.direction, direction)
                 }),
@@ -974,6 +1083,7 @@ impl ConnectionManager {
         let _ = self.event_tx.send(Event::DmConnected {
             peer_id: peer_id.to_string(),
         });
+        self.dm_connect_done.notify_waiters();
         true
     }
 
@@ -1022,6 +1132,19 @@ impl ConnectionManager {
                 true
             }
             None => {
+                // Cap the cache: gossip-announced peers that never connect are
+                // only removed on explicit disconnect, so without a bound the
+                // map grows for the lifetime of the process. Evict the stalest.
+                const MAX_PEER_TICKETS: usize = 256;
+                if tickets.len() >= MAX_PEER_TICKETS {
+                    if let Some(stalest) = tickets
+                        .iter()
+                        .min_by_key(|(_, record)| record.last_updated_ms)
+                        .map(|(id, _)| id.clone())
+                    {
+                        tickets.remove(&stalest);
+                    }
+                }
                 tickets.insert(
                     peer_id.to_string(),
                     PeerTicketRecord {
@@ -1330,6 +1453,7 @@ impl ConnectionManager {
             connection_status: PeerConnectionKind::Connected,
             established_at: std::time::Instant::now(),
             outbound_bitrate_bps: Arc::new(AtomicU32::new(0)),
+            audio_sequence: Arc::new(AtomicU16::new(0)),
         };
 
         let video_writer = peer_conn.video_writer.clone();
@@ -1407,8 +1531,8 @@ impl ConnectionManager {
     async fn cleanup_peer_internal(
         peer_id: &str,
         peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
+        dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
         peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-        audio_sequences: &Arc<Mutex<HashMap<String, u16>>>,
         video_receive_state: &Arc<Mutex<HashMap<String, VideoReceiveState>>>,
         event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
@@ -1444,8 +1568,31 @@ impl ConnectionManager {
         if !preserve_ticket {
             peer_tickets.lock().await.remove(peer_id);
         }
-        audio_sequences.lock().await.remove(peer_id);
         video_receive_state.lock().await.remove(peer_id);
+
+        // A SharedCall DM rides the QUIC connection we just tore down; no DM
+        // cleanup path observes call teardowns, so evict it here or the entry
+        // lingers pointing at a closed connection and DmDisconnected is never
+        // emitted, leaving the frontend's DM session in limbo.
+        let dead_connection_id = peer.connection.stable_id();
+        let shared_dm_dead = {
+            let dm_peers_guard = dm_peers.lock().await;
+            dm_peers_guard.get(peer_id).is_some_and(|dm| {
+                dm.ownership == DmConnectionOwnership::SharedCall
+                    && dm.connection.stable_id() == dead_connection_id
+            })
+        };
+        if shared_dm_dead {
+            Self::cleanup_dm_internal(
+                peer_id,
+                dm_peers,
+                event_tx,
+                None,
+                Some(dead_connection_id),
+            )
+            .await;
+        }
+
         let _ = event_tx.send(Event::PeerDisconnected {
             peer_id: peer_id.to_string(),
         });
@@ -1541,7 +1688,6 @@ impl ConnectionManager {
         let video_media_tx = self.video_media_tx.clone();
         let peers_ref = self.peers.clone();
         let peer_tickets_ref = self.peer_tickets.clone();
-        let sequences_ref = self.audio_sequences.clone();
         let video_state_ref = self.video_receive_state.clone();
         let video_state_ref_uni = video_state_ref.clone();
         let event_tx_cleanup = self.event_tx.clone();
@@ -1649,8 +1795,8 @@ impl ConnectionManager {
         });
 
         let peers_ref_closed = peers_ref.clone();
+        let dm_peers_ref_closed = self.dm_peers.clone();
         let peer_tickets_ref = peer_tickets_ref.clone();
-        let sequences_ref = sequences_ref.clone();
         let video_state_ref = video_state_ref.clone();
         let event_tx_cleanup_closed = event_tx_cleanup.clone();
         let peer_id_closed = peer_id.clone();
@@ -1662,8 +1808,8 @@ impl ConnectionManager {
             Self::cleanup_peer_internal(
                 &peer_id_closed,
                 &peers_ref_closed,
+                &dm_peers_ref_closed,
                 &peer_tickets_ref,
-                &sequences_ref,
                 &video_state_ref,
                 &event_tx_cleanup_closed,
                 None,
@@ -1834,8 +1980,17 @@ impl ConnectionManager {
 
                     loop {
                         if send.is_none() {
-                            match connection.open_uni().await {
-                                Ok(mut stream) => {
+                            // Bound the open: when the peer's flow-control window
+                            // is exhausted or the connection is half-open, open_uni
+                            // blocks until QUIC's 30s idle timeout — freezing video
+                            // for the whole window. Drop the (stale) frame instead.
+                            let opened = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                connection.open_uni(),
+                            )
+                            .await;
+                            match opened {
+                                Ok(Ok(mut stream)) => {
                                     if stream.write_all(&[STREAM_VIDEO]).await.is_ok() {
                                         send = Some(stream);
                                     } else {
@@ -1845,9 +2000,15 @@ impl ConnectionManager {
                                         break;
                                     }
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     tracing::warn!(
                                         "Failed to open video stream for peer {peer_id}: {e}"
+                                    );
+                                    break;
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "Timed out opening video stream for peer {peer_id}; dropping frame"
                                     );
                                     break;
                                 }
@@ -1855,7 +2016,7 @@ impl ConnectionManager {
                         }
 
                         let result = if let Some(stream) = send.as_mut() {
-                            let _ = stream.set_priority(if is_keyframe(&frame.payload) {
+                            let _ = stream.set_priority(if frame.is_keyframe {
                                 50
                             } else {
                                 30
@@ -1907,18 +2068,23 @@ impl ConnectionManager {
     }
 
     pub async fn send_audio_to_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
-        let peers: Vec<(String, Connection)> = {
+        let peers: Vec<(String, Connection, Arc<AtomicU16>)> = {
             let peers = self.peers.lock().await;
             peers
                 .iter()
-                .map(|(peer_id, peer)| (peer_id.clone(), peer.connection.clone()))
+                .map(|(peer_id, peer)| {
+                    (
+                        peer_id.clone(),
+                        peer.connection.clone(),
+                        peer.audio_sequence.clone(),
+                    )
+                })
                 .collect()
         };
-        let mut sequences = self.audio_sequences.lock().await;
-        for (peer_id, conn) in peers {
-            let entry = sequences.entry(peer_id.clone()).or_insert(0);
-            let sequence = *entry;
-            *entry = entry.wrapping_add(1);
+        for (peer_id, conn, seq) in peers {
+            // fetch_add wraps on overflow, matching the receiver's
+            // wrapping-aware sequence tracking.
+            let sequence = seq.fetch_add(1, Ordering::Relaxed);
             if let Err(e) = Self::send_audio_datagram(&conn, sequence, data, timestamp) {
                 tracing::warn!("Audio datagram send failed for {peer_id}: {e}");
             }
@@ -1940,6 +2106,11 @@ impl ConnectionManager {
                         p.connection_status,
                         PeerConnectionKind::Connected | PeerConnectionKind::Connecting
                     )
+                })
+                // Honor VideoQualityRequest { layer: None } — the peer asked us
+                // to stop sending video (e.g. their view of us is paused).
+                .filter(|p| {
+                    p.requested_video_layer.load(Ordering::Relaxed) != VideoLayerRequest::None.to_u8()
                 })
                 .map(|p| p.video_writer.clone())
                 .collect()
@@ -1983,6 +2154,25 @@ impl ConnectionManager {
                     peer.pending_keyframe.store(true, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    /// Ask every connected peer to send a keyframe — used when the local video
+    /// pipeline dropped frames (broadcast lag) and may have lost an IDR.
+    pub async fn request_keyframes_from_all_peers(&self) {
+        let peer_ids: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers.keys().cloned().collect()
+        };
+        for peer_id in peer_ids {
+            let _ = self
+                .send_control(
+                    &peer_id,
+                    &ControlAction::KeyframeRequest {
+                        layer: VideoLayerRequest::High,
+                    },
+                )
+                .await;
         }
     }
 
@@ -2214,8 +2404,8 @@ impl ConnectionManager {
             Self::cleanup_peer_internal(
                 &peer_id,
                 &self.peers,
+                &self.dm_peers,
                 &self.peer_tickets,
-                &self.audio_sequences,
                 &self.video_receive_state,
                 &self.event_tx,
                 Some(b"peer timeout"),
@@ -2312,6 +2502,19 @@ impl ConnectionManager {
             peer.outbound_bitrate_bps
                 .store(bitrate_bps, Ordering::Relaxed);
         }
+    }
+
+    /// Strictest (lowest) non-zero per-peer outbound bitrate override, or 0
+    /// when no peer has one. The video encoder is shared across peers, so the
+    /// most constrained peer dictates the encoding bitrate.
+    pub async fn min_peer_outbound_bitrate(&self) -> u32 {
+        let peers = self.peers.lock().await;
+        peers
+            .values()
+            .map(|p| p.outbound_bitrate_bps.load(Ordering::Relaxed))
+            .filter(|&bps| bps > 0)
+            .min()
+            .unwrap_or(0)
     }
 
     // ── DM connection management ────────────────────────────────────────
@@ -2449,12 +2652,15 @@ impl ConnectionManager {
             format!("timed out waiting for DM connection to peer {peer_id}"),
             async {
                 loop {
+                    // Arm the notification BEFORE checking the condition so a
+                    // state change between check and wait can't be missed.
+                    let notified = self.dm_connect_done.notified();
                     if self.dm_peer_connected(peer_id).await
                         || !self.dm_connect_in_progress(peer_id).await
                     {
                         return Ok(());
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    notified.await;
                 }
             },
         )
@@ -2535,14 +2741,6 @@ impl ConnectionManager {
         })
     }
 
-    /// Sends one DM frame after ensuring a connection exists, without reconnecting
-    /// or retrying after a write failure.
-    #[cfg(test)]
-    async fn send_dm_no_retry(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
-        self.ensure_dm_connected(peer_id).await?;
-        self.send_dm_frame_strict(peer_id, message).await
-    }
-
     pub async fn send_dm(&self, peer_id: &str, message: &DmMessage) -> Result<()> {
         self.ensure_dm_connected(peer_id).await?;
 
@@ -2597,8 +2795,8 @@ impl ConnectionManager {
         Self::cleanup_peer_internal(
             peer_id,
             &self.peers,
+            &self.dm_peers,
             &self.peer_tickets,
-            &self.audio_sequences,
             &self.video_receive_state,
             &self.event_tx,
             Some(b"call ended"),
@@ -2633,8 +2831,7 @@ mod tests {
     }
 
     fn test_public_key() -> iroh::PublicKey {
-        let mut rng = rand::rng();
-        SecretKey::generate(&mut rng).public()
+        SecretKey::generate().public()
     }
 
     fn serialize_endpoint_addr(addr: EndpointAddr) -> String {
@@ -2984,7 +3181,10 @@ mod tests {
             "foreign relay announce must not be cached"
         );
 
-        let endpoint = iroh::Endpoint::empty_builder().bind().await.unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
         let err = manager
             .connect_to_peer_with_ticket(&endpoint, &ticket)
             .await
@@ -3548,7 +3748,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_dm_no_retry_surfaces_unavailable_stream_without_reconnect() {
+    async fn send_dm_frame_strict_surfaces_unavailable_stream_without_reconnect() {
         let (event_tx_a, _) = broadcast::channel::<Event>(64);
         let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
         let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
@@ -3583,8 +3783,12 @@ mod tests {
         *stale_send.lock().await = None;
 
         let mut rx_a = event_tx_a.subscribe();
+        // Mid-transfer frame sends must NOT transparently reconnect: file
+        // receiver state is stream-local, so a chunk on a fresh stream would
+        // silently vanish. (ensure_dm_connected is the transfer-START repair
+        // path and is intentionally allowed to re-dial.)
         let err = mgr_b
-            .send_dm_no_retry(
+            .send_dm_frame_strict(
                 &endpoint_a.id().to_string(),
                 &DmMessage::FileChunk {
                     id: "strict-transfer".to_string(),
