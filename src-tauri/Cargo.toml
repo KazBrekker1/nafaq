@@ -12,9 +12,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-iroh = "0.98"
-iroh-gossip = "0.98"
-iroh-tickets = "0.5"
+iroh = "1.0.1"
+iroh-gossip = "0.101"
+iroh-tickets = "1"
 blake3 = "1"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
@@ -26,17 +26,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 opus = "0.3"
 openh264 = "0.9"
-noq-proto = "0.17"
+noq-proto = "1.0.1"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-os = "2"
 uuid = { version = "1", features = ["v4"] }
 serde_bytes = "0.11"
 rand = "0.9"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-shell = "2"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::messages::{DmMessage, Event};
-use crate::test_support::{wait_for_event, TestNode};
+use crate::test_support::{TestNode, wait_for_event};
 
 /// Phase-1 sanity: when two nodes track each other as contacts, both sides
 /// should see `PresenceChanged { online: true }` via gossip neighbor-up.
@@ -65,7 +65,6 @@ async fn presence_neighbor_up_within_60s_after_tracking_contact() {
 /// The five phases mirror the user-visible flow exactly.
 #[tokio::test]
 async fn dm_survives_peer_restart_with_persistent_identity() {
-
     // ── Phase 1: bring up both nodes ───────────────────────────────────
     let a = TestNode::new().await.expect("create A");
     let b = TestNode::new().await.expect("create B");
@@ -220,16 +219,6 @@ async fn bidirectional_dms_survive_b_restart() {
         )
         .await
         .unwrap();
-    b.mgr
-        .send_dm(
-            &a_id,
-            &DmMessage::Text {
-                content: "b_before".into(),
-                timestamp: 2,
-            },
-        )
-        .await
-        .unwrap();
     wait_for_event(&mut rx_b, Duration::from_secs(15), |e| {
         matches!(e,
             Event::DmReceived {
@@ -240,6 +229,16 @@ async fn bidirectional_dms_survive_b_restart() {
     })
     .await
     .expect("baseline a_before missing");
+    b.mgr
+        .send_dm(
+            &a_id,
+            &DmMessage::Text {
+                content: "b_before".into(),
+                timestamp: 2,
+            },
+        )
+        .await
+        .unwrap();
     wait_for_event(&mut rx_a, Duration::from_secs(15), |e| {
         matches!(e,
             Event::DmReceived {
@@ -276,6 +275,16 @@ async fn bidirectional_dms_survive_b_restart() {
         )
         .await
         .expect("A.send_dm post-restart");
+    wait_for_event(&mut rx_b_new, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "a_after"
+        )
+    })
+    .await
+    .expect("B' never received a_after");
     b_new
         .mgr
         .send_dm(
@@ -287,17 +296,6 @@ async fn bidirectional_dms_survive_b_restart() {
         )
         .await
         .expect("B'.send_dm post-restart");
-
-    wait_for_event(&mut rx_b_new, Duration::from_secs(30), |e| {
-        matches!(e,
-            Event::DmReceived {
-                peer_id,
-                message: DmMessage::Text { content, .. },
-            } if peer_id == &a_id && content == "a_after"
-        )
-    })
-    .await
-    .expect("B' never received a_after");
     wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
         matches!(e,
             Event::DmReceived {
@@ -398,6 +396,685 @@ async fn dm_survives_local_restart() {
     .expect("B never received the post-restart DM");
 
     a_new.shutdown_graceful().await;
+    b.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn simultaneous_first_dms_are_delivered_from_blank_state() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let mut rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online");
+
+    wait_for_event(&mut rx_b, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &a_id
+        )
+    })
+    .await
+    .expect("B never saw A online");
+
+    let (a_send, b_send) = tokio::join!(
+        async {
+            a.mgr
+                .send_dm(
+                    &b_id,
+                    &DmMessage::Text {
+                        content: "a_first".into(),
+                        timestamp: 1,
+                    },
+                )
+                .await
+        },
+        async {
+            b.mgr
+                .send_dm(
+                    &a_id,
+                    &DmMessage::Text {
+                        content: "b_first".into(),
+                        timestamp: 2,
+                    },
+                )
+                .await
+        },
+    );
+
+    a_send.expect("A first send failed");
+    b_send.expect("B first send failed");
+
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "a_first"
+        )
+    })
+    .await
+    .expect("B never received A's simultaneous first DM");
+
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "b_first"
+        )
+    })
+    .await
+    .expect("A never received B's simultaneous first DM");
+
+    a.shutdown_graceful().await;
+    b.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn multiple_sequential_dms_preserve_order_over_existing_dm_connection() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let mut rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online");
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "warmup".into(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .expect("A warmup send failed");
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "warmup"
+        )
+    })
+    .await
+    .expect("B never received warmup DM");
+    assert!(a.mgr.dm_peer_connected(&b_id).await);
+    assert!(b.mgr.dm_peer_connected(&a_id).await);
+
+    for (content, timestamp) in [("first", 2), ("second", 3), ("third", 4)] {
+        a.mgr
+            .send_dm(
+                &b_id,
+                &DmMessage::Text {
+                    content: content.into(),
+                    timestamp,
+                },
+            )
+            .await
+            .expect("A sequential send failed");
+        wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+            matches!(e,
+                Event::DmReceived {
+                    peer_id,
+                    message: DmMessage::Text { content: received, .. },
+                } if peer_id == &a_id && received == content
+            )
+        })
+        .await
+        .unwrap_or_else(|| panic!("B never received {content} in order"));
+    }
+
+    b.mgr
+        .send_dm(
+            &a_id,
+            &DmMessage::Text {
+                content: "ack".into(),
+                timestamp: 5,
+            },
+        )
+        .await
+        .expect("B ack send failed");
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "ack"
+        )
+    })
+    .await
+    .expect("A never received B ack");
+
+    a.shutdown_graceful().await;
+    b.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn simultaneous_first_dm_burst_continues_after_duplicate_resolution() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let mut rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online");
+    wait_for_event(&mut rx_b, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &a_id
+        )
+    })
+    .await
+    .expect("B never saw A online");
+
+    let (a_first, b_first) = tokio::join!(
+        async {
+            a.mgr
+                .send_dm(
+                    &b_id,
+                    &DmMessage::Text {
+                        content: "a_first_burst".into(),
+                        timestamp: 1,
+                    },
+                )
+                .await
+        },
+        async {
+            b.mgr
+                .send_dm(
+                    &a_id,
+                    &DmMessage::Text {
+                        content: "b_first_burst".into(),
+                        timestamp: 2,
+                    },
+                )
+                .await
+        },
+    );
+    a_first.expect("A first burst send failed");
+    b_first.expect("B first burst send failed");
+
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "a_first_burst"
+        )
+    })
+    .await
+    .expect("B never received A's first burst DM");
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "b_first_burst"
+        )
+    })
+    .await
+    .expect("A never received B's first burst DM");
+
+    let (a_follow_up, b_follow_up) = tokio::join!(
+        async {
+            a.mgr
+                .send_dm(
+                    &b_id,
+                    &DmMessage::Text {
+                        content: "a_follow_up".into(),
+                        timestamp: 3,
+                    },
+                )
+                .await
+        },
+        async {
+            b.mgr
+                .send_dm(
+                    &a_id,
+                    &DmMessage::Text {
+                        content: "b_follow_up".into(),
+                        timestamp: 4,
+                    },
+                )
+                .await
+        },
+    );
+    a_follow_up.expect("A follow-up send failed");
+    b_follow_up.expect("B follow-up send failed");
+
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "a_follow_up"
+        )
+    })
+    .await
+    .expect("B never received A's follow-up DM");
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "b_follow_up"
+        )
+    })
+    .await
+    .expect("A never received B's follow-up DM");
+    assert!(a.mgr.dm_peer_connected(&b_id).await);
+    assert!(b.mgr.dm_peer_connected(&a_id).await);
+
+    a.shutdown_graceful().await;
+    b.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn peer_restart_emits_presence_cycle_and_dms_resume() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+    let b_secret = b.secret_key.clone();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online before restart");
+
+    drop(rx_b);
+    b.shutdown_graceful().await;
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: false } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B offline after shutdown");
+
+    let b_new = TestNode::with_key(b_secret).await.expect("re-create B");
+    assert_eq!(b_new.node_id_str(), b_id);
+    let mut rx_b_new = b_new.event_tx.subscribe();
+    b_new.presence.track_contact(&a_id).await.unwrap();
+
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online after restart");
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "a_after_presence_cycle".into(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .expect("A post-cycle send failed");
+    wait_for_event(&mut rx_b_new, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "a_after_presence_cycle"
+        )
+    })
+    .await
+    .expect("B' never received A's post-cycle DM");
+
+    b_new
+        .mgr
+        .send_dm(
+            &a_id,
+            &DmMessage::Text {
+                content: "b_after_presence_cycle".into(),
+                timestamp: 2,
+            },
+        )
+        .await
+        .expect("B post-cycle send failed");
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "b_after_presence_cycle"
+        )
+    })
+    .await
+    .expect("A never received B's post-cycle DM");
+
+    a.shutdown_graceful().await;
+    b_new.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn failed_dm_while_peer_offline_recovers_after_rejoin() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+    let b_secret = b.secret_key.clone();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online before offline send test");
+
+    drop(rx_b);
+    b.shutdown_graceful().await;
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: false } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B offline before failed send");
+
+    let offline_send = a
+        .mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "sent_while_offline".into(),
+                timestamp: 1,
+            },
+        )
+        .await;
+    assert!(
+        offline_send.is_err(),
+        "DM send should fail while the peer is offline"
+    );
+    assert!(
+        !a.mgr.dm_peer_connected(&b_id).await,
+        "failed offline DM must not leave a stale connected DM entry"
+    );
+
+    let b_new = TestNode::with_key(b_secret).await.expect("re-create B");
+    assert_eq!(b_new.node_id_str(), b_id);
+    let mut rx_b_new = b_new.event_tx.subscribe();
+    b_new.presence.track_contact(&a_id).await.unwrap();
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online after failed-send rejoin");
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "sent_after_rejoin".into(),
+                timestamp: 2,
+            },
+        )
+        .await
+        .expect("A send after B rejoined failed");
+    wait_for_event(&mut rx_b_new, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "sent_after_rejoin"
+        )
+    })
+    .await
+    .expect("B' never received DM after failed-send recovery");
+
+    a.shutdown_graceful().await;
+    b_new.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn untracking_contact_during_active_dm_keeps_dm_usable() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let mut rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online before active DM untrack");
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "before_untrack".into(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .expect("A initial DM failed");
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "before_untrack"
+        )
+    })
+    .await
+    .expect("B never received initial DM before untrack");
+    assert!(a.mgr.dm_peer_connected(&b_id).await);
+    assert!(b.mgr.dm_peer_connected(&a_id).await);
+
+    a.presence.untrack_contact(&b_id).await;
+    wait_for_event(&mut rx_a, Duration::from_secs(2), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: false } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A did not emit offline event after active DM untrack");
+    assert!(
+        !a.presence.snapshot().await.contains_key(&b_id),
+        "untracked contact should be absent from A's presence snapshot"
+    );
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "after_untrack".into(),
+                timestamp: 2,
+            },
+        )
+        .await
+        .expect("A DM after untrack failed");
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "after_untrack"
+        )
+    })
+    .await
+    .expect("B never received DM after A untracked contact");
+
+    b.mgr
+        .send_dm(
+            &a_id,
+            &DmMessage::Text {
+                content: "reply_after_untrack".into(),
+                timestamp: 3,
+            },
+        )
+        .await
+        .expect("B reply after A untrack failed");
+    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &b_id && content == "reply_after_untrack"
+        )
+    })
+    .await
+    .expect("A never received reply after untracking contact");
+
+    a.shutdown_graceful().await;
+    b.shutdown_graceful().await;
+}
+
+#[tokio::test]
+async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
+    let a = TestNode::new().await.expect("create A");
+    let b = TestNode::new().await.expect("create B");
+    let a_id = a.node_id_str();
+    let b_id = b.node_id_str();
+
+    let mut rx_a = a.event_tx.subscribe();
+    let mut rx_b = b.event_tx.subscribe();
+
+    a.presence.track_contact(&b_id).await.unwrap();
+    b.presence.track_contact(&a_id).await.unwrap();
+    wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
+        matches!(e,
+            Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
+        )
+    })
+    .await
+    .expect("A never saw B online before interrupted transfer");
+
+    let file_id = "interrupted-large-transfer".to_string();
+    let chunk = vec![7u8; 128 * 1024];
+    a.mgr
+        .ensure_dm_connected(&b_id)
+        .await
+        .expect("A could not establish DM before interrupted transfer");
+    a.mgr
+        .send_dm_frame_strict(
+            &b_id,
+            &DmMessage::FileStart {
+                name: "interrupted.bin".into(),
+                size: (chunk.len() * 2) as u64,
+                id: file_id.clone(),
+            },
+        )
+        .await
+        .expect("FileStart send failed");
+    a.mgr
+        .send_dm_frame_strict(
+            &b_id,
+            &DmMessage::FileChunk {
+                id: file_id.clone(),
+                offset: 0,
+                data: chunk,
+            },
+        )
+        .await
+        .expect("FileChunk send failed");
+
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmFileProgress { peer_id, file_id: seen_id, received }
+                if peer_id == &a_id && seen_id == &file_id && *received == 128 * 1024
+        )
+    })
+    .await
+    .expect("B never observed partial file progress before interruption");
+
+    a.mgr.disconnect_dm(&b_id).await;
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmFileTransferFailed { peer_id, file_id: seen_id }
+                if peer_id == &a_id && seen_id == &file_id
+        )
+    })
+    .await
+    .expect("B never emitted file-transfer failure after interrupted DM stream");
+
+    a.mgr
+        .send_dm(
+            &b_id,
+            &DmMessage::Text {
+                content: "after_interrupted_file".into(),
+                timestamp: 1,
+            },
+        )
+        .await
+        .expect("A text DM after interrupted file transfer failed");
+    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
+        matches!(e,
+            Event::DmReceived {
+                peer_id,
+                message: DmMessage::Text { content, .. },
+            } if peer_id == &a_id && content == "after_interrupted_file"
+        )
+    })
+    .await
+    .expect("B never received text DM after interrupted file transfer");
+
+    a.shutdown_graceful().await;
     b.shutdown_graceful().await;
 }
 

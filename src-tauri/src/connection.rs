@@ -1,16 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::{
-    endpoint::{Connection, PathId, RecvStream, SendStream},
-    Watcher,
-};
-use tokio::sync::{broadcast, Mutex, Notify};
+use iroh::endpoint::{Connection, PathId, RecvStream, SendStream};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 #[derive(Clone)]
 struct PendingVideoFrame {
@@ -52,13 +49,13 @@ impl PeerVideoWriter {
 
 use crate::codec::is_keyframe;
 use crate::messages::{
-    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, PeerConnectionKind,
-    VideoLayerRequest, VideoPacket, STREAM_AUDIO, STREAM_CHAT, STREAM_CONTROL, STREAM_DM,
-    STREAM_VIDEO,
+    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, PeerConnectionKind, STREAM_AUDIO,
+    STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO, VideoLayerRequest, VideoPacket,
 };
 
 const CALL_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 pub(crate) const DM_DIAL_TIMEOUT: Duration = Duration::from_secs(12);
+const DM_DUPLICATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 const DM_CONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(21);
@@ -151,11 +148,7 @@ fn is_valid_transfer_id(id: &str) -> bool {
 /// a join — strip directories, control chars, and leading dots.
 fn sanitize_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let cleaned: String = base
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect();
+    let cleaned: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
     let trimmed = cleaned.trim_start_matches(['.', ' ']).trim_end();
     if trimmed.is_empty() {
         "download".to_string()
@@ -253,9 +246,7 @@ async fn handle_dm_file_message(
                 .get(id)
                 .is_some_and(|recv| offset.saturating_add(data.len() as u64) > recv.expected_size);
             if over_declared {
-                tracing::warn!(
-                    "FileChunk for {id} exceeds declared size; dropping transfer"
-                );
+                tracing::warn!("FileChunk for {id} exceeds declared size; dropping transfer");
                 if let Some(recv) = active_files.remove(id) {
                     drop(recv.file);
                     let _ = tokio::fs::remove_file(&recv.temp_path).await;
@@ -357,44 +348,38 @@ async fn handle_dm_file_message(
     }
 }
 
-/// Shared DM stream reader loop — reads framed messages, handles files,
-/// emits events. Used by both connect_dm and setup_dm_connection.
-async fn run_dm_reader(
-    recv: &mut iroh::endpoint::RecvStream,
+async fn handle_dm_frame_payload(
+    data: &[u8],
+    peer_id: &str,
+    active_files: &mut HashMap<String, ActiveFileReceive>,
+    event_tx: &broadcast::Sender<Event>,
+) {
+    if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(data) {
+        if matches!(dm_msg, DmMessage::Heartbeat) {
+            return;
+        }
+        if let DmMessage::CallInvite { ref ticket } = dm_msg {
+            let _ = event_tx.send(Event::CallInviteReceived {
+                peer_id: peer_id.to_string(),
+                ticket: ticket.clone(),
+            });
+            return;
+        }
+        let skip_dm_event = handle_dm_file_message(&dm_msg, peer_id, active_files, event_tx).await;
+        if !skip_dm_event {
+            let _ = event_tx.send(Event::DmReceived {
+                peer_id: peer_id.to_string(),
+                message: dm_msg,
+            });
+        }
+    }
+}
+
+async fn cleanup_active_dm_files(
+    active_files: HashMap<String, ActiveFileReceive>,
     peer_id: &str,
     event_tx: &broadcast::Sender<Event>,
 ) {
-    let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
-    loop {
-        match crate::messages::read_framed(recv).await {
-            Ok(Some(data)) => {
-                if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(&data) {
-                    if matches!(dm_msg, DmMessage::Heartbeat) {
-                        continue;
-                    }
-                    if let DmMessage::CallInvite { ref ticket } = dm_msg {
-                        let _ = event_tx.send(Event::CallInviteReceived {
-                            peer_id: peer_id.to_string(),
-                            ticket: ticket.clone(),
-                        });
-                        // Handled as a call invite — don't also emit it as a
-                        // generic DmReceived (it carries no chat content).
-                        continue;
-                    }
-                    let skip_dm_event =
-                        handle_dm_file_message(&dm_msg, peer_id, &mut active_files, event_tx).await;
-                    if !skip_dm_event {
-                        let _ = event_tx.send(Event::DmReceived {
-                            peer_id: peer_id.to_string(),
-                            message: dm_msg,
-                        });
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
     for (id, recv) in active_files {
         tracing::debug!("Cleaning up incomplete file transfer {id}");
         drop(recv.file);
@@ -406,6 +391,52 @@ async fn run_dm_reader(
             file_id: id,
         });
     }
+}
+
+async fn drain_duplicate_dm_frame_once(
+    recv: &mut iroh::endpoint::RecvStream,
+    peer_id: &str,
+    event_tx: &broadcast::Sender<Event>,
+) {
+    let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+    match tokio::time::timeout(
+        DM_DUPLICATE_DRAIN_TIMEOUT,
+        crate::messages::read_framed(recv),
+    )
+    .await
+    {
+        Ok(Ok(Some(data))) => {
+            handle_dm_frame_payload(&data, peer_id, &mut active_files, event_tx).await;
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!("Duplicate DM drain read failed for {peer_id}: {error}");
+        }
+        Err(_) => {
+            tracing::debug!("Duplicate DM drain timed out for {peer_id}");
+        }
+    }
+    cleanup_active_dm_files(active_files, peer_id, event_tx).await;
+}
+
+/// Shared DM stream reader loop — reads framed messages, handles files,
+/// emits events. Used by both connect_dm and setup_dm_connection.
+async fn run_dm_reader(
+    recv: &mut iroh::endpoint::RecvStream,
+    peer_id: &str,
+    event_tx: &broadcast::Sender<Event>,
+) {
+    let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+    loop {
+        match crate::messages::read_framed(recv).await {
+            Ok(Some(data)) => {
+                handle_dm_frame_payload(&data, peer_id, &mut active_files, event_tx).await;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    cleanup_active_dm_files(active_files, peer_id, event_tx).await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +514,20 @@ enum DmConnectionOwnership {
     SharedCall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmConnectionHandling {
+    Store,
+    DrainDuplicate,
+    CloseDuplicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DmStreamRegistration {
+    Stored,
+    DrainDuplicate,
+    CloseDuplicate,
+}
+
 struct DmPeerConnection {
     connection: Connection,
     direction: ConnectionDirection,
@@ -495,6 +540,13 @@ impl DmPeerConnection {
     fn close_if_owned(&self, reason: &'static [u8]) {
         if self.ownership == DmConnectionOwnership::Dedicated {
             self.connection.close(0u32.into(), reason);
+        }
+    }
+
+    async fn finish_send_stream(&self) {
+        let mut guard = self.dm_send.lock().await;
+        if let Some(mut send) = guard.take() {
+            let _ = send.finish();
         }
     }
 }
@@ -664,7 +716,10 @@ impl ConnectionManager {
     async fn peer_recently_rejoined_gossip(&self, peer_id: &str) -> bool {
         let presence = self.presence.lock().await.clone();
         match presence {
-            Some(p) => p.is_recent_neighbor(peer_id, DM_RECENT_NEIGHBOR_WINDOW).await,
+            Some(p) => {
+                p.is_recent_neighbor(peer_id, DM_RECENT_NEIGHBOR_WINDOW)
+                    .await
+            }
             None => false,
         }
     }
@@ -682,7 +737,9 @@ impl ConnectionManager {
             return false;
         };
         let presence = self.presence.lock().await.clone();
-        let Some(presence) = presence else { return false; };
+        let Some(presence) = presence else {
+            return false;
+        };
         match presence.last_neighbor_up(peer_id).await {
             Some(up_at) => up_at > established_at,
             None => false,
@@ -898,11 +955,11 @@ impl ConnectionManager {
         )
     }
 
-    async fn should_accept_dm_connection(
+    async fn dm_connection_handling(
         &self,
         peer_id: &str,
         direction: ConnectionDirection,
-    ) -> bool {
+    ) -> DmConnectionHandling {
         let local_node_id = self.local_node_id().await;
 
         let probe = {
@@ -917,7 +974,7 @@ impl ConnectionManager {
         };
 
         let Some((conn_closed, dm_send, existing_direction)) = probe else {
-            return true;
+            return DmConnectionHandling::Store;
         };
 
         // The closed() cleanup task may not have fired yet; treat a dead
@@ -931,24 +988,14 @@ impl ConnectionManager {
                 None,
             )
             .await;
-            return true;
+            return DmConnectionHandling::Store;
         }
 
-        // Gossip presence reported this peer as freshly online within the recent
-        // window — strong signal the remote restarted and its old QUIC connection
-        // is dead on its side but iroh's idle timeout hasn't fired here yet.
-        // Prefer the new inbound and evict the stale entry without falling
-        // through to the lexicographic tiebreak.
-        // Evict the stale entry and accept the new inbound when gossip says the
-        // peer is freshly reachable. Two complementary triggers:
-        //  - recent NeighborUp within the short window (covers normal setup), or
-        //  - any NeighborUp newer than the existing entry, unbounded (covers a
-        //    slow-relay reconnect that lands after the 10s window but is still a
-        //    genuine restart — the case the bounded window alone wrongly rejected
-        //    because it was shorter than QUIC's 30s idle timeout).
+        // NeighborUp is stale-DM evidence only when it is newer than the stored
+        // entry. Initial blank-state presence is also recent, so it must not
+        // bypass crossed-dial arbitration.
         if matches!(direction, ConnectionDirection::Inbound)
-            && (self.peer_recently_rejoined_gossip(peer_id).await
-                || self.dm_entry_predates_recent_rejoin(peer_id).await)
+            && self.dm_entry_predates_recent_rejoin(peer_id).await
         {
             Self::cleanup_dm_internal(
                 peer_id,
@@ -958,7 +1005,7 @@ impl ConnectionManager {
                 None,
             )
             .await;
-            return true;
+            return DmConnectionHandling::Store;
         }
 
         // Same-direction duplicate: not the crossed-dial race (that pairs one
@@ -975,12 +1022,18 @@ impl ConnectionManager {
                 None,
             )
             .await;
-            return true;
+            return DmConnectionHandling::Store;
         }
 
-        local_node_id.is_some_and(|local_id| {
-            should_replace_connection(&local_id, peer_id, existing_direction, direction)
-        })
+        match local_node_id.as_deref() {
+            Some(local_id)
+                if should_replace_connection(local_id, peer_id, existing_direction, direction) =>
+            {
+                DmConnectionHandling::Store
+            }
+            Some(_) => DmConnectionHandling::DrainDuplicate,
+            None => DmConnectionHandling::CloseDuplicate,
+        }
     }
 
     async fn store_dm_peer_connection(
@@ -989,7 +1042,7 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
         dm_send: SendStream,
-    ) -> bool {
+    ) -> DmStreamRegistration {
         self.store_dm_peer_connection_with_ownership(
             peer_id,
             connection,
@@ -1006,7 +1059,7 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
         dm_send: SendStream,
-    ) -> bool {
+    ) -> DmStreamRegistration {
         self.store_dm_peer_connection_with_ownership(
             peer_id,
             connection,
@@ -1024,7 +1077,7 @@ impl ConnectionManager {
         direction: ConnectionDirection,
         dm_send: SendStream,
         ownership: DmConnectionOwnership,
-    ) -> bool {
+    ) -> DmStreamRegistration {
         let dm_send = Arc::new(Mutex::new(Some(dm_send)));
         let dm_peer = DmPeerConnection {
             connection: connection.clone(),
@@ -1034,12 +1087,21 @@ impl ConnectionManager {
             established_at: std::time::Instant::now(),
         };
 
+        let mut close_replaced_connection = true;
+        let mut close_ignored_candidate = true;
+
         let old_dm_peer = {
             let local_node_id = self.local_node_id().await;
             let mut dm_peers = self.dm_peers.lock().await;
             let should_insert = match dm_peers.get(peer_id) {
                 None => true,
                 Some(existing) if existing.connection.stable_id() == connection.stable_id() => {
+                    if ownership == DmConnectionOwnership::SharedCall {
+                        return DmStreamRegistration::CloseDuplicate;
+                    }
+                    if existing.dm_send.lock().await.is_some() {
+                        return DmStreamRegistration::DrainDuplicate;
+                    }
                     // Same underlying QUIC connection re-presented its DM stream.
                     // Swap the new SendStream in while STILL holding dm_peers, so
                     // a concurrent cleanup_dm_internal can't remove the entry
@@ -1053,15 +1115,30 @@ impl ConnectionManager {
                     let new_send = dm_send.lock().await.take();
                     *existing.dm_send.lock().await = new_send;
                     self.dm_connect_done.notify_waiters();
-                    return true;
+                    return DmStreamRegistration::Stored;
                 }
                 // Same-direction duplicate: the initiator re-dialed, which only
                 // happens once it considers the old connection dead — replace
-                // rather than reject (see should_accept_dm_connection).
+                // rather than reject (see dm_connection_handling).
                 Some(existing) if existing.direction == direction => true,
-                Some(existing) => local_node_id.as_ref().is_some_and(|local_id| {
-                    should_replace_connection(local_id, peer_id, existing.direction, direction)
-                }),
+                Some(existing) => match local_node_id.as_ref() {
+                    Some(local_id)
+                        if should_replace_connection(
+                            local_id,
+                            peer_id,
+                            existing.direction,
+                            direction,
+                        ) =>
+                    {
+                        close_replaced_connection = false;
+                        true
+                    }
+                    Some(_) => {
+                        close_ignored_candidate = false;
+                        false
+                    }
+                    None => false,
+                },
             };
 
             if !should_insert {
@@ -1069,22 +1146,32 @@ impl ConnectionManager {
                 tracing::info!(
                     "Ignoring duplicate {direction:?} DM stream for peer {peer_id}; existing connection wins"
                 );
-                dm_peer.close_if_owned(b"duplicate_dm_connection");
-                return false;
+                if close_ignored_candidate {
+                    dm_peer.close_if_owned(b"duplicate_dm_connection");
+                    return DmStreamRegistration::CloseDuplicate;
+                }
+                return match ownership {
+                    DmConnectionOwnership::Dedicated => DmStreamRegistration::DrainDuplicate,
+                    DmConnectionOwnership::SharedCall => DmStreamRegistration::CloseDuplicate,
+                };
             }
 
             dm_peers.insert(peer_id.to_string(), dm_peer)
         };
 
         if let Some(old_dm_peer) = old_dm_peer {
-            old_dm_peer.close_if_owned(b"replaced_dm_connection");
+            if close_replaced_connection {
+                old_dm_peer.close_if_owned(b"replaced_dm_connection");
+            } else {
+                old_dm_peer.finish_send_stream().await;
+            }
         }
 
         let _ = self.event_tx.send(Event::DmConnected {
             peer_id: peer_id.to_string(),
         });
         self.dm_connect_done.notify_waiters();
-        true
+        DmStreamRegistration::Stored
     }
 
     async fn cleanup_dm_internal(
@@ -1250,12 +1337,51 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
     ) -> Result<()> {
-        if !self.should_accept_dm_connection(&peer_id, direction).await {
-            tracing::info!(
-                "Closing duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
-            );
-            connection.close(0u32.into(), b"duplicate_dm_connection");
-            return Ok(());
+        let connection_handling = self.dm_connection_handling(&peer_id, direction).await;
+        match connection_handling {
+            DmConnectionHandling::Store => {}
+            DmConnectionHandling::DrainDuplicate => {
+                tracing::info!(
+                    "Draining duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
+                );
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    match tokio::time::timeout(DM_DUPLICATE_DRAIN_TIMEOUT, connection.accept_bi())
+                        .await
+                    {
+                        Ok(Ok((_send, mut recv))) => {
+                            let mut type_buf = [0u8; 1];
+                            let typed = tokio::time::timeout(
+                                DM_DUPLICATE_DRAIN_TIMEOUT,
+                                recv.read_exact(&mut type_buf),
+                            )
+                            .await;
+                            if matches!(typed, Ok(Ok(_))) && type_buf[0] == STREAM_DM {
+                                drain_duplicate_dm_frame_once(&mut recv, &peer_id, &event_tx).await;
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                "Duplicate DM connection drain accept failed for {peer_id}: {error}"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "Duplicate DM connection drain accept timed out for {peer_id}"
+                            );
+                        }
+                    }
+                    connection.close(0u32.into(), b"duplicate_dm_drained");
+                });
+                return Ok(());
+            }
+            DmConnectionHandling::CloseDuplicate => {
+                tracing::info!(
+                    "Closing duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
+                );
+                connection.close(0u32.into(), b"duplicate_dm_connection");
+                return Ok(());
+            }
         }
 
         let manager = self.clone();
@@ -1263,7 +1389,6 @@ impl ConnectionManager {
         let peer_id_reader = peer_id.clone();
         let connection_reader = connection.clone();
         let connection_reader_id = connection_reader.stable_id();
-
         // Spawn bi-stream reader for incoming DM streams
         tokio::spawn(async move {
             loop {
@@ -1274,24 +1399,44 @@ impl ConnectionManager {
                             continue;
                         }
                         if type_buf[0] == STREAM_DM {
-                            let inserted = manager
-                                .store_dm_peer_connection(
-                                    &peer_id_reader,
-                                    connection_reader.clone(),
-                                    direction,
-                                    send,
-                                )
-                                .await;
-                            if !inserted {
-                                break;
+                            let registration = match connection_handling {
+                                DmConnectionHandling::Store => {
+                                    manager
+                                        .store_dm_peer_connection(
+                                            &peer_id_reader,
+                                            connection_reader.clone(),
+                                            direction,
+                                            send,
+                                        )
+                                        .await
+                                }
+                                DmConnectionHandling::DrainDuplicate => {
+                                    DmStreamRegistration::DrainDuplicate
+                                }
+                                DmConnectionHandling::CloseDuplicate => {
+                                    DmStreamRegistration::CloseDuplicate
+                                }
+                            };
+                            match registration {
+                                DmStreamRegistration::Stored => {
+                                    let event_tx = event_tx.clone();
+                                    let peer_id = peer_id_reader.clone();
+                                    tokio::spawn(async move {
+                                        run_dm_reader(&mut recv, &peer_id, &event_tx).await;
+                                    });
+                                }
+                                DmStreamRegistration::DrainDuplicate => {
+                                    drain_duplicate_dm_frame_once(
+                                        &mut recv,
+                                        &peer_id_reader,
+                                        &event_tx,
+                                    )
+                                    .await;
+                                    connection_reader.close(0u32.into(), b"duplicate_dm_drained");
+                                    break;
+                                }
+                                DmStreamRegistration::CloseDuplicate => break,
                             }
-
-                            // Spawn reader for this DM stream
-                            let event_tx = event_tx.clone();
-                            let peer_id = peer_id_reader.clone();
-                            tokio::spawn(async move {
-                                run_dm_reader(&mut recv, &peer_id, &event_tx).await;
-                            });
                         }
                         // Ignore non-DM streams on a DM connection
                     }
@@ -1583,14 +1728,8 @@ impl ConnectionManager {
             })
         };
         if shared_dm_dead {
-            Self::cleanup_dm_internal(
-                peer_id,
-                dm_peers,
-                event_tx,
-                None,
-                Some(dead_connection_id),
-            )
-            .await;
+            Self::cleanup_dm_internal(peer_id, dm_peers, event_tx, None, Some(dead_connection_id))
+                .await;
         }
 
         let _ = event_tx.send(Event::PeerDisconnected {
@@ -1839,7 +1978,7 @@ impl ConnectionManager {
                         // can reply, and emit DmConnected if this is a new
                         // DM peer.
                         if type_buf[0] == STREAM_DM {
-                            let inserted = manager_bi
+                            let registration = manager_bi
                                 .register_dm_stream_on_call_connection(
                                     &peer_id,
                                     connection_bi.clone(),
@@ -1847,8 +1986,14 @@ impl ConnectionManager {
                                     send,
                                 )
                                 .await;
-                            if !inserted {
-                                continue;
+                            match registration {
+                                DmStreamRegistration::Stored => {}
+                                DmStreamRegistration::DrainDuplicate => {
+                                    drain_duplicate_dm_frame_once(&mut recv, &peer_id, &event_tx)
+                                        .await;
+                                    continue;
+                                }
+                                DmStreamRegistration::CloseDuplicate => continue,
                             }
                         }
                         tokio::spawn(async move {
@@ -1984,11 +2129,9 @@ impl ConnectionManager {
                             // is exhausted or the connection is half-open, open_uni
                             // blocks until QUIC's 30s idle timeout — freezing video
                             // for the whole window. Drop the (stale) frame instead.
-                            let opened = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                connection.open_uni(),
-                            )
-                            .await;
+                            let opened =
+                                tokio::time::timeout(Duration::from_secs(5), connection.open_uni())
+                                    .await;
                             match opened {
                                 Ok(Ok(mut stream)) => {
                                     if stream.write_all(&[STREAM_VIDEO]).await.is_ok() {
@@ -2016,11 +2159,7 @@ impl ConnectionManager {
                         }
 
                         let result = if let Some(stream) = send.as_mut() {
-                            let _ = stream.set_priority(if frame.is_keyframe {
-                                50
-                            } else {
-                                30
-                            });
+                            let _ = stream.set_priority(if frame.is_keyframe { 50 } else { 30 });
                             crate::messages::write_framed(stream, &payload).await
                         } else {
                             break;
@@ -2110,7 +2249,8 @@ impl ConnectionManager {
                 // Honor VideoQualityRequest { layer: None } — the peer asked us
                 // to stop sending video (e.g. their view of us is paused).
                 .filter(|p| {
-                    p.requested_video_layer.load(Ordering::Relaxed) != VideoLayerRequest::None.to_u8()
+                    p.requested_video_layer.load(Ordering::Relaxed)
+                        != VideoLayerRequest::None.to_u8()
                 })
                 .map(|p| p.video_writer.clone())
                 .collect()
@@ -2444,9 +2584,7 @@ impl ConnectionManager {
             let video_state = self.video_receive_state.lock().await;
             video_state
                 .iter()
-                .map(|(id, state)| {
-                    (id.clone(), state.last_received.elapsed().as_millis() as u64)
-                })
+                .map(|(id, state)| (id.clone(), state.last_received.elapsed().as_millis() as u64))
                 .collect()
         };
 
@@ -2455,14 +2593,12 @@ impl ConnectionManager {
         peers
             .iter()
             .map(|(peer_id, peer)| {
-                let mut paths = peer.connection.paths();
-                let _ = paths.update();
-                let path_list = paths.peek().clone();
-                let path_stats = path_list
+                let paths = peer.connection.paths();
+                let path_stats = paths
                     .iter()
-                    .find(|path| path.is_selected() && !path.is_closed())
-                    .or_else(|| path_list.iter().find(|path| !path.is_closed()))
-                    .and_then(|path| path.stats());
+                    .find(|path| path.is_selected())
+                    .or_else(|| paths.iter().next())
+                    .map(|path| path.stats());
 
                 let rtt_ms = path_stats
                     .map(|path| path.rtt.as_millis() as u64)
@@ -2557,16 +2693,25 @@ impl ConnectionManager {
             let (dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) =
                 open_typed_bi_stream(&connection, STREAM_DM, "DM").await?;
 
-            if !self
+            let registration = self
                 .store_dm_peer_connection(
                     &peer_id,
                     connection.clone(),
                     ConnectionDirection::Outbound,
                     dm_send,
                 )
-                .await
-            {
-                return Ok(());
+                .await;
+            match registration {
+                DmStreamRegistration::Stored => {}
+                DmStreamRegistration::DrainDuplicate => {
+                    drain_duplicate_dm_frame_once(&mut dm_recv, &peer_id, &self.event_tx).await;
+                    connection.close(0u32.into(), b"duplicate_dm_drained");
+                    return Ok(());
+                }
+                DmStreamRegistration::CloseDuplicate => {
+                    connection.close(0u32.into(), b"duplicate_dm_connection");
+                    return Ok(());
+                }
             }
 
             // Spawn a reader for the initial bistream's recv side so the remote
@@ -2596,11 +2741,10 @@ impl ConnectionManager {
                             if type_buf[0] != STREAM_DM {
                                 continue;
                             }
-                            let event_tx = event_tx.clone();
-                            let peer_id = peer_id_reader.clone();
-                            tokio::spawn(async move {
-                                run_dm_reader(&mut recv, &peer_id, &event_tx).await;
-                            });
+                            drain_duplicate_dm_frame_once(&mut recv, &peer_id_reader, &event_tx)
+                                .await;
+                            connection_reader.close(0u32.into(), b"duplicate_dm_drained");
+                            break;
                         }
                         Err(_) => break,
                     }
@@ -2815,8 +2959,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::{endpoint::Connection, protocol::Router, EndpointAddr, SecretKey, TransportAddr};
-    use iroh_tickets::{endpoint::EndpointTicket, Ticket};
+    use iroh::{EndpointAddr, SecretKey, TransportAddr, endpoint::Connection, protocol::Router};
+    use iroh_tickets::{Ticket, endpoint::EndpointTicket};
     use tokio::time::timeout;
 
     use crate::node;
@@ -2835,7 +2979,24 @@ mod tests {
     }
 
     fn serialize_endpoint_addr(addr: EndpointAddr) -> String {
-        EndpointTicket::new(addr).serialize()
+        EndpointTicket::new(addr).encode_string()
+    }
+
+    async fn wait_for_relay_addr(endpoint: &iroh::Endpoint) -> EndpointAddr {
+        timeout(Duration::from_secs(60), async {
+            loop {
+                let mut addr = endpoint.addr();
+                addr.addrs
+                    .retain(|transport_addr| transport_addr.is_relay());
+                if !addr.addrs.is_empty() {
+                    return addr;
+                }
+                let _ = tokio::time::timeout(Duration::from_millis(250), endpoint.online()).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("endpoint did not publish a relay address")
     }
 
     async fn set_peer_liveness(
@@ -2993,17 +3154,21 @@ mod tests {
             .reserve_call_connecting_guard("peer-a")
             .await
             .expect("first reservation should succeed");
-        assert!(manager
-            .reserve_call_connecting_guard("peer-a")
-            .await
-            .is_none());
+        assert!(
+            manager
+                .reserve_call_connecting_guard("peer-a")
+                .await
+                .is_none()
+        );
 
         drop(guard);
 
-        assert!(manager
-            .reserve_call_connecting_guard("peer-a")
-            .await
-            .is_some());
+        assert!(
+            manager
+                .reserve_call_connecting_guard("peer-a")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3017,17 +3182,21 @@ mod tests {
             .reserve_dm_connecting_guard("peer-a")
             .await
             .expect("first reservation should succeed");
-        assert!(manager
-            .reserve_dm_connecting_guard("peer-a")
-            .await
-            .is_none());
+        assert!(
+            manager
+                .reserve_dm_connecting_guard("peer-a")
+                .await
+                .is_none()
+        );
 
         drop(guard);
 
-        assert!(manager
-            .reserve_dm_connecting_guard("peer-a")
-            .await
-            .is_some());
+        assert!(
+            manager
+                .reserve_dm_connecting_guard("peer-a")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3194,6 +3363,63 @@ mod tests {
             !manager.peer_tickets.lock().await.contains_key(&peer_id),
             "foreign relay join ticket must not be cached"
         );
+        endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_or_foreign_ticket_replay_does_not_replace_trusted_cache() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        let trusted_addr = EndpointAddr::from_parts(
+            test_public_key(),
+            [TransportAddr::Relay(node::RELAY_URL_PARSED.clone())],
+        );
+        let peer_id = trusted_addr.id.to_string();
+        let trusted_ticket = serialize_endpoint_addr(trusted_addr);
+        assert!(manager.upsert_peer_ticket(&peer_id, &trusted_ticket).await);
+
+        let foreign_relay = "https://foreign-relay.example".parse().unwrap();
+        let foreign_addr = EndpointAddr::from_parts(
+            peer_id.parse().unwrap(),
+            [TransportAddr::Relay(foreign_relay)],
+        );
+        let foreign_ticket = serialize_endpoint_addr(foreign_addr);
+
+        manager
+            .handle_peer_announce("sender", peer_id.clone(), foreign_ticket.clone())
+            .await;
+        manager
+            .handle_peer_announce("sender", peer_id.clone(), "not-a-ticket".to_string())
+            .await;
+
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind()
+            .await
+            .unwrap();
+        let foreign_err = manager
+            .connect_to_peer_with_ticket(&endpoint, &foreign_ticket)
+            .await
+            .expect_err("foreign relay replay must be rejected");
+        assert!(foreign_err.to_string().contains("unsupported relay"));
+        manager
+            .connect_to_peer_with_ticket(&endpoint, "not-a-ticket")
+            .await
+            .expect_err("invalid ticket replay must be rejected");
+
+        let cached_ticket = manager
+            .peer_tickets
+            .lock()
+            .await
+            .get(&peer_id)
+            .expect("trusted ticket should remain cached")
+            .ticket
+            .clone();
+        assert_eq!(cached_ticket, trusted_ticket);
+        assert!(!manager.peers.lock().await.contains_key(&peer_id));
+
         endpoint.close().await;
     }
 
@@ -3636,6 +3862,8 @@ mod tests {
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
 
+        wait_for_relay_addr(&endpoint_a).await;
+
         let mut rx_a = event_tx_a.subscribe();
         mgr_b
             .send_dm(
@@ -3694,6 +3922,8 @@ mod tests {
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
+
+        wait_for_relay_addr(&endpoint_a).await;
 
         mgr_b
             .connect_dm(&endpoint_a.id().to_string())
@@ -3767,6 +3997,8 @@ mod tests {
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
+
+        wait_for_relay_addr(&endpoint_a).await;
 
         mgr_b
             .connect_dm(&endpoint_a.id().to_string())
@@ -3918,6 +4150,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_dedicated_dm_flood_drains_one_frame_per_duplicate() {
+        const DUPLICATE_COUNT: usize = 4;
+
+        let (event_tx_a, _) = broadcast::channel::<Event>(128);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(128);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = Arc::new(test_manager(event_tx_b.clone(), audio_tx_b, video_tx_b));
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+        let router_b = Router::builder(endpoint_b.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_b.clone()))
+            .spawn();
+
+        let a_id = endpoint_a.id().to_string();
+        let b_id = endpoint_b.id().to_string();
+        let (high_mgr, high_endpoint, low_mgr, low_endpoint, high_events, low_id) = if a_id > b_id {
+            (
+                mgr_a.clone(),
+                endpoint_a.clone(),
+                mgr_b.clone(),
+                endpoint_b.clone(),
+                event_tx_a.clone(),
+                b_id.clone(),
+            )
+        } else {
+            (
+                mgr_b.clone(),
+                endpoint_b.clone(),
+                mgr_a.clone(),
+                endpoint_a.clone(),
+                event_tx_b.clone(),
+                a_id.clone(),
+            )
+        };
+
+        let mut rx_high = high_events.subscribe();
+        high_mgr.connect_dm(&low_id).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_high.recv().await {
+                    Ok(Event::DmConnected { peer_id }) if peer_id == low_id => break,
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for baseline DM connection");
+
+        let high_addr = iroh::EndpointAddr::new(high_endpoint.id())
+            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let mut duplicate_connections = Vec::with_capacity(DUPLICATE_COUNT);
+        for index in 0..DUPLICATE_COUNT {
+            let connection = low_endpoint
+                .connect(high_addr.clone(), node::NAFAQ_DM_ALPN)
+                .await
+                .unwrap();
+            let (mut send, _recv) = open_typed_bi_stream(&connection, STREAM_DM, "duplicate DM")
+                .await
+                .unwrap();
+            let first = DmMessage::Text {
+                content: format!("duplicate-first-{index}"),
+                timestamp: index as u64,
+            };
+            let second = DmMessage::Text {
+                content: format!("duplicate-second-{index}"),
+                timestamp: index as u64,
+            };
+            crate::messages::write_framed(&mut send, &serde_json::to_vec(&first).unwrap())
+                .await
+                .ok();
+            crate::messages::write_framed(&mut send, &serde_json::to_vec(&second).unwrap())
+                .await
+                .ok();
+            duplicate_connections.push(connection);
+        }
+
+        let mut first_count = 0usize;
+        timeout(Duration::from_secs(10), async {
+            while first_count < DUPLICATE_COUNT {
+                match rx_high.recv().await {
+                    Ok(Event::DmReceived {
+                        message: DmMessage::Text { content, .. },
+                        ..
+                    }) if content.starts_with("duplicate-first-") => first_count += 1,
+                    Ok(Event::DmReceived {
+                        message: DmMessage::Text { content, .. },
+                        ..
+                    }) if content.starts_with("duplicate-second-") => {
+                        panic!("duplicate drain spawned persistent reader and delivered {content}");
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for one drained frame per duplicate DM connection");
+
+        let second_frame = timeout(Duration::from_millis(750), async {
+            loop {
+                match rx_high.recv().await {
+                    Ok(Event::DmReceived {
+                        message: DmMessage::Text { content, .. },
+                        ..
+                    }) if content.starts_with("duplicate-second-") => break Some(content),
+                    Ok(_) => {}
+                    Err(_) => break None,
+                }
+            }
+        })
+        .await;
+        assert!(
+            second_frame.is_err(),
+            "duplicate DM drain delivered more than one frame per duplicate connection"
+        );
+
+        low_mgr
+            .send_dm(
+                &high_endpoint.id().to_string(),
+                &DmMessage::Text {
+                    content: "dm-survived-duplicate-flood".to_string(),
+                    timestamp: 99,
+                },
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_high.recv().await {
+                    Ok(Event::DmReceived {
+                        message: DmMessage::Text { content, .. },
+                        ..
+                    }) if content == "dm-survived-duplicate-flood" => break,
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for DM after duplicate flood");
+
+        drop(duplicate_connections);
+        router_a.shutdown().await.ok();
+        router_b.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
     async fn emits_single_disconnect_when_remote_endpoint_closes() {
         let (event_tx_a, _) = broadcast::channel::<Event>(64);
         let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
@@ -3997,7 +4391,7 @@ mod tests {
     async fn wait_for_selected_relay(conn: &Connection) {
         timeout(Duration::from_secs(10), async {
             loop {
-                let paths = conn.paths().get();
+                let paths = conn.paths();
                 if paths
                     .iter()
                     .any(|path| path.is_selected() && path.is_relay())
@@ -4016,12 +4410,7 @@ mod tests {
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
 
-        let mut relay_only_addr = endpoint_a.addr();
-        relay_only_addr.addrs.retain(|addr| addr.is_relay());
-        assert!(
-            !relay_only_addr.addrs.is_empty(),
-            "endpoint A did not publish any relay address"
-        );
+        let relay_only_addr = wait_for_relay_addr(&endpoint_a).await;
 
         let accept_task = tokio::spawn({
             let endpoint_a = endpoint_a.clone();

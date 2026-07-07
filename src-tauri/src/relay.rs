@@ -125,7 +125,7 @@ async fn check_relay(endpoint: &Endpoint) -> Result<String, String> {
         ));
     }
 
-    Ok(EndpointTicket::new(addr).serialize())
+    Ok(EndpointTicket::new(addr).encode_string())
 }
 
 async fn refresh_ticket(

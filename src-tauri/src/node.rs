@@ -20,11 +20,11 @@ pub struct NafaqEndpoint {
 }
 
 pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndpoint> {
-    use noq_proto::congestion::BbrConfig;
+    use noq_proto::congestion::Bbr3Config;
     use std::sync::Arc;
 
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()
-        .congestion_controller_factory(Arc::new(BbrConfig::default()))
+        .congestion_controller_factory(Arc::new(Bbr3Config::default()))
         .keep_alive_interval(Duration::from_secs(5))
         .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
         // Bound concurrent uni-streams at the QUIC layer. A peer's stream-open
@@ -85,7 +85,7 @@ pub async fn create_test_endpoint() -> Result<Endpoint> {
 #[cfg(test)]
 pub fn generate_ticket(endpoint: &Endpoint) -> String {
     let ticket = EndpointTicket::new(endpoint.addr());
-    ticket.serialize()
+    ticket.encode_string()
 }
 
 pub async fn generate_ticket_when_online(endpoint: &Endpoint) -> Result<String> {
@@ -104,7 +104,7 @@ pub async fn generate_ticket_when_online(endpoint: &Endpoint) -> Result<String> 
         );
     }
 
-    Ok(EndpointTicket::new(addr).serialize())
+    Ok(EndpointTicket::new(addr).encode_string())
 }
 
 /// Validate that an endpoint address only references the project relay.
@@ -122,7 +122,7 @@ pub fn validate_project_relay_addr(addr: &iroh::EndpointAddr) -> Result<()> {
 
 /// Parse a ticket string back into an EndpointTicket.
 pub fn parse_ticket(ticket_str: &str) -> Result<EndpointTicket> {
-    let ticket = EndpointTicket::deserialize(ticket_str)?;
+    let ticket = EndpointTicket::decode_string(ticket_str)?;
     Ok(ticket)
 }
 
@@ -136,6 +136,19 @@ pub fn parse_external_ticket(ticket_str: &str) -> Result<EndpointTicket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn wait_for_online_ticket(endpoint: &Endpoint) -> String {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(ticket) = generate_ticket_when_online(endpoint).await {
+                    return ticket;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .expect("endpoint did not publish an online ticket")
+    }
 
     #[tokio::test]
     async fn test_create_endpoint() {
@@ -158,7 +171,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_ticket_when_online() {
         let endpoint = create_test_endpoint().await.unwrap();
-        let ticket_str = generate_ticket_when_online(&endpoint).await.unwrap();
+        let ticket_str = wait_for_online_ticket(&endpoint).await;
         let ticket = parse_ticket(&ticket_str).unwrap();
         assert_eq!(ticket.endpoint_addr().id, endpoint.id().into());
         assert!(
