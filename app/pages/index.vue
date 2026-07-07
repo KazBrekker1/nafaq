@@ -6,6 +6,13 @@ const { contacts, displayName: contactDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
 const { conversations, unreadCounts } = useDM();
 const { settings } = useSettings();
+const appVersion = useRuntimeConfig().public.appVersion;
+const { status: updateStatus, isUpdateAvailable, latestVersion, checkForUpdate } = useAppUpdate();
+const showUpdateModal = ref(false);
+
+function openUpdateModal() {
+  showUpdateModal.value = true;
+}
 
 // ── Identity ─────────────────────────────────────────────
 
@@ -44,10 +51,19 @@ const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
 
 onMounted(() => {
   startProbing(contactNodeIds);
+  checkForUpdate();
 });
 
 onUnmounted(() => {
   stopProbing();
+});
+
+watch(isUpdateAvailable, (available) => {
+  if (available) openUpdateModal();
+});
+
+watch(updateStatus, (status) => {
+  if (status === "error") openUpdateModal();
 });
 
 // ── Recent activity ──────────────────────────────────────
@@ -251,7 +267,28 @@ const recentItems = computed<RecentItem[]>(() => {
 
     </div>
 
+    <footer class="max-w-xl mx-auto border-t border-[var(--color-border-muted)] px-4 py-3 text-center text-[10px] font-mono tracking-wider text-[var(--color-muted)]">
+      <span>Nafaq v{{ appVersion }}</span>
+      <button
+        v-if="isUpdateAvailable"
+        type="button"
+        class="ml-2 border border-[var(--color-accent)] px-2 py-0.5 text-[var(--color-accent)] transition-colors hover:bg-[var(--color-accent)] hover:text-white"
+        @click="openUpdateModal"
+      >
+        UPDATE TO v{{ latestVersion }}
+      </button>
+      <button
+        v-else-if="updateStatus === 'error'"
+        type="button"
+        class="ml-2 text-[var(--color-danger)] underline decoration-dotted underline-offset-2"
+        @click="openUpdateModal"
+      >
+        UPDATE CHECK FAILED
+      </button>
+    </footer>
+
     <NodeIdQrModal v-model:open="qrModalOpen" />
+    <AppUpdateModal v-model:open="showUpdateModal" />
 
   </div>
 </template>

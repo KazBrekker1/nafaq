@@ -12,6 +12,9 @@
     "core:window:allow-set-title",
     "core:app:default",
     "shell:allow-open",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "os:default",
+    "updater:default",
+    "process:default"
   ]
 }

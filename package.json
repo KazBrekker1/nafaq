@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "nuxt dev",
     "generate": "nuxt generate",
+    "test": "vitest run",
     "bump": "bumpp",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -14,20 +15,28 @@
     "tauri:android:build": "tauri android build"
   },
   "dependencies": {
-    "@nuxt/ui": "^4.3.0",
-    "@tauri-apps/api": "^2.9.1",
-    "@tauri-apps/plugin-dialog": "^2",
-    "@vueuse/core": "^14.2.1",
-    "@vueuse/nuxt": "^14.2.1",
-    "nuxt": "^4.2.2",
+    "@nuxt/ui": "^4.9.0",
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-os": "^2.3.2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
+    "@vueuse/core": "^14.3.0",
+    "@vueuse/nuxt": "^14.3.0",
+    "nuxt": "^4.4.8",
     "qr-scanner": "^1.4.2",
     "qrcode": "^1.5.4",
-    "vue": "^3.5.27"
+    "vue": "^3.5.39"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.9.6",
+    "@tauri-apps/cli": "^2.11.4",
     "@types/qrcode": "^1.5.5",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "@vue/test-utils": "^2.4.11",
     "bumpp": "^10.4.0",
-    "typescript": "^5.9.3"
+    "happy-dom": "^20.10.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.2.2"
   }
 }

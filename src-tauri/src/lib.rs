@@ -26,8 +26,8 @@ use messages::{AudioPacket, Contact, ControlAction, Event, RelayStatusKind, Vide
 use presence::PresenceManager;
 use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
-use tauri_plugin_store::StoreExt;
 use tauri::{Emitter, Manager};
+use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, Mutex};
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
@@ -117,8 +117,16 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_shell::init());
     }
 
+    builder = builder.plugin(tauri_plugin_os::init());
     builder = builder.plugin(tauri_plugin_store::Builder::new().build());
     builder = builder.plugin(tauri_plugin_dialog::init());
+
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_process::init());
+    }
 
     builder
         .setup(move |app| {
@@ -242,10 +250,7 @@ pub fn run() {
                     .unwrap_or_default();
                 for contact in contacts {
                     if let Err(e) = presence_for_bootstrap.track_contact(&contact.node_id).await {
-                        tracing::warn!(
-                            "presence track failed for {}: {e}",
-                            contact.node_id
-                        );
+                        tracing::warn!("presence track failed for {}: {e}", contact.node_id);
                     }
                 }
             });
@@ -411,28 +416,27 @@ pub fn run() {
                             // still be decoded — it can fill the gap / carry Opus
                             // FEC — rather than being dropped as "<= previous".
                             // Only exact duplicates are discarded.
-                            let lost_count =
-                                match last_sequence.get(&peer_id).copied() {
-                                    None => {
+                            let lost_count = match last_sequence.get(&peer_id).copied() {
+                                None => {
+                                    last_sequence.insert(peer_id.clone(), packet.sequence);
+                                    0u16
+                                }
+                                Some(previous) => {
+                                    let advance = packet.sequence.wrapping_sub(previous);
+                                    if advance == 0 {
+                                        // Exact duplicate.
+                                        continue;
+                                    } else if advance < 0x8000 {
+                                        // Forward progress; a gap (>1) is loss.
                                         last_sequence.insert(peer_id.clone(), packet.sequence);
-                                        0u16
+                                        advance - 1
+                                    } else {
+                                        // Reordered/late: decode but keep the
+                                        // high-water mark and don't flag loss.
+                                        0
                                     }
-                                    Some(previous) => {
-                                        let advance = packet.sequence.wrapping_sub(previous);
-                                        if advance == 0 {
-                                            // Exact duplicate.
-                                            continue;
-                                        } else if advance < 0x8000 {
-                                            // Forward progress; a gap (>1) is loss.
-                                            last_sequence.insert(peer_id.clone(), packet.sequence);
-                                            advance - 1
-                                        } else {
-                                            // Reordered/late: decode but keep the
-                                            // high-water mark and don't flag loss.
-                                            0
-                                        }
-                                    }
-                                };
+                                }
+                            };
 
                             // Lightweight energy proxy from Opus payload size (no decode
                             // needed), smoothed with an EWMA so one large packet (e.g. a
