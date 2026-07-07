@@ -11,6 +11,10 @@ function copyTicket() {
   copied.value = true;
   setTimeout(() => (copied.value = false), 2000);
 }
+
+function showTicketQr() {
+  showShareModal.value = true;
+}
 </script>
 
 <template>
@@ -27,7 +31,7 @@ function copyTicket() {
       <div class="border-2 border-[var(--color-accent)] p-4 text-xs break-all text-[var(--color-border)] bg-[#111]">{{ ticket }}</div>
       <div class="flex gap-0">
         <UButton class="flex-1 rounded-none border-r-0" @click="copyTicket">{{ copied ? "Copied!" : "Copy" }}</UButton>
-        <UButton variant="outline" class="flex-1 rounded-none" @click="showShareModal = true">Show QR</UButton>
+        <UButton variant="outline" class="flex-1 rounded-none" @click="showTicketQr">Show QR</UButton>
       </div>
       <p class="text-[var(--color-muted)] text-xs tracking-widest text-center">
         Waiting for peer<span class="text-[var(--color-accent)]">_</span>

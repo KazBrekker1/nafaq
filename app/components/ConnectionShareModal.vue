@@ -41,6 +41,10 @@ async function copyTicket() {
     copied.value = false;
   }, 2000);
 }
+
+function closeModal() {
+  open.value = false;
+}
 </script>
 
 <template>
@@ -55,7 +59,7 @@ async function copyTicket() {
           <button
             class="text-[var(--color-muted)] transition-colors hover:text-white"
             aria-label="Close share modal"
-            @click="open = false"
+            @click="closeModal"
           >
             <UIcon name="i-heroicons-x-mark" class="text-lg" />
           </button>
@@ -88,7 +92,7 @@ async function copyTicket() {
             <UButton class="flex-1 rounded-none" :disabled="!ticket" @click="copyTicket">
               {{ copied ? "Copied!" : "Copy" }}
             </UButton>
-            <UButton variant="outline" class="flex-1 rounded-none border-l-0" @click="open = false">
+            <UButton variant="outline" class="flex-1 rounded-none border-l-0" @click="closeModal">
               Close
             </UButton>
           </div>

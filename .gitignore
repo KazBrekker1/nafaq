@@ -1,6 +1,7 @@
 .superpowers/
 .pi/
 .osgrep/
+.omo/
 node_modules/
 dist/
 target/

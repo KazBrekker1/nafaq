@@ -8,6 +8,10 @@ const qrDataUrl = useQRCode(
   computed(() => nodeId.value || ""),
   { width: 256, margin: 1, color: { dark: "#000", light: "#fff" } }
 );
+
+function closeModal() {
+  open.value = false;
+}
 </script>
 
 <template>
@@ -19,7 +23,7 @@ const qrDataUrl = useQRCode(
           <button
             class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
             aria-label="Close QR modal"
-            @click="open = false"
+            @click="closeModal"
           >
             <UIcon name="i-heroicons-x-mark" class="text-lg" />
           </button>
@@ -40,7 +44,7 @@ const qrDataUrl = useQRCode(
             </div>
           </div>
           <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "\u2014" }}</p>
-          <UButton variant="outline" class="w-full rounded-none" @click="open = false">
+          <UButton variant="outline" class="w-full rounded-none" @click="closeModal">
             CLOSE
           </UButton>
         </div>

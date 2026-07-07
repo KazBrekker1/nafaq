@@ -63,6 +63,10 @@ function destroyScanner() {
   error.value = null;
 }
 
+function closeScanner() {
+  open.value = false;
+}
+
 onBeforeUnmount(() => {
   destroyScanner();
 });
@@ -77,7 +81,7 @@ onBeforeUnmount(() => {
           <button
             class="text-[var(--color-muted)] transition-colors hover:text-white"
             aria-label="Close scanner"
-            @click="open = false"
+            @click="closeScanner"
           >
             <UIcon name="i-heroicons-x-mark" class="text-lg" />
           </button>
@@ -95,7 +99,7 @@ onBeforeUnmount(() => {
             <video ref="videoRef" class="h-full w-full object-cover" />
           </div>
 
-          <UButton variant="outline" class="w-full rounded-none mt-3" @click="open = false">
+          <UButton variant="outline" class="w-full rounded-none mt-3" @click="closeScanner">
             Cancel
           </UButton>
         </div>

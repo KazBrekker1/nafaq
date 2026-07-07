@@ -14,6 +14,10 @@ function onScan(ticket: string) {
   ticketInput.value = ticket;
   emit("join", ticket);
 }
+
+function openScanner() {
+  showScanner.value = true;
+}
 </script>
 
 <template>
@@ -25,7 +29,7 @@ function onScan(ticket: string) {
       <UButton class="flex-1 rounded-none" :disabled="disabled || !ticketInput.trim() || state === 'joining'" @click="submit">
         {{ state === "joining" ? "Connecting..." : "Connect" }}
       </UButton>
-      <UButton variant="outline" class="rounded-none border-l-0" :disabled="disabled || state === 'joining'" @click="showScanner = true">
+      <UButton variant="outline" class="rounded-none border-l-0" :disabled="disabled || state === 'joining'" @click="openScanner">
         <UIcon name="i-heroicons-camera" />
       </UButton>
     </div>
