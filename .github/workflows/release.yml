@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches:
-      - "**"
+      - main
   workflow_dispatch:
     inputs:
       draft:
@@ -30,8 +30,9 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       release_name: ${{ steps.meta.outputs.release_name }}
       draft: ${{ steps.meta.outputs.draft }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Get version from package.json
         id: version
@@ -47,13 +48,19 @@ jobs:
           DRAFT: ${{ github.event.inputs.draft == 'true' }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           # Slugify branch name for use in tag (replace anything not [A-Za-z0-9.] with '-').
           BRANCH_SLUG=$(echo "$REF_NAME" | sed -E 's/[^A-Za-z0-9.]+/-/g' | sed -E 's/^-+|-+$//g')
           TAG="${BRANCH_SLUG}-v${VERSION}"
           RELEASE_NAME="Nafaq ${BRANCH_SLUG} v${VERSION}"
+          PRERELEASE="false"
+          if [ "$REF_NAME" != "main" ]; then
+            PRERELEASE="true"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
           echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
 
           NOTES=$(cat <<EOF
           ## $RELEASE_NAME
@@ -75,6 +82,8 @@ jobs:
 
           if [ "$DRAFT" = "true" ]; then
             gh release create "$TAG" --target "$REF_NAME" --title "$RELEASE_NAME" --notes "$NOTES" --draft
+          elif [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" --target "$REF_NAME" --title "$RELEASE_NAME" --notes "$NOTES" --prerelease
           else
             gh release create "$TAG" --target "$REF_NAME" --title "$RELEASE_NAME" --notes "$NOTES"
           fi
@@ -102,15 +111,15 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
       - name: Cache bun dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
@@ -118,12 +127,12 @@ jobs:
             ${{ runner.os }}-bun-
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri -> target
           shared-key: ${{ matrix.platform }}-${{ matrix.arch }}
@@ -137,18 +146,31 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify updater signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY is required for signed updater artifacts" >&2
+            exit 1
+          fi
+
       - name: Build and release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: "-"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         with:
           tagName: ${{ needs.create-release.outputs.tag }}
           releaseName: ${{ needs.create-release.outputs.release_name }}
           releaseBody: ""
           releaseDraft: ${{ needs.create-release.outputs.draft == 'true' }}
-          prerelease: false
+          prerelease: ${{ needs.create-release.outputs.prerelease == 'true' }}
           args: ${{ matrix.args }}
 
   publish-android:
@@ -158,15 +180,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: Main
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
       - name: Cache bun dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.bun/install/cache
           key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
@@ -174,24 +196,24 @@ jobs:
             ${{ runner.os }}-bun-
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: aarch64-linux-android
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: src-tauri -> target
           shared-key: android-arm64
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
 
       - name: Install Android SDK components
         run: |
@@ -250,3 +272,64 @@ jobs:
           if [ -n "$AAB" ]; then
             gh release upload "$TAG" "$AAB" --clobber || echo "AAB upload failed"
           fi
+
+  updater-manifest:
+    needs: [create-release, publish-desktop]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose and upload latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+
+          ASSETS="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
+          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
+
+          declare -A PATTERNS=(
+            ["darwin-aarch64"]="aarch64.app.tar.gz"
+            ["darwin-x86_64"]="x64.app.tar.gz"
+            ["linux-x86_64"]="amd64.AppImage"
+            ["windows-x86_64"]="x64-setup.exe"
+          )
+
+          PLATFORMS="{}"
+          for TARGET in "${!PATTERNS[@]}"; do
+            SUFFIX="${PATTERNS[$TARGET]}"
+            ESC="$(printf '%s' "$SUFFIX" | sed 's/\./\\./g')"
+            ART="$(printf '%s\n' "$ASSETS" | grep -E "${ESC}$" | head -1 || true)"
+            if [ -z "$ART" ]; then
+              echo "ERROR: missing updater artifact for $TARGET (*$SUFFIX)" >&2
+              exit 1
+            fi
+
+            SIG_NAME="${ART}.sig"
+            if ! printf '%s\n' "$ASSETS" | grep -qxF "$SIG_NAME"; then
+              echo "ERROR: missing signature $SIG_NAME for $TARGET" >&2
+              exit 1
+            fi
+
+            gh release download "$TAG" --repo "$REPO" --pattern "$SIG_NAME" --dir . --clobber
+            SIG="$(cat "$SIG_NAME")"
+            URL="$BASE_URL/$ART"
+            PLATFORMS="$(printf '%s' "$PLATFORMS" | jq \
+              --arg t "$TARGET" --arg s "$SIG" --arg u "$URL" \
+              '. + {($t): {signature:$s, url:$u}}')"
+          done
+
+          jq -n \
+            --arg v "$VERSION" \
+            --arg notes "See https://github.com/$REPO/releases/tag/$TAG" \
+            --argjson p "$PLATFORMS" \
+            '{version:$v, notes:$notes, pub_date:(now|todate), platforms:$p}' > latest.json
+
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$REPO" --clobber
