@@ -1,9 +1,11 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ref } from "vue";
-import { useNodeRuntime, type PeerConnectionStatus } from "./useNodeRuntime";
+import { useNodeRuntime } from "./useNodeRuntime";
 
 const onlineStatus = ref<Record<string, boolean>>({});
-let bootstrapped = false;
-let unlistenPromise: Promise<() => void> | null = null;
+let bootstrap: Promise<void> | null = null;
+let unlisten: UnlistenFn | null = null;
 let runtime: ReturnType<typeof useNodeRuntime> | null = null;
 
 function nodeRuntime() {
@@ -11,73 +13,51 @@ function nodeRuntime() {
   return runtime;
 }
 
-export function uniquePresenceIds(nodeIds: string[]): string[] {
-  return [...new Set(nodeIds.filter((nodeId) => nodeId.length > 0))];
-}
-
-export function peerConnectionStatusToPresence(status: PeerConnectionStatus | undefined): boolean | null {
-  switch (status) {
-    case "connected":
-      return true;
-    case "disconnected":
-    case "failed":
-      return false;
-    // "suspect"/"reconnecting" mean the call peer has gone silent for 20–35s+.
-    // Don't assert "online" from that — return null so gossip's fresher
-    // presence signal (which may already know the peer left) wins via isOnline.
-    case "suspect":
-    case "reconnecting":
-    default:
-      return null;
-  }
-}
-
-function knownPresence(nodeId: string): boolean | null {
-  return peerConnectionStatusToPresence(nodeRuntime().peerConnectionStatuses.value[nodeId]);
-}
-
 interface PresenceChangedPayload {
   peer_id: string;
   online: boolean;
 }
 
-async function ensureBootstrap() {
-  if (bootstrapped) return;
-  bootstrapped = true;
-
-  const { invoke } = await import("@tauri-apps/api/core");
-  const { listen } = await import("@tauri-apps/api/event");
-
-  try {
-    const snapshot = await invoke<Record<string, boolean>>("get_presence_snapshot");
-    onlineStatus.value = { ...snapshot };
-  } catch (err) {
-    console.warn("get_presence_snapshot failed", err);
-  }
-
-  unlistenPromise = listen<PresenceChangedPayload>("presence-changed", (event) => {
-    const { peer_id, online } = event.payload;
-    if (onlineStatus.value[peer_id] === online) return;
-    onlineStatus.value = { ...onlineStatus.value, [peer_id]: online };
-  });
+// Listen first, then snapshot: an event racing the snapshot is never lost, and
+// the snapshot only fills peers no event has reported yet (events win). A
+// failed snapshot is retried by the next usePresence() call; the listener stays.
+function ensureBootstrap(): Promise<void> {
+  bootstrap ??= (async () => {
+    try {
+      unlisten ??= await listen<PresenceChangedPayload>("presence-changed", (event) => {
+        const { peer_id, online } = event.payload;
+        if (onlineStatus.value[peer_id] === online) return;
+        onlineStatus.value = { ...onlineStatus.value, [peer_id]: online };
+      });
+      const snapshot = await invoke<Record<string, boolean>>("get_presence_snapshot");
+      onlineStatus.value = { ...snapshot, ...onlineStatus.value };
+    } catch (err) {
+      console.warn("[presence] bootstrap failed:", err);
+      bootstrap = null;
+    }
+  })();
+  return bootstrap;
 }
 
 export function usePresence() {
   void ensureBootstrap();
 
+  // A live call connection confirms the peer is online, but a call ending
+  // ("disconnected"/"failed") says nothing about whether the peer left the
+  // network — defer to gossip presence for everything but "connected".
   function isOnline(nodeId: string): boolean {
-    return knownPresence(nodeId) ?? onlineStatus.value[nodeId] ?? false;
+    return nodeRuntime().peerConnectionStatuses.value[nodeId] === "connected"
+      || (onlineStatus.value[nodeId] ?? false);
   }
 
   return { onlineStatus, isOnline };
 }
 
-// HMR-safe cleanup
-if (typeof import.meta.hot !== "undefined") {
-  import.meta.hot?.dispose(() => {
-    void unlistenPromise?.then((u) => u());
-    bootstrapped = false;
-    unlistenPromise = null;
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    unlisten?.();
+    unlisten = null;
+    bootstrap = null;
     onlineStatus.value = {};
   });
 }
