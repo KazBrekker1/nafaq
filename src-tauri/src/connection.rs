@@ -2089,6 +2089,7 @@ impl ConnectionManager {
                                                 .await;
                                                 let _ = audio_tx.send(AudioPacket {
                                                     peer_id: peer_id.clone(),
+                                                    connection_id,
                                                     timestamp_ms: packet.timestamp_ms,
                                                     sequence: packet.sequence,
                                                     payload: packet.payload,
@@ -2179,6 +2180,7 @@ impl ConnectionManager {
         let audio_media_tx = self.audio_media_tx.clone();
         let peer_id_datagram = peer_id.clone();
         let connection_datagram = connection.clone();
+        let datagram_connection_id = connection_datagram.stable_id();
         let peers_ref_datagram = peers_ref.clone();
         tokio::spawn(async move {
             loop {
@@ -2189,6 +2191,7 @@ impl ConnectionManager {
                                 .await;
                             let _ = audio_media_tx.send(AudioPacket {
                                 peer_id: peer_id_datagram.clone(),
+                                connection_id: datagram_connection_id,
                                 timestamp_ms: packet.timestamp_ms,
                                 sequence: packet.sequence,
                                 payload: packet.payload,

@@ -84,6 +84,10 @@ pub const STREAM_DM: u8 = 0x05;
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
     pub peer_id: String,
+    /// `stable_id` of the QUIC connection the packet arrived on. The sender's
+    /// sequence counter restarts with every connection, so receivers reset
+    /// their per-peer sequence/decoder state when this changes.
+    pub connection_id: usize,
     pub timestamp_ms: u64,
     pub sequence: u16,
     pub payload: Vec<u8>,

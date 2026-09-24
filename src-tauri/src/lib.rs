@@ -53,17 +53,26 @@ struct AudioEvent {
     timestamp: u64,
 }
 
+/// A backward jump larger than this can't be reordering (datagrams arrive at
+/// most a few packets out of order); the sender's counter restarted.
+const AUDIO_SEQUENCE_RESTART_THRESHOLD: u16 = 64;
+
 /// Wrapping-aware high-water mark for a peer's audio datagrams. Returns how
 /// many packets were lost before `sequence`, or `None` if it must be dropped:
 /// a duplicate, or a late packet whose slot FEC/concealment already filled
 /// (playing it would repeat 20 ms out of order and disturb decoder state).
+/// A large backward jump is treated as a sender restart (new stream, no gap)
+/// rather than as a late packet, so audio can't go permanently silent.
 fn audio_sequence_gap(previous: Option<u16>, sequence: u16) -> Option<u16> {
     let Some(previous) = previous else {
         return Some(0);
     };
     let advance = sequence.wrapping_sub(previous);
-    if advance == 0 || advance >= 0x8000 {
+    if advance == 0 {
         None
+    } else if advance >= 0x8000 {
+        let backward = previous.wrapping_sub(sequence);
+        (backward > AUDIO_SEQUENCE_RESTART_THRESHOLD).then_some(0)
     } else {
         Some(advance - 1)
     }
@@ -445,6 +454,9 @@ pub fn run() {
                 let mut audio_rx = audio_media_tx_for_setup.subscribe();
                 let mut last_active: HashMap<String, std::time::Instant> = HashMap::new();
                 let mut last_sequence: HashMap<String, u16> = HashMap::new();
+                // Connection each peer's audio last arrived on: a reconnect
+                // restarts the sender's sequence counter and Opus stream.
+                let mut last_connection: HashMap<String, usize> = HashMap::new();
                 let mut last_prune = std::time::Instant::now();
                 let mut peer_energy: HashMap<String, f32> = HashMap::new();
                 let mut top_speakers: HashSet<String> = HashSet::new();
@@ -467,11 +479,19 @@ pub fn run() {
                                 for k in &stale {
                                     last_active.remove(k);
                                     last_sequence.remove(k);
+                                    last_connection.remove(k);
                                     peer_energy.remove(k);
                                     codec_audio.remove_peer_decoders(k).await;
                                 }
                             }
                             last_active.insert(peer_id.clone(), now_inst);
+
+                            let previous_connection =
+                                last_connection.insert(peer_id.clone(), packet.connection_id);
+                            if previous_connection.is_some_and(|id| id != packet.connection_id) {
+                                last_sequence.remove(&peer_id);
+                                codec_audio.remove_peer_decoders(&peer_id).await;
+                            }
 
                             let Some(lost_count) = audio_sequence_gap(
                                 last_sequence.get(&peer_id).copied(),
@@ -879,5 +899,20 @@ mod audio_sequence_tests {
         assert_eq!(audio_sequence_gap(Some(u16::MAX), 0), Some(0));
         assert_eq!(audio_sequence_gap(Some(u16::MAX - 1), 1), Some(2));
         assert_eq!(audio_sequence_gap(Some(0), u16::MAX), None);
+    }
+
+    #[test]
+    fn small_backward_jumps_are_late_packets() {
+        assert_eq!(audio_sequence_gap(Some(100), 36), None);
+        assert_eq!(audio_sequence_gap(Some(10), u16::MAX - 50), None);
+    }
+
+    #[test]
+    fn large_backward_jump_is_a_sender_restart() {
+        // A reconnect restarts the sender's counter at 0.
+        assert_eq!(audio_sequence_gap(Some(1000), 0), Some(0));
+        assert_eq!(audio_sequence_gap(Some(100), 35), Some(0));
+        // Across the wrap boundary too.
+        assert_eq!(audio_sequence_gap(Some(30), u16::MAX - 100), Some(0));
     }
 }
