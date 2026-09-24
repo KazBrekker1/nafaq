@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import QRCode from "qrcode";
+import { useQRCode } from "@vueuse/integrations/useQRCode";
 
 const open = defineModel<boolean>('open', { required: true });
 
@@ -9,37 +9,17 @@ const { ticket, title = "SHARE CONNECTION", description = "Scan the QR or copy t
   description?: string;
 }>();
 
-const copied = ref(false);
-const qrDataUrl = ref<string | null>(null);
-
-watch(
-  () => [open.value, ticket] as const,
-  async ([isOpen, t]) => {
-    if (!isOpen || !t) {
-      qrDataUrl.value = null;
-      return;
-    }
-
-    try {
-      qrDataUrl.value = await QRCode.toDataURL(t, {
-        width: 320,
-        margin: 1,
-        color: { dark: "#000", light: "#fff" },
-      });
-    } catch {
-      qrDataUrl.value = null;
-    }
-  },
-  { immediate: true },
+// useQRCode skips empty input and keeps its last value, so the template
+// also checks `ticket` before showing the image.
+const qrDataUrl = useQRCode(
+  () => ticket ?? "",
+  { width: 320, margin: 1, color: { dark: "#000", light: "#fff" } },
 );
 
-async function copyTicket() {
-  if (!ticket) return;
-  await navigator.clipboard.writeText(ticket);
-  copied.value = true;
-  setTimeout(() => {
-    copied.value = false;
-  }, 2000);
+const { copy, copied } = useClipboard({ copiedDuring: 2000 });
+
+function copyTicket() {
+  if (ticket) copy(ticket);
 }
 
 function closeModal() {
@@ -58,7 +38,7 @@ function closeModal() {
       <div class="space-y-4">
         <div class="flex justify-center bg-white p-2">
           <img
-            v-if="qrDataUrl"
+            v-if="qrDataUrl && ticket"
             :src="qrDataUrl"
             alt="Connection QR code"
             class="h-[200px] w-[200px] sm:h-[240px] sm:w-[240px]"

@@ -9,20 +9,22 @@ const scanner = ref<QrScanner | null>(null);
 const error = ref<string | null>(null);
 const streaming = ref(false);
 
-watch(() => open.value, async (isOpen) => {
-  if (isOpen) {
-    await nextTick();
-    startScanner();
-  } else {
-    destroyScanner();
-  }
+// The <video> only exists while the modal is open and no error is shown, so
+// its ref is the single source of truth for the scanner's lifetime.
+watch(videoRef, (el) => {
+  if (el) void startScanner(el);
+  else stopScanner();
 });
 
-async function startScanner() {
-  if (!videoRef.value) return;
+// Clear a previous camera error when reopening, so the video mounts again.
+watch(open, (isOpen) => {
+  if (isOpen) error.value = null;
+});
 
+async function startScanner(el: HTMLVideoElement) {
+  stopScanner();
   const instance = new QrScanner(
-    videoRef.value,
+    el,
     (result) => {
       if (result.data) {
         instance.stop();
@@ -40,7 +42,7 @@ async function startScanner() {
 
   try {
     await instance.start();
-    // The modal may have closed while start() was in flight — destroyScanner
+    // The modal may have closed while start() was in flight — stopScanner
     // already ran, and a started orphan would hold the camera indefinitely.
     if (scanner.value !== instance) {
       instance.destroy();
@@ -56,20 +58,17 @@ async function startScanner() {
   }
 }
 
-function destroyScanner() {
+function stopScanner() {
   scanner.value?.destroy();
   scanner.value = null;
   streaming.value = false;
-  error.value = null;
 }
 
 function closeScanner() {
   open.value = false;
 }
 
-onBeforeUnmount(() => {
-  destroyScanner();
-});
+onBeforeUnmount(stopScanner);
 </script>
 
 <template>

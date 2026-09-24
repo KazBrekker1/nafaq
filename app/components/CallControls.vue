@@ -22,9 +22,6 @@ const emit = defineEmits<{
   switchMic: [deviceId: string];
   switchCamera: [deviceId: string];
 }>();
-
-const micDropdownOpen = ref(false);
-const camDropdownOpen = ref(false);
 </script>
 
 <template>
@@ -46,11 +43,9 @@ const camDropdownOpen = ref(false);
       <!-- Mic device picker (desktop only) -->
       <CallDeviceDropdown
         class="hidden sm:flex"
-        :open="micDropdownOpen"
         label="MICROPHONE"
         :devices="microphones"
         :selected-id="selectedMic"
-        @update:open="micDropdownOpen = $event"
         @select="emit('switchMic', $event)"
       />
     </UFieldGroup>
@@ -72,11 +67,9 @@ const camDropdownOpen = ref(false);
       <!-- Cam device picker (desktop only) -->
       <CallDeviceDropdown
         class="hidden sm:flex"
-        :open="camDropdownOpen"
         label="CAMERA"
         :devices="cameras"
         :selected-id="selectedCamera"
-        @update:open="camDropdownOpen = $event"
         @select="emit('switchCamera', $event)"
       />
     </UFieldGroup>

@@ -1,119 +1,85 @@
 <script setup lang="ts">
-import { truncateNodeId } from "~/utils/format";
+import type { AppSettings } from "~/composables/useSettings";
+import type { SettingSelectOption } from "~/components/SettingSelect.vue";
+import { relayStatusColor } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
-const { nodeId, displayName, relayStatus, nodeError, shareTicket } = useCall();
+const { displayName, relayStatus, nodeError, shareTicket } = useCall();
 const { settings, save } = useSettings();
-
-const truncatedNodeId = computed(() => {
-  if (!nodeId.value) return "\u2014";
-  return truncateNodeId(nodeId.value, 8, 4);
-});
-
-const { copy, copied: nodeCopied } = useClipboard();
-function copyNodeId() {
-  if (nodeId.value) copy(nodeId.value);
-}
-
-const qrModalOpen = ref(false);
-
-const relayStatusLabel = computed(() => relayStatus.value.toUpperCase());
-const relayStatusColor = computed(() => {
-  switch (relayStatus.value) {
-    case "online":
-      return "success";
-    case "degraded":
-    case "offline":
-      return "error";
-    default:
-      return "neutral";
-  }
-});
 
 // ── Devices ───────────────────────────────────────────────
 const media = useMedia();
 const allDevices = ref<MediaDeviceInfo[]>([]);
+
+async function enumerate(): Promise<MediaDeviceInfo[]> {
+  try {
+    return await navigator.mediaDevices.enumerateDevices();
+  } catch {
+    return [];
+  }
+}
 
 async function loadDevices() {
   if (!navigator.mediaDevices?.enumerateDevices) {
     allDevices.value = [];
     return;
   }
-  // Request a brief getUserMedia to unlock device labels (browsers hide
-  // labels until permission is granted), then always stop the tracks — even
-  // if enumeration throws, or the camera LED stays on.
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
-  try {
-    allDevices.value = await navigator.mediaDevices.enumerateDevices();
-  } catch {
-    allDevices.value = [];
-  } finally {
-    stream?.getTracks().forEach(t => t.stop());
+  let devices = await enumerate();
+  // Browsers hide labels until media permission is granted. Only then ask —
+  // for just the device kinds that exist — and release the tracks straight
+  // away so the camera LED doesn't stay on.
+  if (devices.length > 0 && devices.every(d => !d.label)) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: devices.some(d => d.kind === "audioinput"),
+      video: devices.some(d => d.kind === "videoinput"),
+    }).catch(() => null);
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      devices = await enumerate();
+    }
   }
+  allDevices.value = devices;
 }
 
-const audioInputs = computed(() =>
-  allDevices.value.filter((d) => d.kind === "audioinput").map((d) => ({
+function deviceOptions(kind: MediaDeviceKind, fallback: string): SettingSelectOption[] {
+  return allDevices.value.filter(d => d.kind === kind).map(d => ({
     value: d.deviceId,
-    label: d.label || `Microphone ${d.deviceId.slice(0, 8)}`,
-  }))
-);
-const videoInputs = computed(() =>
-  allDevices.value.filter((d) => d.kind === "videoinput").map((d) => ({
-    value: d.deviceId,
-    label: d.label || `Camera ${d.deviceId.slice(0, 8)}`,
-  }))
-);
-const audioOutputs = computed(() =>
-  allDevices.value.filter((d) => d.kind === "audiooutput").map((d) => ({
-    value: d.deviceId,
-    label: d.label || `Speaker ${d.deviceId.slice(0, 8)}`,
-  }))
-);
-
-const selectedMic = ref(settings.value.preferredMic ?? "");
-const selectedCamera = ref(settings.value.preferredCamera ?? "");
-const selectedSpeaker = ref(settings.value.preferredSpeaker ?? "");
-
-watch(() => settings.value.preferredMic, (v) => { if (v) selectedMic.value = v; });
-watch(() => settings.value.preferredCamera, (v) => { if (v) selectedCamera.value = v; });
-watch(() => settings.value.preferredSpeaker, (v) => { if (v) selectedSpeaker.value = v; });
-
-async function onMicChange(e: Event) {
-  selectedMic.value = (e.target as HTMLSelectElement).value;
-  await save({ preferredMic: selectedMic.value || null });
-  if (selectedMic.value) media.switchMic(selectedMic.value);
+    label: d.label || `${fallback} ${d.deviceId.slice(0, 8)}`,
+  }));
 }
-async function onCameraChange(e: Event) {
-  selectedCamera.value = (e.target as HTMLSelectElement).value;
-  await save({ preferredCamera: selectedCamera.value || null });
-  if (selectedCamera.value) media.switchCamera(selectedCamera.value);
+
+type SelectKey = "preferredMic" | "preferredCamera" | "preferredSpeaker" | "videoQuality";
+
+interface SelectField {
+  key: SelectKey;
+  label: string;
+  options: SettingSelectOption[];
+  placeholder?: string;
+  // Applies the choice to live media; "" means the system default.
+  apply?: (value: string) => void;
 }
-async function onSpeakerChange(e: Event) {
-  selectedSpeaker.value = (e.target as HTMLSelectElement).value;
-  await save({ preferredSpeaker: selectedSpeaker.value || null });
-}
+
+const deviceFields = computed<SelectField[]>(() => [
+  { key: "preferredMic", label: "MICROPHONE", options: deviceOptions("audioinput", "Microphone"), placeholder: "— Default —", apply: v => media.switchMic(v) },
+  { key: "preferredCamera", label: "CAMERA", options: deviceOptions("videoinput", "Camera"), placeholder: "— Default —", apply: v => media.switchCamera(v) },
+  { key: "preferredSpeaker", label: "SPEAKER", options: deviceOptions("audiooutput", "Speaker"), placeholder: "— Default —" },
+]);
 
 // ── Call Quality ─────────────────────────────────────────
-const qualityOptions = [
-  { value: "auto", label: "AUTO" },
-  { value: "low", label: "LOW" },
-  { value: "medium", label: "MEDIUM" },
-  { value: "high", label: "HIGH" },
-] as const;
+const qualityField: SelectField = {
+  key: "videoQuality",
+  label: "VIDEO QUALITY",
+  options: [
+    { value: "auto", label: "AUTO" },
+    { value: "low", label: "LOW" },
+    { value: "medium", label: "MEDIUM" },
+    { value: "high", label: "HIGH" },
+  ],
+};
 
-const selectedQuality = ref(settings.value.videoQuality ?? "auto");
-watch(() => settings.value.videoQuality, (v) => { selectedQuality.value = v; });
-
-async function onQualityChange(e: Event) {
-  const val = (e.target as HTMLSelectElement).value as "auto" | "low" | "medium" | "high";
-  selectedQuality.value = val;
-  await save({ videoQuality: val });
-}
-
-async function handleDataSaver(e: Event) {
-  const enabled = (e.target as HTMLInputElement).checked;
-  await save({ dataSaver: enabled });
+async function onSelect(field: SelectField, value: string) {
+  await save({ [field.key]: value || null } as Partial<AppSettings>);
+  field.apply?.(value);
 }
 
 onMounted(loadDevices);
@@ -143,21 +109,7 @@ onMounted(loadDevices);
         <!-- Node ID -->
         <div class="px-6 sm:px-8 py-5 border-b border-muted">
           <p class="label mb-2">NODE ID</p>
-          <div class="flex items-stretch gap-2">
-            <div class="flex flex-1 min-w-0 items-center truncate border-2 border-(--ui-border-accented) bg-elevated px-4 py-2 text-xs text-muted shadow-(--ui-shadow-hard-sm)">
-              {{ truncatedNodeId }}
-            </div>
-            <UButton
-              :icon="nodeCopied ? 'i-heroicons-check' : 'i-heroicons-clipboard-document'"
-              :color="nodeCopied ? 'primary' : 'neutral'"
-              @click="copyNodeId"
-            >
-              {{ nodeCopied ? "Copied" : "Copy" }}
-            </UButton>
-            <UButton icon="i-heroicons-qr-code" color="neutral" @click="() => { qrModalOpen = true }">
-              QR
-            </UButton>
-          </div>
+          <IdentityCard :show-name="false" />
         </div>
 
         <!-- Relay Runtime -->
@@ -167,8 +119,8 @@ onMounted(loadDevices);
               <p class="label mb-1">RELAY STATUS</p>
               <p class="text-xs text-muted">Tickets are available when the project relay is online.</p>
             </div>
-            <UBadge :color="relayStatusColor" class="shrink-0">
-              {{ relayStatusLabel }}
+            <UBadge :color="relayStatusColor(relayStatus)" class="shrink-0">
+              {{ relayStatus.toUpperCase() }}
             </UBadge>
           </div>
           <p class="text-[10px] text-muted">
@@ -199,71 +151,17 @@ onMounted(loadDevices);
           <p class="label">DEVICES</p>
         </div>
 
-        <!-- Microphone -->
-        <div class="px-6 sm:px-8 py-5 border-b border-muted">
-          <p class="label mb-2">MICROPHONE</p>
-          <div class="relative">
-            <select
-              class="w-full appearance-none cursor-pointer border-2 border-(--ui-border-accented) bg-elevated px-4 py-2 pr-9 text-xs text-default outline-none transition-colors focus:border-primary shadow-(--ui-shadow-hard-sm)"
-              :value="selectedMic"
-              @change="onMicChange"
-            >
-              <option value="">— Default —</option>
-              <option
-                v-for="d in audioInputs"
-                :key="d.value"
-                :value="d.value"
-              >
-                {{ d.label }}
-              </option>
-            </select>
-            <UIcon name="i-heroicons-chevron-down" class="absolute right-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none text-base" />
-          </div>
-        </div>
-
-        <!-- Camera -->
-        <div class="px-6 sm:px-8 py-5 border-b border-muted">
-          <p class="label mb-2">CAMERA</p>
-          <div class="relative">
-            <select
-              class="w-full appearance-none cursor-pointer border-2 border-(--ui-border-accented) bg-elevated px-4 py-2 pr-9 text-xs text-default outline-none transition-colors focus:border-primary shadow-(--ui-shadow-hard-sm)"
-              :value="selectedCamera"
-              @change="onCameraChange"
-            >
-              <option value="">— Default —</option>
-              <option
-                v-for="d in videoInputs"
-                :key="d.value"
-                :value="d.value"
-              >
-                {{ d.label }}
-              </option>
-            </select>
-            <UIcon name="i-heroicons-chevron-down" class="absolute right-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none text-base" />
-          </div>
-        </div>
-
-        <!-- Speaker -->
-        <div class="px-6 sm:px-8 py-5">
-          <p class="label mb-2">SPEAKER</p>
-          <div class="relative">
-            <select
-              class="w-full appearance-none cursor-pointer border-2 border-(--ui-border-accented) bg-elevated px-4 py-2 pr-9 text-xs text-default outline-none transition-colors focus:border-primary shadow-(--ui-shadow-hard-sm)"
-              :value="selectedSpeaker"
-              @change="onSpeakerChange"
-            >
-              <option value="">— Default —</option>
-              <option
-                v-for="d in audioOutputs"
-                :key="d.value"
-                :value="d.value"
-              >
-                {{ d.label }}
-              </option>
-            </select>
-            <UIcon name="i-heroicons-chevron-down" class="absolute right-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none text-base" />
-          </div>
-        </div>
+        <SettingSelect
+          v-for="(field, idx) in deviceFields"
+          :key="field.key"
+          class="px-6 sm:px-8 py-5"
+          :class="{ 'border-b border-muted': idx < deviceFields.length - 1 }"
+          :label="field.label"
+          :options="field.options"
+          :placeholder="field.placeholder"
+          :model-value="settings[field.key] ?? ''"
+          @update:model-value="onSelect(field, $event)"
+        />
       </section>
 
       <!-- ── CALL QUALITY ── -->
@@ -273,25 +171,13 @@ onMounted(loadDevices);
         </div>
 
         <!-- Video Quality -->
-        <div class="px-6 sm:px-8 py-5 border-b border-muted">
-          <p class="label mb-2">VIDEO QUALITY</p>
-          <div class="relative">
-            <select
-              class="w-full appearance-none cursor-pointer border-2 border-(--ui-border-accented) bg-elevated px-4 py-2 pr-9 text-xs text-default outline-none transition-colors focus:border-primary shadow-(--ui-shadow-hard-sm)"
-              :value="selectedQuality"
-              @change="onQualityChange"
-            >
-              <option
-                v-for="opt in qualityOptions"
-                :key="opt.value"
-                :value="opt.value"
-              >
-                {{ opt.label }}
-              </option>
-            </select>
-            <UIcon name="i-heroicons-chevron-down" class="absolute right-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none text-base" />
-          </div>
-        </div>
+        <SettingSelect
+          class="px-6 sm:px-8 py-5 border-b border-muted"
+          :label="qualityField.label"
+          :options="qualityField.options"
+          :model-value="settings.videoQuality"
+          @update:model-value="onSelect(qualityField, $event)"
+        />
 
         <!-- Data Saver -->
         <div class="px-6 sm:px-8 py-5">
@@ -303,7 +189,7 @@ onMounted(loadDevices);
             <USwitch
               :model-value="settings.dataSaver"
               class="shrink-0"
-              @update:model-value="(val) => handleDataSaver({ target: { checked: val } } as unknown as Event)"
+              @update:model-value="(val) => save({ dataSaver: val })"
             />
           </div>
         </div>
@@ -328,6 +214,5 @@ onMounted(loadDevices);
 
     </div>
 
-    <NodeIdQrModal v-model:open="qrModalOpen" />
   </div>
 </template>
