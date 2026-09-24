@@ -51,6 +51,7 @@ vi.mock("~/composables/useAppUpdate", () => ({
     },
     downloadAndInstall: updateState.downloadAndInstall,
     checkForUpdate: updateState.checkForUpdate,
+    checkForUpdateOnce: updateState.checkForUpdate,
   }),
 }));
 

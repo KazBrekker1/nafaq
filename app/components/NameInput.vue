@@ -1,46 +1,48 @@
 <script setup lang="ts">
 const model = defineModel<string>({ required: true });
 
-const pinned = ref(false);
-const loaded = ref(false);
+// useCall loads the pinned name at startup; this component only pins/persists.
+const { namePinned } = useCall();
+const pinned = computed(() => namePinned.value === true);
+const loaded = computed(() => namePinned.value !== null);
 
-onMounted(async () => {
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    const savedName = await invoke<string | null>("get_pinned_name");
-    if (savedName) {
-      model.value = savedName;
-      pinned.value = true;
-    }
-  } catch {}
-  loaded.value = true;
-});
+async function setPinnedName(name: string | null, pin: boolean) {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_pinned_name", { name, pinned: pin });
+}
 
 async function togglePin() {
-  pinned.value = !pinned.value;
+  const next = !pinned.value;
+  namePinned.value = next;
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_pinned_name", {
-      name: pinned.value ? model.value : null,
-      pinned: pinned.value,
-    });
-  } catch {}
+    await setPinnedName(next ? model.value : null, next);
+  } catch {
+    namePinned.value = !next;
+  }
 }
 
 // Debounced persist — avoids an IPC call on every keystroke
-let persistTimer: ReturnType<typeof setTimeout>;
-watch(() => model.value, (name) => {
-  if (!pinned.value || !loaded.value) return;
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+let pendingName: string | null = null;
+
+function flushPersist() {
   clearTimeout(persistTimer);
-  persistTimer = setTimeout(async () => {
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("set_pinned_name", { name, pinned: true });
-    } catch {}
-  }, 400);
+  if (pendingName === null) return;
+  const name = pendingName;
+  pendingName = null;
+  setPinnedName(name, true).catch(() => {});
+}
+
+watch(() => model.value, (name) => {
+  if (!pinned.value) return;
+  pendingName = name;
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(flushPersist, 400);
 });
 
-onUnmounted(() => clearTimeout(persistTimer));
+// Flush rather than drop: leaving Settings within the debounce window must
+// still persist the last edit.
+onUnmounted(flushPersist);
 </script>
 
 <template>
@@ -49,6 +51,7 @@ onUnmounted(() => clearTimeout(persistTimer));
       v-model="model"
       placeholder="Your name"
       class="flex-1"
+      :maxlength="64"
       :ui="{ base: 'text-center' }"
     />
     <UTooltip :text="pinned ? 'Name pinned — persists across sessions' : 'Pin name to remember it'">

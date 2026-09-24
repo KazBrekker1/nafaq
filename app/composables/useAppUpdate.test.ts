@@ -92,6 +92,18 @@ describe("useAppUpdate", () => {
     expect(tauriMocks.relaunch).toHaveBeenCalledOnce();
   });
 
+  it("checks automatically only once per session", async () => {
+    tauriMocks.check.mockResolvedValue(null);
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdateOnce();
+    await useAppUpdate().checkForUpdateOnce();
+
+    expect(tauriMocks.check).toHaveBeenCalledOnce();
+    expect(updater.status.value).toBe("uptodate");
+  });
+
   it("surfaces check failures", async () => {
     tauriMocks.check.mockRejectedValue(new Error("manifest missing"));
     const { useAppUpdate } = await freshUpdater();

@@ -10,18 +10,15 @@
       <TabBar v-if="showNav" />
     </div>
 
-    <IncomingCallBanner
-      v-if="state === 'ringing' && incomingInvite"
-      :caller="incomingInvite"
-      @accept="acceptInvite"
-      @decline="declineInvite"
-    />
-
-    <MissedCallToast
-      v-if="missedCall"
-      :key="missedCall.timestamp"
-      :name="missedCall.callerName"
-    />
+    <!-- The Transition must wrap the v-if for enter/leave to run. -->
+    <Transition name="slide-down">
+      <IncomingCallBanner
+        v-if="state === 'ringing' && incomingInvite"
+        :caller-name="contactName(incomingInvite.peerId)"
+        @accept="acceptInvite"
+        @decline="declineInvite"
+      />
+    </Transition>
   </UApp>
 </template>
 
@@ -33,12 +30,24 @@ const showNav = computed(() => {
 });
 
 const { state, incomingInvite, missedCall, acceptInvite, declineInvite } = useCall();
+const { displayName: contactName } = useContacts();
+const toast = useToast();
 
-useHead({
-  link: [
-    { rel: "preconnect", href: "https://fonts.googleapis.com" },
-    { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" },
-    { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" },
-  ],
+watch(missedCall, (missed) => {
+  if (missed) {
+    toast.add({ title: `Missed call from ${missed.callerName}`, icon: "i-heroicons-phone-x-mark", duration: 4000 });
+  }
 });
 </script>
+
+<style scoped>
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition: transform 0.3s ease, opacity 0.3s ease;
+}
+.slide-down-enter-from,
+.slide-down-leave-to {
+  transform: translateY(-100%);
+  opacity: 0;
+}
+</style>

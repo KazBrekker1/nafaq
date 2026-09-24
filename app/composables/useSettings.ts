@@ -2,8 +2,9 @@ import type { RelayStatus } from "./useNodeRuntime";
 
 export type IdentityStatus = "loaded_persistent" | "created_persistent" | "reset_required";
 
+// The display name is not here: it lives in the pinned-name store
+// (get_pinned_name / set_pinned_name, loaded by useCall).
 export interface AppSettings {
-  displayName: string;
   persistentIdentity: boolean;
   identityStatus: IdentityStatus | null;
   nodeId: string | null;
@@ -16,7 +17,6 @@ export interface AppSettings {
 }
 
 const settings = ref<AppSettings>({
-  displayName: "",
   persistentIdentity: true,
   identityStatus: null,
   nodeId: null,

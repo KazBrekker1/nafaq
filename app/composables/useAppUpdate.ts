@@ -22,6 +22,7 @@ const progressKnown = ref(false);
 const errorMessage = ref<string | null>(null);
 
 let pendingUpdate: Update | null = null;
+let sessionCheck: Promise<void> | null = null;
 
 const isUpdateAvailable = computed(() => status.value === "available");
 
@@ -62,6 +63,13 @@ async function checkForUpdate(): Promise<void> {
     errorMessage.value = error instanceof Error ? error.message : String(error);
     status.value = "error";
   }
+}
+
+// Automatic check: runs at most once per app session, however many times the
+// caller (e.g. the home page) remounts. Manual retries use checkForUpdate.
+function checkForUpdateOnce(): Promise<void> {
+  sessionCheck ??= checkForUpdate();
+  return sessionCheck;
 }
 
 async function downloadAndInstall(): Promise<void> {
@@ -121,6 +129,7 @@ export function useAppUpdate() {
     errorMessage: readonly(errorMessage),
     isUpdateAvailable,
     checkForUpdate,
+    checkForUpdateOnce,
     downloadAndInstall,
   };
 }

@@ -19,6 +19,8 @@ const peerId = ref<string | null>(null);
 const error = ref<string | null>(null);
 const peers = ref<string[]>([]);
 const displayName = ref("");
+// null until get_pinned_name has answered; then whether the name is pinned.
+const namePinned = ref<boolean | null>(null);
 const peerNames = ref<Record<string, string>>({});
 const callConnectionProgress = ref<"idle" | "connecting" | "securing" | "connected">("idle");
 const incomingInvite = ref<{ peerId: string; ticket: string } | null>(null);
@@ -33,17 +35,35 @@ const peerVideoOff = ref<Record<string, boolean>>({});
 const invitedPeerId = ref<string | null>(null);
 
 let ringingTimer: ReturnType<typeof setTimeout> | null = null;
-let missedCallTimer: ReturnType<typeof setTimeout> | null = null;
 let answerTimer: ReturnType<typeof setTimeout> | null = null;
 let initialized = false;
+let pinnedNameRequested = false;
 let callUnlisteners: Array<() => void> = [];
 
 const RING_TIMEOUT_MS = 45_000;
 
-function showMissedCall(callerName: string) {
-  missedCall.value = { callerName, timestamp: Date.now() };
-  if (missedCallTimer) clearTimeout(missedCallTimer);
-  missedCallTimer = setTimeout(() => { missedCall.value = null; }, 5000);
+// A fresh object per event so app.vue's toast watcher fires even for
+// repeated misses from the same caller; the toast owns its own dismissal.
+function showMissedCall(name: string) {
+  missedCall.value = { callerName: name, timestamp: Date.now() };
+}
+
+// Same resolver the incoming-call banner uses: contact name, else short id.
+function callerName(pid: string) {
+  return useContacts().displayName(pid);
+}
+
+// Load the pinned display name once at startup so it is set before any call,
+// not only once the Settings page (NameInput) happens to mount.
+async function loadPinnedName() {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const saved = await invoke<string | null>("get_pinned_name");
+    if (saved && !displayName.value) displayName.value = saved;
+    namePinned.value = Boolean(saved);
+  } catch {
+    namePinned.value = false;
+  }
 }
 
 function relayUnavailableMessage(relayStatus: RelayStatus) {
@@ -222,6 +242,10 @@ export function useCall() {
     initialized = true;
     initCallListeners();
   }
+  if (!pinnedNameRequested && import.meta.client) {
+    pinnedNameRequested = true;
+    void loadPinnedName();
+  }
 
   async function createCall(): Promise<string | null> {
     error.value = null;
@@ -271,6 +295,7 @@ export function useCall() {
     nodeError: nodeRuntime.nodeError,
     error,
     displayName,
+    namePinned,
     peerNames,
     peerMuted,
     peerVideoOff,
@@ -392,13 +417,12 @@ async function initCallListeners() {
         // Auto-decline after 30 seconds
         ringingTimer = setTimeout(() => {
           if (state.value === "ringing") {
-            const callerName = peerNames.value[pid] || pid.slice(0, 12);
             ringingTimer = null;
             state.value = "idle";
             ticket.value = null;
             peerId.value = null;
             incomingInvite.value = null;
-            showMissedCall(callerName);
+            showMissedCall(callerName(pid));
             invoke("send_call_decline", { peerId: pid }).catch((e) => {
               console.warn(`[call] failed to send auto-decline to ${pid}:`, e);
             });
@@ -406,8 +430,7 @@ async function initCallListeners() {
         }, 30_000);
       } else {
         // Already busy — record as missed call
-        const callerName = peerNames.value[pid] || pid.slice(0, 12);
-        showMissedCall(callerName);
+        showMissedCall(callerName(pid));
       }
     }));
 
@@ -432,13 +455,12 @@ async function initCallListeners() {
       const pid = typeof data === "string" ? data : data?.peer_id;
       if (!pid) return;
       if (state.value === "ringing" && incomingInvite.value?.peerId === pid) {
-        const callerName = peerNames.value[pid] || pid.slice(0, 12);
         clearRingingTimer();
         state.value = "idle";
         ticket.value = null;
         peerId.value = null;
         incomingInvite.value = null;
-        showMissedCall(callerName);
+        showMissedCall(callerName(pid));
       }
     }));
 

@@ -668,8 +668,8 @@ pub async fn get_settings(
 /// Settings keys the webview is allowed to persist. Everything else is either
 /// backend-owned (identityStatus, persistentIdentity) or unknown — letting
 /// arbitrary keys through would let a compromised webview poison the store.
+/// The display name is persisted separately via set_pinned_name.
 const ALLOWED_SETTINGS_KEYS: &[&str] = &[
-    "displayName",
     "preferredMic",
     "preferredCamera",
     "preferredSpeaker",

@@ -1,6 +1,9 @@
 <script setup lang="ts">
+import { formatRelativeTime } from "~/utils/format";
+
 const { conversations, unreadCounts } = useDM();
 const { displayName } = useContacts();
+const now = useNow({ interval: 60_000 });
 
 function lastMessage(nodeId: string) {
   const msgs = conversations.value[nodeId];
@@ -19,16 +22,7 @@ function lastMessagePreview(nodeId: string): string {
 
 function lastMessageTime(nodeId: string): string {
   const msg = lastMessage(nodeId);
-  if (!msg) return "";
-  const date = new Date(msg.timestamp);
-  const now = new Date();
-  const diffMs = now.getTime() - date.getTime();
-  const diffMins = Math.floor(diffMs / 60_000);
-  const diffHours = Math.floor(diffMins / 60);
-  if (diffMins < 1) return "now";
-  if (diffMins < 60) return `${diffMins}m`;
-  if (diffHours < 24) return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+  return msg ? formatRelativeTime(msg.timestamp, now.value.getTime()) : "";
 }
 
 // ── Conversation list sorted by last message time ─────────
@@ -64,11 +58,11 @@ const sortedConversations = computed(() => {
       />
 
       <!-- Conversation rows -->
-      <div
+      <NuxtLink
         v-for="nodeId in sortedConversations"
         :key="nodeId"
-        class="flex cursor-pointer items-center gap-3 border-b border-default px-5 py-4 transition-colors hover:bg-muted"
-        @click="navigateTo('/dm/' + nodeId)"
+        :to="`/dm/${nodeId}`"
+        class="flex items-center gap-3 border-b border-default px-5 py-4 transition-colors hover:bg-muted"
       >
         <!-- Unread dot -->
         <span
@@ -99,7 +93,7 @@ const sortedConversations = computed(() => {
 
         <!-- Chevron -->
         <UIcon name="i-heroicons-chevron-right" class="shrink-0 text-base text-dimmed" />
-      </div>
+      </NuxtLink>
 
     </div>
   </div>

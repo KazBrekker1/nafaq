@@ -23,6 +23,14 @@ export default defineNuxtConfig({
 
   css: ["@/assets/css/main.css"],
 
+  // @nuxt/fonts (installed by Nuxt UI) self-hosts Inter at build time.
+  // Nuxt UI's default weights stop at 700; font-black needs 900.
+  fonts: {
+    families: [
+      { name: "Inter", provider: "google", weights: [400, 500, 600, 700, 900] },
+    ],
+  },
+
   icon: {
     clientBundle: {
       scan: true,
