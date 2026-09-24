@@ -1201,8 +1201,13 @@ export function useMediaTransport() {
   }
 
   function registerPeerCanvas(peerId: string, canvas: HTMLCanvasElement | null) {
+    // Function refs fire on every re-render of the tile, not just on mount —
+    // only a real change may cost a decoder reset and a keyframe request.
     const peerState = getOrCreatePeerState(peerId);
+    if (peerState.canvas === canvas) return;
     peerState.canvas = canvas;
+    // The decoder's output callback draws to the canvas it was created with.
+    destroyVideoDecoder(peerId);
     if (!canvas) {
       peerState.pendingVideoFrame = null;
       return;
