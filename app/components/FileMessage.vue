@@ -13,13 +13,17 @@ const { progress, localPath, failed } = defineProps<{
 const isComplete = computed(() => progress >= 1);
 const progressPct = computed(() => Math.round(progress * 100));
 
+const toast = useToast();
+
+// Received files land in ~/Downloads (see the FileEnd handler in
+// connection.rs); the opener capability is scoped to that directory.
 async function openFile() {
   if (!localPath) return;
   try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("plugin:shell|open", { path: localPath }).catch(() => {});
-  } catch {
-    // Silently fail — best-effort
+    const { openPath } = await import("@tauri-apps/plugin-opener");
+    await openPath(localPath);
+  } catch (e) {
+    toast.add({ title: "Could not open file", description: String(e), color: "error" });
   }
 }
 </script>
@@ -57,9 +61,10 @@ async function openFile() {
       <p class="mt-1 text-[9px] text-dimmed">{{ progressPct }}%</p>
     </div>
 
-    <!-- Completion: OPEN button if localPath available, otherwise status badge -->
+    <!-- Completion: OPEN button for received files (the only paths the
+         opener scope allows), otherwise status badge -->
     <div
-      v-if="isComplete && localPath"
+      v-if="isComplete && localPath && from === 'peer'"
       class="border-t border-primary/40"
     >
       <UButton

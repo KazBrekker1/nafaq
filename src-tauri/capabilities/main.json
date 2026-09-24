@@ -11,7 +11,13 @@
     "core:window:allow-close",
     "core:window:allow-set-title",
     "core:app:default",
-    "shell:allow-open",
+    {
+      "identifier": "opener:allow-open-path",
+      "allow": [
+        { "path": "$HOME/Downloads/**" },
+        { "path": "$TEMP/**" }
+      ]
+    },
     "dialog:allow-open",
     "os:default",
     "updater:default",
