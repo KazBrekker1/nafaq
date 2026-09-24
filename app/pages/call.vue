@@ -470,6 +470,28 @@ function handleSendChat(text: string) {
                 <span v-if="isPeerSuspect(peer)" class="suspect-dot" aria-hidden="true" />
                 {{ peer.slice(0, 12) }}...
               </span>
+              <!-- Remote mute / camera-off state (from the peer's control messages) -->
+              <div
+                v-if="call.peerMuted.value[peer] || call.peerVideoOff.value[peer]"
+                class="absolute top-1.5 left-1.5 flex items-center gap-1"
+              >
+                <span
+                  v-if="call.peerMuted.value[peer]"
+                  class="size-5 bg-error flex items-center justify-center"
+                  title="Muted"
+                  aria-label="Muted"
+                >
+                  <UIcon name="i-lucide-mic-off" class="text-inverted text-[10px]" />
+                </span>
+                <span
+                  v-if="call.peerVideoOff.value[peer]"
+                  class="size-5 bg-black/70 flex items-center justify-center"
+                  title="Camera off"
+                  aria-label="Camera off"
+                >
+                  <UIcon name="i-heroicons-video-camera-slash" class="text-dimmed text-xs" />
+                </span>
+              </div>
               <div class="absolute top-1.5 right-1.5 flex items-center gap-1.5">
                 <span v-if="transport.activeSpeaker.value === peer" class="text-[8px] text-primary bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
                 <button

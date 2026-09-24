@@ -339,6 +339,17 @@ async function initCallListeners() {
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
       }
+      // Mute / camera-off are only broadcast on change, so a peer joining
+      // later would assume both are on — send our current state.
+      const { audioMuted, videoMuted } = useMedia();
+      invoke("send_control", {
+        peerId: pid,
+        action: { action: "mute", muted: audioMuted.value },
+      }).catch(() => {});
+      invoke("send_control", {
+        peerId: pid,
+        action: { action: "video_off", off: videoMuted.value },
+      }).catch(() => {});
     }));
 
     callUnlisteners.push(await listen<any>("peer-disconnected", (event) => {
