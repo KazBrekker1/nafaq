@@ -145,6 +145,9 @@ defineShortcuts({
 // (state flips to connected while onMounted awaits the preview), so the
 // pipeline is single-flight: later callers share the first run.
 let pipelinePromise: Promise<void> | null = null;
+// Set once the pipeline has created the encoders; sending before that would
+// only feed frames to a backend with no encoder.
+let codecsReady = false;
 function startConnectedPipeline() {
   if (!pipelinePromise) {
     pipelinePromise = runConnectedPipeline().catch((e) => {
@@ -181,6 +184,7 @@ async function runConnectedPipeline() {
   if (cleaned) return;
   await transport.initCodecs(media.localStream.value);
   if (cleaned) return;
+  codecsReady = true;
 
   if (media.localStream.value && call.peers.value.length > 0) {
     await transport.startSending(media.localStream.value);
@@ -262,7 +266,7 @@ watch(() => [...call.peers.value], async (peerIds, oldPeerIds) => {
   // Notification sounds
   if (oldPeerIds && peerIds.length > oldPeerIds.length) playPeerConnected();
   if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
-  if (media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
+  if (codecsReady && media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
     await transport.startSending(media.localStream.value);
   }
 });
