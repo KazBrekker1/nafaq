@@ -6,40 +6,17 @@ const encoding = ref(false);
 const connectionQuality = ref<"good" | "degraded" | "poor">("good");
 
 type MediaBridgeMode = "channel_binary" | "event_base64";
-type TransportLifecycleState = "idle" | "starting" | "running" | "degraded" | "stopping";
 
 interface MediaSessionProfile {
   sessionId: string;
   receiveBridgeMode: MediaBridgeMode;
   receiveVideoMode: "decoded_jpeg" | "raw_h264_nalu";
-  receiveAudioMode: "decoded_pcm";
-  sendIngressMode: "invoke_raw" | "invoke_json_fallback";
-  playbackReady: boolean;
-  bridgeReady: boolean;
 }
 
 interface MediaBridgeRegistration {
   sessionId: string;
   preferredBridgeModes: MediaBridgeMode[];
-  playbackReady: boolean;
   webcodecsActive: boolean;
-}
-
-interface MediaPlaybackStatus {
-  sessionId: string;
-  audioReady: boolean;
-  videoReady: boolean;
-  lastFailure: string | null;
-}
-
-interface TransportStatus {
-  state: TransportLifecycleState;
-  sessionId: string | null;
-  selectedMode: MediaBridgeMode | null;
-  audioReady: boolean;
-  videoReady: boolean;
-  bridgeReady: boolean;
-  lastFailure: string | null;
 }
 
 interface PendingVideoFrame {
@@ -97,15 +74,10 @@ interface MediaUploader {
   close: () => void;
 }
 
-const transportStatus = ref<TransportStatus>({
-  state: "idle",
-  sessionId: null,
-  selectedMode: null,
-  audioReady: false,
-  videoReady: false,
-  bridgeReady: false,
-  lastFailure: null,
-});
+// Receive side lifecycle (startReceiving is idempotent while a session is
+// starting/running) and the registered bridge session, for clearing it.
+let receiveState: "idle" | "starting" | "running" = "idle";
+let bridgeSessionId: string | null = null;
 
 const activeSpeaker = ref<string | null>(null);
 const peerSpeakingMap = ref<Record<string, boolean>>({});
@@ -653,14 +625,6 @@ function parseRawNaluPacket(buf: ArrayBuffer) {
   return { peerId, timestamp, isKeyframe, h264Data };
 }
 
-function setTransportFailure(message: string) {
-  transportStatus.value = {
-    ...transportStatus.value,
-    state: transportStatus.value.state === "starting" ? "degraded" : transportStatus.value.state,
-    lastFailure: message,
-  };
-}
-
 async function sendControl(peerId: string, action: Record<string, unknown>) {
   const invoke = await invokePromise;
   await invoke("send_control", { peerId, action });
@@ -673,31 +637,6 @@ async function requestKeyframe(peerId: string, force = false) {
   if (!force && now - peerState.lastKeyframeRequestAt < KEYFRAME_REQUEST_DEBOUNCE_MS) return;
   peerState.lastKeyframeRequestAt = now;
   sendControl(peerId, { action: "keyframe_request", layer: "high" }).catch(() => {});
-}
-
-async function reportPlaybackStatus() {
-  const sessionId = transportStatus.value.sessionId;
-  if (!sessionId) return;
-  const invoke = await invokePromise;
-  const status: MediaPlaybackStatus = {
-    sessionId,
-    audioReady: transportStatus.value.audioReady,
-    videoReady: transportStatus.value.videoReady,
-    lastFailure: transportStatus.value.lastFailure,
-  };
-  await invoke("report_media_playback_status", { status }).catch(() => {});
-}
-
-async function acknowledgeBridgeReady() {
-  const sessionId = transportStatus.value.sessionId;
-  if (!sessionId || transportStatus.value.bridgeReady) return;
-  transportStatus.value = {
-    ...transportStatus.value,
-    bridgeReady: true,
-    state: "running",
-  };
-  const invoke = await invokePromise;
-  await invoke("ack_media_bridge_ready", { sessionId }).catch(() => {});
 }
 
 function resolveBridgeProbe() {
@@ -796,29 +735,8 @@ async function ensurePlaybackContext(token: number) {
   }
 }
 
-function markAudioReady() {
-  if (!transportStatus.value.audioReady) {
-    transportStatus.value = {
-      ...transportStatus.value,
-      audioReady: true,
-    };
-    reportPlaybackStatus().catch(() => {});
-  }
-}
-
-function markVideoReady() {
-  if (!transportStatus.value.videoReady) {
-    transportStatus.value = {
-      ...transportStatus.value,
-      videoReady: true,
-    };
-    reportPlaybackStatus().catch(() => {});
-  }
-}
-
 function handleBridgeProbe(peerId: string) {
   if (peerId !== BRIDGE_PROBE_PEER_ID) return false;
-  acknowledgeBridgeReady().catch(() => {});
   resolveBridgeProbe();
   return true;
 }
@@ -869,7 +787,6 @@ function handleIncomingPcm(peerId: string, _timestamp: number, pcmBytes: Uint8Ar
 
   // Only touch reactive state on an actual change — this runs 50x/s per peer.
   if (peerState.speaking !== wasSpeaking) updateSpeakingMap();
-  markAudioReady();
 }
 
 async function drawJpegToCanvas(
@@ -938,14 +855,11 @@ async function handleIncomingVideoFrame(
       if (current.timestamp >= peerState.lastDrawnTimestamp) {
         await drawJpegToCanvas(peerState.canvas, current.jpegBytes, current.width, current.height);
         peerState.lastDrawnTimestamp = current.timestamp;
-        markVideoReady();
       }
       next = peerState.pendingVideoFrame;
     }
   } catch (error) {
-    const message = `Video frame render failed: ${error instanceof Error ? error.message : String(error)}`;
-    setTransportFailure(message);
-    await reportPlaybackStatus();
+    console.warn("[transport] Video frame render failed:", error);
   } finally {
     peerState.jpegRendering = false;
   }
@@ -965,7 +879,6 @@ async function setupReceiveBridge(token: number, forceEventMode = false) {
   const registration: MediaBridgeRegistration = {
     sessionId,
     preferredBridgeModes,
-    playbackReady: playbackCtx?.state === "running",
     // Raw NALUs only travel over the binary channel; in event mode the
     // backend has to decode to JPEG, or no video would arrive at all.
     webcodecsActive: !forceEventMode && await supportsWebCodecsDecode(),
@@ -982,16 +895,7 @@ async function setupReceiveBridge(token: number, forceEventMode = false) {
     throw new TransportStoppedError();
   }
 
-  transportStatus.value = {
-    state: "starting",
-    sessionId: profile.sessionId,
-    selectedMode: profile.receiveBridgeMode,
-    audioReady: false,
-    videoReady: false,
-    bridgeReady: false,
-    lastFailure: null,
-  };
-
+  bridgeSessionId = profile.sessionId;
   bridgeProbeReceived = false;
 
   audioChannel = nextAudioChannel;
@@ -1095,9 +999,7 @@ async function setupReceiveBridge(token: number, forceEventMode = false) {
       await setupReceiveBridge(token, true);
       return;
     }
-    const message = `Media bridge setup failed: ${error instanceof Error ? error.message : String(error)}`;
-    setTransportFailure(message);
-    await reportPlaybackStatus();
+    console.warn("[transport] Media bridge setup failed:", error);
     throw error;
   }
 }
@@ -1114,7 +1016,8 @@ function disposeReceiveListeners() {
 }
 
 async function teardownReceiveBridge(clearBackend = true) {
-  const sessionId = transportStatus.value.sessionId;
+  const sessionId = bridgeSessionId;
+  bridgeSessionId = null;
 
   unlistenAudio?.();
   unlistenVideo?.();
@@ -1385,7 +1288,7 @@ export function useMediaTransport() {
       ensureCaptureRun(token);
       if (!resumed) {
         // Don't fail (or hang) the call: capture starts on the next gesture.
-        setTransportFailure("Microphone capture is waiting for user interaction");
+        console.warn("[transport] Microphone capture is waiting for user interaction");
         resumeCaptureOnGesture();
       }
       const WORKLET_CODE = `
@@ -1565,21 +1468,13 @@ export function useMediaTransport() {
 
   async function startReceiving(getPeerIds: () => string[]) {
     peerIdsProvider = getPeerIds;
-    if (transportStatus.value.state === "starting" || transportStatus.value.state === "running") {
+    if (receiveState !== "idle") {
       await syncSubscriptions(getPeerIds());
       return;
     }
 
     const token = receiveRunToken;
-    transportStatus.value = {
-      state: "starting",
-      sessionId: null,
-      selectedMode: null,
-      audioReady: false,
-      videoReady: false,
-      bridgeReady: false,
-      lastFailure: null,
-    };
+    receiveState = "starting";
 
     // A previous run that failed mid-setup (or a stale degraded session) may
     // have left listeners or the quality watcher behind — dispose them before
@@ -1588,13 +1483,14 @@ export function useMediaTransport() {
 
     try {
       await startReceivingInner(getPeerIds, token);
+      receiveState = "running";
     } catch (error) {
       // stop() landed mid-setup and already tore everything down.
       if (token !== receiveRunToken) return;
       // Leave nothing half-registered so a later retry starts clean.
       disposeReceiveListeners();
       await teardownReceiveBridge(true).catch(() => {});
-      transportStatus.value = { ...transportStatus.value, state: "idle" };
+      receiveState = "idle";
       throw error;
     }
   }
@@ -1810,10 +1706,6 @@ export function useMediaTransport() {
 
   async function stop() {
     receiveRunToken++;
-    transportStatus.value = {
-      ...transportStatus.value,
-      state: "stopping",
-    };
 
     teardownCapture();
     await teardownReceiveBridge(true);
@@ -1861,16 +1753,7 @@ export function useMediaTransport() {
     webEncoderFailed = false;
     audioBufferPool = null;
     videoFrameBufferPool = null;
-
-    transportStatus.value = {
-      state: "idle",
-      sessionId: null,
-      selectedMode: null,
-      audioReady: false,
-      videoReady: false,
-      bridgeReady: false,
-      lastFailure: null,
-    };
+    receiveState = "idle";
   }
 
   async function setPeerVideoPaused(peerId: string, paused: boolean) {
@@ -1892,7 +1775,6 @@ export function useMediaTransport() {
     peerSpeakingMap,
     activeSpeaker,
     connectionQuality,
-    status: transportStatus,
     initCodecs,
     registerPeerCanvas,
     startSending,
