@@ -163,6 +163,40 @@ let bridgeProbeResolver: (() => void) | null = null;
 let bridgeProbeReceived = false;
 let bridgeFallbackUsed = false;
 
+// Setup is a chain of awaits that stop() can land in the middle of. Each run
+// captures the token it started with and bails out after every await once it
+// changed, so a stale setup can't resume and re-register bridges, listeners
+// or intervals after teardown. Receive and capture have separate tokens:
+// restartSending() tears down capture only and must not cancel receiving.
+let receiveRunToken = 0; // bumped by stop()
+let captureRunToken = 0; // bumped by teardownCapture() (and so by stop())
+
+class TransportStoppedError extends Error {
+  constructor() {
+    super("stopped");
+  }
+}
+
+function ensureReceiveRun(token: number) {
+  if (token !== receiveRunToken) throw new TransportStoppedError();
+}
+
+function ensureCaptureRun(token: number) {
+  if (token !== captureRunToken) throw new TransportStoppedError();
+}
+
+// listen() for a receive run: a listener that resolves after stop() is
+// unregistered on the spot instead of leaking into the next call.
+async function listenForRun<T>(token: number, event: string, handler: (event: { payload: T }) => void) {
+  const { listen } = await import("@tauri-apps/api/event");
+  const unlisten = await listen<T>(event, handler);
+  if (token !== receiveRunToken) {
+    unlisten();
+    throw new TransportStoppedError();
+  }
+  return unlisten;
+}
+
 const isAndroid = isAndroidUa;
 const DECODER_CODEC = "avc1.42001E"; // H.264 Constrained Baseline Level 3.0
 // A VideoDecoder global doesn't guarantee H.264 support (e.g. Linux WebKitGTK
@@ -670,16 +704,19 @@ function keepContextRunning(ctx: AudioContext, label: string) {
   return resumeOnGesture;
 }
 
-async function ensurePlaybackContext() {
+async function ensurePlaybackContext(token: number) {
   if (!playbackCtx) {
     playbackCtx = new AudioContext({ sampleRate: 48000 });
     const resumeOnGesture = keepContextRunning(playbackCtx, "playback");
-    if (!(await resumeWithTimeout(playbackCtx))) {
+    const resumed = await resumeWithTimeout(playbackCtx);
+    ensureReceiveRun(token);
+    if (!resumed) {
       console.warn("[transport] Playback AudioContext resume deferred until user interaction");
       resumeOnGesture();
     }
   } else if (playbackCtx.state !== "running") {
     await resumeWithTimeout(playbackCtx);
+    ensureReceiveRun(token);
   }
 
   if (!playbackWorkletLoaded) {
@@ -695,7 +732,9 @@ async function ensurePlaybackContext() {
       })
       .finally(() => URL.revokeObjectURL(blobUrl));
   }
-  if (!(await playbackWorkletLoaded)) {
+  const workletLoaded = await playbackWorkletLoaded;
+  ensureReceiveRun(token);
+  if (!workletLoaded) {
     playbackWorkletLoaded = null;
     throw new Error("Audio playback worklet unavailable");
   }
@@ -853,9 +892,8 @@ async function handleIncomingVideoFrame(
   }
 }
 
-async function setupReceiveBridge(forceEventMode = false) {
+async function setupReceiveBridge(token: number, forceEventMode = false) {
   const { invoke } = await corePromise;
-  const { listen } = await import("@tauri-apps/api/event");
 
   const sessionId = createSessionId();
   const preferredBridgeModes: MediaBridgeMode[] = forceEventMode
@@ -879,6 +917,11 @@ async function setupReceiveBridge(forceEventMode = false) {
     audio: nextAudioChannel,
     video: nextVideoChannel,
   });
+  if (token !== receiveRunToken) {
+    // stop() ran while registering; it couldn't know this session id.
+    await invoke("clear_media_bridge", { sessionId: profile.sessionId }).catch(() => {});
+    throw new TransportStoppedError();
+  }
 
   transportStatus.value = {
     state: "starting",
@@ -958,11 +1001,11 @@ async function setupReceiveBridge(forceEventMode = false) {
       videoChannel = null;
     };
   } else {
-    unlistenAudio = await listen<LegacyAudioEvent>("audio-received", (event) => {
+    unlistenAudio = await listenForRun<LegacyAudioEvent>(token, "audio-received", (event) => {
       const payload = event.payload;
       handleIncomingPcm(payload.peer_id, payload.timestamp, fromBase64(payload.data));
     });
-    unlistenVideo = await listen<LegacyVideoEvent>("video-received", (event) => {
+    unlistenVideo = await listenForRun<LegacyVideoEvent>(token, "video-received", (event) => {
       const payload = event.payload;
       const peerState = peerMediaStates.get(payload.peer_id);
       if (peerState?.videoPaused) return;
@@ -978,15 +1021,19 @@ async function setupReceiveBridge(forceEventMode = false) {
 
   const probeWait = waitForBridgeProbe();
   await invoke("probe_media_bridge", { sessionId: profile.sessionId });
+  ensureReceiveRun(token);
 
   try {
     await probeWait;
   } catch (error) {
+    // After stop() the bridge globals may already belong to a newer run.
+    ensureReceiveRun(token);
     await teardownReceiveBridge(false);
     if (!bridgeFallbackUsed && profile.receiveBridgeMode === "channel_binary") {
       bridgeFallbackUsed = true;
       await invoke("clear_media_bridge", { sessionId: profile.sessionId }).catch(() => {});
-      await setupReceiveBridge(true);
+      ensureReceiveRun(token);
+      await setupReceiveBridge(token, true);
       return;
     }
     const message = `Media bridge setup failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -1116,12 +1163,14 @@ function webEncoderConfig(): VideoEncoderConfig {
   };
 }
 
-async function setupWebEncoder(): Promise<boolean> {
+async function setupWebEncoder(token: number): Promise<boolean> {
   if (!isAndroid || webEncoderFailed || typeof VideoEncoder === "undefined") return false;
   if (webEncoder) return true;
   try {
     const config = webEncoderConfig();
     const support = await VideoEncoder.isConfigSupported(config);
+    // Capture was torn down meanwhile — don't install an orphan encoder.
+    if (token !== captureRunToken) return false;
     if (!support.supported) {
       webEncoderFailed = true;
       return false;
@@ -1243,10 +1292,14 @@ export function useMediaTransport() {
     if (encoding.value) return;
     encoding.value = true;
     activeCaptureStream = stream;
+    const token = captureRunToken;
 
     try {
-      await startSendingInner(stream);
+      await startSendingInner(stream, token);
     } catch (error) {
+      // Torn down mid-setup (stop/restart): that teardown already released
+      // this run's resources, and anything global now belongs to a newer run.
+      if (token !== captureRunToken) return;
       // Release everything the partial setup created (capture AudioContext,
       // off-screen video element, worklet) — otherwise a failed start leaks
       // them and blocks the next attempt.
@@ -1255,15 +1308,18 @@ export function useMediaTransport() {
     }
   }
 
-  async function startSendingInner(stream: MediaStream) {
+  async function startSendingInner(stream: MediaStream, token: number) {
     const invoke = await invokePromise;
+    ensureCaptureRun(token);
     mediaUploader = createMediaUploader(invoke);
 
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack) {
       captureCtx = new AudioContext({ sampleRate: 48000 });
       const resumeCaptureOnGesture = keepContextRunning(captureCtx, "capture");
-      if (!(await resumeWithTimeout(captureCtx))) {
+      const resumed = await resumeWithTimeout(captureCtx);
+      ensureCaptureRun(token);
+      if (!resumed) {
         // Don't fail (or hang) the call: capture starts on the next gesture.
         setTransportFailure("Microphone capture is waiting for user interaction");
         resumeCaptureOnGesture();
@@ -1288,6 +1344,7 @@ export function useMediaTransport() {
       } finally {
         URL.revokeObjectURL(blobUrl);
       }
+      ensureCaptureRun(token);
 
       sourceNode = captureCtx.createMediaStreamSource(new MediaStream([audioTrack]));
       workletNode = new AudioWorkletNode(captureCtx, "capture");
@@ -1367,7 +1424,10 @@ export function useMediaTransport() {
       // programmatically-created video elements, so RAF is more reliable.
       const rafCaptureLoop = () => {
         captureRafId = null;
-        if (!encoding.value || !captureVideoEl) return;
+        if (token !== captureRunToken || !encoding.value || !captureVideoEl) return;
+        // Schedule first: a throw below (drawImage, VideoFrame, encode) must
+        // not silently end capture for the rest of the call.
+        captureRafId = requestAnimationFrame(rafCaptureLoop);
 
         const now = performance.now();
         const elapsed = now - lastCaptureTime;
@@ -1414,14 +1474,13 @@ export function useMediaTransport() {
             }
           }
         }
-
-        captureRafId = requestAnimationFrame(rafCaptureLoop);
       };
 
-      await setupWebEncoder();
+      await setupWebEncoder(token);
+      ensureCaptureRun(token);
 
       const startCaptureLoop = () => {
-        if (captureLoopStarted || !captureVideoEl) return;
+        if (token !== captureRunToken || captureLoopStarted || !captureVideoEl) return;
         captureLoopStarted = true;
         captureRafId = requestAnimationFrame(rafCaptureLoop);
       };
@@ -1447,6 +1506,7 @@ export function useMediaTransport() {
       return;
     }
 
+    const token = receiveRunToken;
     transportStatus.value = {
       state: "starting",
       sessionId: null,
@@ -1463,8 +1523,10 @@ export function useMediaTransport() {
     disposeReceiveListeners();
 
     try {
-      await startReceivingInner(getPeerIds);
+      await startReceivingInner(getPeerIds, token);
     } catch (error) {
+      // stop() landed mid-setup and already tore everything down.
+      if (token !== receiveRunToken) return;
       // Leave nothing half-registered so a later retry starts clean.
       disposeReceiveListeners();
       await teardownReceiveBridge(true).catch(() => {});
@@ -1473,14 +1535,14 @@ export function useMediaTransport() {
     }
   }
 
-  async function startReceivingInner(getPeerIds: () => string[]) {
-    await ensurePlaybackContext();
+  async function startReceivingInner(getPeerIds: () => string[], token: number) {
+    await ensurePlaybackContext(token);
     bridgeFallbackUsed = false;
     await teardownReceiveBridge(false);
-    await setupReceiveBridge(false);
+    ensureReceiveRun(token);
+    await setupReceiveBridge(token, false);
 
-    const { listen } = await import("@tauri-apps/api/event");
-    unlistenDisconnect = await listen<{ peer_id: string }>("peer-disconnected", (event) => {
+    unlistenDisconnect = await listenForRun<{ peer_id: string }>(token, "peer-disconnected", (event) => {
       const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
       if (!pid) return;
       const state = peerMediaStates.get(pid);
@@ -1494,13 +1556,13 @@ export function useMediaTransport() {
 
     // Call-size profile: rebuild the encoder at the new base; the backend
     // controller applies its congestion level on top.
-    unlistenQuality = await listen<{
+    unlistenQuality = await listenForRun<{
       peer_count: number;
       bitrate_bps: number;
       fps: number;
       max_width: number;
       max_height: number;
-    }>("quality-profile-changed", async (event) => {
+    }>(token, "quality-profile-changed", async (event) => {
       const { bitrate_bps, fps, max_width, max_height } = event.payload;
       baseProfile = {
         bitrateBps: bitrate_bps,
@@ -1513,7 +1575,7 @@ export function useMediaTransport() {
 
     // Single source of truth for outbound quality: the backend's controller
     // (driven by skipped frames, loss and queueing delay — not raw RTT).
-    unlistenSendQuality = await listen<{ level: number }>("send-quality-changed", async (event) => {
+    unlistenSendQuality = await listenForRun<{ level: number }>(token, "send-quality-changed", async (event) => {
       sendLevel = event.payload.level;
       connectionQuality.value = sendQualityForLevel(sendLevel);
       await applyCaptureProfile({ rebuildEncoder: false });
@@ -1610,6 +1672,7 @@ export function useMediaTransport() {
   }
 
   function teardownCapture() {
+    captureRunToken++;
     encoding.value = false;
     closeWebEncoder();
     videoSendInFlight = false;
@@ -1650,11 +1713,14 @@ export function useMediaTransport() {
 
   async function restartSending(newStream: MediaStream) {
     teardownCapture();
+    const token = captureRunToken;
     await initCodecs(newStream);
+    if (token !== captureRunToken) return; // stopped meanwhile
     await startSending(newStream);
   }
 
   async function stop() {
+    receiveRunToken++;
     transportStatus.value = {
       ...transportStatus.value,
       state: "stopping",
