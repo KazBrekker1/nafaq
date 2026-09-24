@@ -131,8 +131,8 @@ struct ActiveFileReceive {
 /// arbitrarily large file and legitimately stream it until the disk fills.
 const MAX_INCOMING_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
-/// Transfer ids are embedded in temp-file names, so anything outside a
-/// UUID-ish charset is a path-injection attempt.
+/// Transfer ids are echoed to the frontend and used as map keys; anything
+/// outside a UUID-ish charset is rejected as a protocol violation.
 fn is_valid_transfer_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -293,9 +293,17 @@ async fn handle_dm_file_message(
                 emit_file_transfer_failed(event_tx, peer_id, id, "too many concurrent transfers");
                 return true;
             }
-            let temp_dir = std::env::temp_dir();
-            let temp_path = temp_dir.join(format!("nafaq_recv_{id}"));
-            match tokio::fs::File::create(&temp_path).await {
+            // Named by a local uuid, never the peer-chosen id, and created
+            // exclusively so an existing file (or a symlink planted in the
+            // shared temp dir) is never opened or truncated.
+            let temp_path =
+                std::env::temp_dir().join(format!("nafaq_recv_{}", uuid::Uuid::new_v4()));
+            let created = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await;
+            match created {
                 Ok(file) => {
                     active_files.insert(
                         id.clone(),
