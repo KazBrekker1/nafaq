@@ -1333,6 +1333,40 @@ impl ConnectionManager {
         .await
     }
 
+    /// Puts a re-presented DM stream's send half into the existing entry's
+    /// slot for the same connection. Returns `DrainDuplicate` if the slot is
+    /// still occupied, and `CloseDuplicate` if the entry was cleaned up while
+    /// no map lock was held (the stream would otherwise be stranded on an
+    /// orphaned slot, silently dropping DMs).
+    async fn reattach_dm_send_stream(
+        &self,
+        peer_id: &str,
+        existing_send: Arc<Mutex<Option<SendStream>>>,
+        new_send: Option<SendStream>,
+    ) -> DmStreamRegistration {
+        {
+            let mut slot = existing_send.lock().await;
+            if slot.is_some() {
+                return DmStreamRegistration::DrainDuplicate;
+            }
+            *slot = new_send;
+        }
+        let still_registered = self
+            .dm_peers
+            .lock()
+            .await
+            .get(peer_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.dm_send, &existing_send));
+        if !still_registered {
+            if let Some(mut send) = existing_send.lock().await.take() {
+                let _ = send.finish();
+            }
+            return DmStreamRegistration::CloseDuplicate;
+        }
+        self.dm_connect_done.notify_waiters();
+        DmStreamRegistration::Stored
+    }
+
     async fn store_dm_peer_connection_with_ownership(
         &self,
         peer_id: &str,
@@ -1356,30 +1390,26 @@ impl ConnectionManager {
         let old_dm_peer = {
             let local_node_id = self.local_node_id().await;
             let mut dm_peers = self.dm_peers.lock().await;
+            if let Some(existing) = dm_peers
+                .get(peer_id)
+                .filter(|existing| existing.connection.stable_id() == connection.stable_id())
+            {
+                if ownership == DmConnectionOwnership::SharedCall {
+                    return DmStreamRegistration::CloseDuplicate;
+                }
+                // Same underlying QUIC connection re-presented its DM stream.
+                // Never await a dm_send lock while holding dm_peers (a writer
+                // may hold it for up to DM_WRITE_TIMEOUT, stalling every DM
+                // path): clone the slot, release the map, then lock it.
+                let existing_send = existing.dm_send.clone();
+                drop(dm_peers);
+                let new_send = dm_send.lock().await.take();
+                return self
+                    .reattach_dm_send_stream(peer_id, existing_send, new_send)
+                    .await;
+            }
             let should_insert = match dm_peers.get(peer_id) {
                 None => true,
-                Some(existing) if existing.connection.stable_id() == connection.stable_id() => {
-                    if ownership == DmConnectionOwnership::SharedCall {
-                        return DmStreamRegistration::CloseDuplicate;
-                    }
-                    if existing.dm_send.lock().await.is_some() {
-                        return DmStreamRegistration::DrainDuplicate;
-                    }
-                    // Same underlying QUIC connection re-presented its DM stream.
-                    // Swap the new SendStream in while STILL holding dm_peers, so
-                    // a concurrent cleanup_dm_internal can't remove the entry
-                    // between our check and the write — which would leave the new
-                    // stream stranded on an orphaned entry and silently drop DMs.
-                    //
-                    // LOCK ORDER INVARIANT: dm_peers may be held while acquiring a
-                    // dm_send lock (here), so no code path may acquire dm_peers
-                    // while holding a dm_send lock — every sender must clone the
-                    // dm_send Arc under dm_peers, release dm_peers, then lock it.
-                    let new_send = dm_send.lock().await.take();
-                    *existing.dm_send.lock().await = new_send;
-                    self.dm_connect_done.notify_waiters();
-                    return DmStreamRegistration::Stored;
-                }
                 // Same-direction duplicate: the initiator re-dialed, which only
                 // happens once it considers the old connection dead — replace
                 // rather than reject (see dm_connection_handling).
