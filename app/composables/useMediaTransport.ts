@@ -1628,47 +1628,54 @@ export function useMediaTransport() {
 
   function startActiveSpeakerDetection() {
     if (activeSpeakerInterval) return;
-    let speakerCheckRunning = false;
-    activeSpeakerInterval = setInterval(async () => {
-      if (speakerCheckRunning) return;
-      speakerCheckRunning = true;
-      try {
-        const now = Date.now();
-        let loudest: string | null = null;
-        let loudestRms = 0;
+    activeSpeakerInterval = setInterval(() => {
+      const now = Date.now();
+      let loudest: string | null = null;
+      let loudestRms = 0;
+      let speakingChanged = false;
 
-        for (const [peerId, state] of peerMediaStates) {
-          if (state.lastAudioRms > loudestRms) {
-            loudestRms = state.lastAudioRms;
-            loudest = peerId;
+      for (const [peerId, state] of peerMediaStates) {
+        // Speaking state is otherwise only updated per packet, so a peer
+        // whose audio stops mid-word (muted, stalled, paused) would stay
+        // "speaking" and keep its level forever.
+        if (now - state.lastAudioAt > ACTIVE_SPEAKER_INTERVAL_MS) {
+          state.lastAudioRms *= 0.5;
+          if (state.speaking && now - state.lastSpeakingTime > SPEAKING_DEBOUNCE_MS) {
+            state.speaking = false;
+            speakingChanged = true;
           }
         }
-
-        const current = activeSpeaker.value;
-        const currentState = current ? peerMediaStates.get(current) : null;
-        let shouldSwitch = false;
-
-        if (!current) {
-          shouldSwitch = loudest !== null && loudestRms > SPEAKING_RMS_THRESHOLD;
-        } else if (currentState) {
-          const currentSilent = now - currentState.lastSpeakingTime > ACTIVE_SPEAKER_SILENCE_MS;
-          if (currentSilent && loudest && loudest !== current) {
-            shouldSwitch = true;
-          } else if (loudest && loudest !== current) {
-            const louderEnough = loudestRms > currentState.lastAudioRms * ACTIVE_SPEAKER_SWITCH_THRESHOLD;
-            const loudestState = peerMediaStates.get(loudest);
-            const speakingLongEnough = loudestState &&
-              loudestState.speaking &&
-              (now - loudestState.speakingSince) >= ACTIVE_SPEAKER_MIN_DURATION_MS;
-            shouldSwitch = louderEnough && !!speakingLongEnough;
-          }
+        if (state.lastAudioRms > loudestRms) {
+          loudestRms = state.lastAudioRms;
+          loudest = peerId;
         }
+      }
+      if (speakingChanged) updateSpeakingMap();
 
-        if (shouldSwitch && loudest) {
-          activeSpeaker.value = loudest;
+      const current = activeSpeaker.value;
+      const currentState = current ? peerMediaStates.get(current) : null;
+      // Background noise alone never makes someone the speaker.
+      const loudestAudible = loudest !== null && loudestRms > SPEAKING_RMS_THRESHOLD;
+      let shouldSwitch = false;
+
+      if (!current) {
+        shouldSwitch = loudestAudible;
+      } else if (currentState) {
+        const currentSilent = now - currentState.lastSpeakingTime > ACTIVE_SPEAKER_SILENCE_MS;
+        if (currentSilent && loudest !== current) {
+          shouldSwitch = loudestAudible;
+        } else if (loudest && loudest !== current) {
+          const louderEnough = loudestRms > currentState.lastAudioRms * ACTIVE_SPEAKER_SWITCH_THRESHOLD;
+          const loudestState = peerMediaStates.get(loudest);
+          const speakingLongEnough = loudestState &&
+            loudestState.speaking &&
+            (now - loudestState.speakingSince) >= ACTIVE_SPEAKER_MIN_DURATION_MS;
+          shouldSwitch = louderEnough && !!speakingLongEnough;
         }
-      } finally {
-        speakerCheckRunning = false;
+      }
+
+      if (shouldSwitch && loudest) {
+        activeSpeaker.value = loudest;
       }
     }, ACTIVE_SPEAKER_INTERVAL_MS);
   }
