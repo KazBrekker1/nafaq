@@ -320,6 +320,8 @@ pub enum Event {
     DmFileTransferFailed {
         peer_id: String,
         file_id: String,
+        /// Human-readable cause, for logs/UI. Additive field.
+        reason: Option<String>,
     },
     DmFileProgress {
         peer_id: String,

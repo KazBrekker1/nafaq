@@ -204,11 +204,52 @@ fn unique_file_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     candidate // unreachable in practice
 }
 
+/// Tell the frontend a transfer ended without a saved file, so its card shows
+/// "failed" instead of hanging at partial progress.
+fn emit_file_transfer_failed(
+    event_tx: &broadcast::Sender<Event>,
+    peer_id: &str,
+    file_id: &str,
+    reason: &str,
+) {
+    let _ = event_tx.send(Event::DmFileTransferFailed {
+        peer_id: peer_id.to_string(),
+        file_id: file_id.to_string(),
+        reason: Some(reason.to_string()),
+    });
+}
+
+/// Where completed transfers are saved.
+fn downloads_dir() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(|h| std::path::PathBuf::from(h).join("Downloads"))
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// Move a completed temp file to its final location, falling back to copy +
+/// remove when rename fails (e.g. across filesystems).
+async fn save_received_file(
+    temp_path: &std::path::Path,
+    final_path: &std::path::Path,
+) -> std::io::Result<()> {
+    match tokio::fs::rename(temp_path, final_path).await {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            tracing::debug!("rename failed ({rename_err}), trying copy fallback");
+            tokio::fs::copy(temp_path, final_path).await?;
+            let _ = tokio::fs::remove_file(temp_path).await;
+            Ok(())
+        }
+    }
+}
+
 /// Process a single DM message, handling file reconstruction when appropriate.
 /// Returns `true` if the caller should `continue` (i.e. skip emitting DmReceived).
 async fn handle_dm_file_message(
     dm_msg: &DmMessage,
     peer_id: &str,
+    sender_is_contact: bool,
     active_files: &mut HashMap<String, ActiveFileReceive>,
     event_tx: &broadcast::Sender<Event>,
 ) -> bool {
@@ -229,6 +270,12 @@ async fn handle_dm_file_message(
                 );
                 return true;
             }
+            // Only saved contacts may write files to disk.
+            if !sender_is_contact {
+                tracing::warn!("Rejecting file transfer {id} from {peer_id}: not a contact");
+                emit_file_transfer_failed(event_tx, peer_id, id, "sender is not a contact");
+                return true;
+            }
             // Bound concurrent in-flight transfers so a peer can't exhaust file
             // descriptors / memory by opening unbounded FileStarts without ends.
             const MAX_CONCURRENT_TRANSFERS: usize = 16;
@@ -236,7 +283,8 @@ async fn handle_dm_file_message(
                 tracing::warn!(
                     "Rejecting file transfer {id} from {peer_id}: too many concurrent transfers"
                 );
-                return false;
+                emit_file_transfer_failed(event_tx, peer_id, id, "too many concurrent transfers");
+                return true;
             }
             let temp_dir = std::env::temp_dir();
             let temp_path = temp_dir.join(format!("nafaq_recv_{id}"));
@@ -255,6 +303,8 @@ async fn handle_dm_file_message(
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create temp file for transfer {id}: {e}");
+                    emit_file_transfer_failed(event_tx, peer_id, id, "could not create temp file");
+                    return true;
                 }
             }
             false // still emit DmReceived so frontend shows the file
@@ -271,6 +321,7 @@ async fn handle_dm_file_message(
                 if let Some(recv) = active_files.remove(id) {
                     drop(recv.file);
                     let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                    emit_file_transfer_failed(event_tx, peer_id, id, "chunk exceeds declared size");
                 }
                 return true;
             }
@@ -305,76 +356,64 @@ async fn handle_dm_file_message(
             true
         }
         DmMessage::FileEnd { id } => {
-            if let Some(mut recv) = active_files.remove(id) {
-                // Flush and close the temp file
-                let _ = recv.file.flush().await;
-                drop(recv.file);
-
-                // Determine downloads directory
-                let downloads_dir = std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .map(|h| std::path::PathBuf::from(h).join("Downloads"))
-                    .unwrap_or_else(|_| std::env::temp_dir());
-
-                // Ensure the directory exists
-                let _ = tokio::fs::create_dir_all(&downloads_dir).await;
-
-                let final_path = unique_file_path(&downloads_dir, &recv.final_name);
-                // Belt and braces on top of sanitize_file_name: the file must
-                // land directly in the downloads directory, nowhere else.
-                if final_path.parent() != Some(downloads_dir.as_path()) {
-                    tracing::warn!(
-                        "Refusing to save transfer {id}: {} escapes {}",
-                        final_path.display(),
-                        downloads_dir.display()
-                    );
-                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
-                    return false;
-                }
-
-                match tokio::fs::rename(&recv.temp_path, &final_path).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            "File transfer {id} complete: {} ({} bytes) -> {}",
-                            recv.final_name,
-                            recv.received_bytes,
-                            final_path.display()
-                        );
-                        let _ = event_tx.send(Event::DmFileSaved {
-                            peer_id: peer_id.to_string(),
-                            file_id: id.clone(),
-                            local_path: final_path.to_string_lossy().to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        // rename can fail across filesystems; fall back to copy + remove
-                        tracing::debug!("rename failed ({e}), trying copy fallback");
-                        match tokio::fs::copy(&recv.temp_path, &final_path).await {
-                            Ok(_) => {
-                                let _ = tokio::fs::remove_file(&recv.temp_path).await;
-                                tracing::info!(
-                                    "File transfer {id} complete (copy): {} -> {}",
-                                    recv.final_name,
-                                    final_path.display()
-                                );
-                                let _ = event_tx.send(Event::DmFileSaved {
-                                    peer_id: peer_id.to_string(),
-                                    file_id: id.clone(),
-                                    local_path: final_path.to_string_lossy().to_string(),
-                                });
-                            }
-                            Err(e2) => {
-                                tracing::warn!(
-                                    "Failed to save file for transfer {id}: rename={e}, copy={e2}"
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
+            let Some(mut recv) = active_files.remove(id) else {
                 tracing::debug!("FileEnd for unknown transfer {id}, ignoring");
+                return false;
+            };
+            // Flush and close the temp file
+            let _ = recv.file.flush().await;
+            drop(recv.file);
+
+            if recv.received_bytes != recv.expected_size {
+                tracing::warn!(
+                    "File transfer {id} from {peer_id} ended at {} of {} bytes; discarding",
+                    recv.received_bytes,
+                    recv.expected_size
+                );
+                let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                emit_file_transfer_failed(event_tx, peer_id, id, "incomplete transfer");
+                // Suppress DmReceived(FileEnd): it would mark the card complete.
+                return true;
             }
-            false
+
+            let downloads_dir = downloads_dir();
+            let _ = tokio::fs::create_dir_all(&downloads_dir).await;
+            let final_path = unique_file_path(&downloads_dir, &recv.final_name);
+            // Belt and braces on top of sanitize_file_name: the file must
+            // land directly in the downloads directory, nowhere else.
+            if final_path.parent() != Some(downloads_dir.as_path()) {
+                tracing::warn!(
+                    "Refusing to save transfer {id}: {} escapes {}",
+                    final_path.display(),
+                    downloads_dir.display()
+                );
+                let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                emit_file_transfer_failed(event_tx, peer_id, id, "invalid file name");
+                return true;
+            }
+
+            match save_received_file(&recv.temp_path, &final_path).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "File transfer {id} complete: {} ({} bytes) -> {}",
+                        recv.final_name,
+                        recv.received_bytes,
+                        final_path.display()
+                    );
+                    let _ = event_tx.send(Event::DmFileSaved {
+                        peer_id: peer_id.to_string(),
+                        file_id: id.clone(),
+                        local_path: final_path.to_string_lossy().to_string(),
+                    });
+                    false
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to save file for transfer {id}: {e}");
+                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                    emit_file_transfer_failed(event_tx, peer_id, id, "could not save file");
+                    true
+                }
+            }
         }
         _ => false,
     }
@@ -460,8 +499,16 @@ async fn handle_dm_frame_payload(
         }
     }
 
-    let skip_dm_event =
-        handle_dm_file_message(&dm_msg, peer_id, active_files, &manager.event_tx).await;
+    let sender_is_contact =
+        !matches!(dm_msg, DmMessage::FileStart { .. }) || manager.is_contact(peer_id);
+    let skip_dm_event = handle_dm_file_message(
+        &dm_msg,
+        peer_id,
+        sender_is_contact,
+        active_files,
+        &manager.event_tx,
+    )
+    .await;
     if !skip_dm_event {
         let _ = manager.event_tx.send(Event::DmReceived {
             peer_id: peer_id.to_string(),
@@ -481,10 +528,7 @@ async fn cleanup_active_dm_files(
         let _ = tokio::fs::remove_file(&recv.temp_path).await;
         // The stream dropped mid-transfer — tell the frontend so it can mark the
         // file failed instead of leaving it stuck at partial progress forever.
-        let _ = event_tx.send(Event::DmFileTransferFailed {
-            peer_id: peer_id.to_string(),
-            file_id: id,
-        });
+        emit_file_transfer_failed(event_tx, peer_id, &id, "stream closed mid-transfer");
     }
 }
 
@@ -751,6 +795,9 @@ pub struct ConnectionManager {
     /// Recently-seen DM `Text` message ids per peer, for ack + dedup. Bounded
     /// per peer so a chatty (or malicious) peer can't grow this unbounded.
     recent_dm_ids: Arc<Mutex<HashMap<String, RecentIds>>>,
+    /// Node ids of saved contacts (mirrors the contacts store). Only contacts
+    /// may send us files. Kept in sync by startup load and add/remove_contact.
+    contacts: Arc<StdMutex<HashSet<String>>>,
 }
 
 const RECENT_DM_IDS_CAPACITY: usize = 256;
@@ -836,7 +883,31 @@ impl ConnectionManager {
             pending_invitee: Arc::new(StdMutex::new(None)),
             replacing_peers: Arc::new(StdMutex::new(HashSet::new())),
             recent_dm_ids: Arc::new(Mutex::new(HashMap::new())),
+            contacts: Arc::new(StdMutex::new(HashSet::new())),
         }
+    }
+
+    fn lock_contacts(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.contacts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Replace the saved-contact set (startup load from the contacts store).
+    pub fn set_contacts(&self, node_ids: impl IntoIterator<Item = String>) {
+        *self.lock_contacts() = node_ids.into_iter().collect();
+    }
+
+    pub fn add_contact(&self, node_id: &str) {
+        self.lock_contacts().insert(node_id.to_string());
+    }
+
+    pub fn remove_contact(&self, node_id: &str) {
+        self.lock_contacts().remove(node_id);
+    }
+
+    fn is_contact(&self, node_id: &str) -> bool {
+        self.lock_contacts().contains(node_id)
     }
 
     /// Mark whether we currently intend to accept inbound call-media dials —
@@ -3441,6 +3512,102 @@ mod tests {
         for name in ["COM0", "COM10", "LPT", "console.txt", "nullable", "auxiliary.md"] {
             assert_eq!(sanitize_file_name(name), name);
         }
+    }
+
+    fn next_transfer_failure(
+        rx: &mut broadcast::Receiver<Event>,
+    ) -> Option<(String, Option<String>)> {
+        loop {
+            match rx.try_recv() {
+                Ok(Event::DmFileTransferFailed {
+                    file_id, reason, ..
+                }) => return Some((file_id, reason)),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_start_from_non_contact_is_rejected_with_failure_event() {
+        let (event_tx, mut rx) = broadcast::channel::<Event>(16);
+        let mut active_files = HashMap::new();
+        let start = DmMessage::FileStart {
+            name: "x.bin".into(),
+            size: 4,
+            id: "t-stranger".into(),
+        };
+
+        let handled =
+            handle_dm_file_message(&start, "stranger", false, &mut active_files, &event_tx).await;
+
+        assert!(handled, "a stranger's file card must not be shown");
+        assert!(active_files.is_empty());
+        assert_eq!(
+            next_transfer_failure(&mut rx),
+            Some((
+                "t-stranger".to_string(),
+                Some("sender is not a contact".to_string())
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_concurrent_transfers_is_handled_and_reported() {
+        let (event_tx, mut rx) = broadcast::channel::<Event>(64);
+        let mut active_files = HashMap::new();
+        for n in 0..16 {
+            let start = DmMessage::FileStart {
+                name: "x.bin".into(),
+                size: 4,
+                id: format!("t-busy-{n}"),
+            };
+            assert!(
+                !handle_dm_file_message(&start, "peer", true, &mut active_files, &event_tx).await
+            );
+        }
+        let overflow = DmMessage::FileStart {
+            name: "x.bin".into(),
+            size: 4,
+            id: "t-busy-overflow".into(),
+        };
+        assert!(handle_dm_file_message(&overflow, "peer", true, &mut active_files, &event_tx).await);
+        assert_eq!(
+            next_transfer_failure(&mut rx).map(|(id, _)| id),
+            Some("t-busy-overflow".to_string())
+        );
+        cleanup_active_dm_files(active_files, "peer", &event_tx).await;
+    }
+
+    #[tokio::test]
+    async fn file_end_before_all_bytes_arrived_fails_and_deletes_temp_file() {
+        let (event_tx, mut rx) = broadcast::channel::<Event>(16);
+        let mut active_files = HashMap::new();
+        let id = "t-short".to_string();
+        let start = DmMessage::FileStart {
+            name: "x.bin".into(),
+            size: 8,
+            id: id.clone(),
+        };
+        handle_dm_file_message(&start, "peer", true, &mut active_files, &event_tx).await;
+        let temp_path = active_files[&id].temp_path.clone();
+        let chunk = DmMessage::FileChunk {
+            id: id.clone(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+        };
+        handle_dm_file_message(&chunk, "peer", true, &mut active_files, &event_tx).await;
+
+        let end = DmMessage::FileEnd { id: id.clone() };
+        let handled =
+            handle_dm_file_message(&end, "peer", true, &mut active_files, &event_tx).await;
+
+        assert!(handled, "an incomplete FileEnd must not mark the card complete");
+        assert!(!temp_path.exists());
+        assert_eq!(
+            next_transfer_failure(&mut rx),
+            Some((id, Some("incomplete transfer".to_string())))
+        );
     }
 
     #[test]

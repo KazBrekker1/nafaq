@@ -301,7 +301,9 @@ pub fn run() {
             app.manage(app_state);
             app.manage(media_bridge);
 
-            // Track presence for every contact on startup.
+            // Track presence for every contact on startup, and seed the
+            // connection manager's contact set (it gates inbound files).
+            let conn_manager_for_bootstrap = conn_manager.clone();
             let presence_for_bootstrap = presence.clone();
             let app_handle_for_bootstrap = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -316,6 +318,8 @@ pub fn run() {
                     .get("contacts")
                     .and_then(|v| serde_json::from_value(v).ok())
                     .unwrap_or_default();
+                conn_manager_for_bootstrap
+                    .set_contacts(contacts.iter().map(|contact| contact.node_id.clone()));
                 for contact in contacts {
                     if let Err(e) = presence_for_bootstrap.track_contact(&contact.node_id).await {
                         tracing::warn!("presence track failed for {}: {e}", contact.node_id);

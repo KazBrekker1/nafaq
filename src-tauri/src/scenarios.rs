@@ -1030,6 +1030,9 @@ async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
     .await
     .expect("A never saw B online before interrupted transfer");
 
+    // Only saved contacts may send files (mirrors the contacts store).
+    b.mgr.add_contact(&a_id);
+
     let file_id = "interrupted-large-transfer".to_string();
     let chunk = vec![7u8; 128 * 1024];
     a.mgr
@@ -1071,7 +1074,7 @@ async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
     a.mgr.disconnect_dm(&b_id).await;
     wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
         matches!(e,
-            Event::DmFileTransferFailed { peer_id, file_id: seen_id }
+            Event::DmFileTransferFailed { peer_id, file_id: seen_id, .. }
                 if peer_id == &a_id && seen_id == &file_id
         )
     })

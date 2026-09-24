@@ -744,6 +744,7 @@ pub async fn add_contact(
         serde_json::to_value(&contacts).map_err(|e| e.to_string())?,
     );
     store.save().map_err(|e| e.to_string())?;
+    state.conn_manager.add_contact(&node_id);
 
     if is_new {
         if let Err(e) = state.presence.track_contact(&node_id).await {
@@ -767,6 +768,7 @@ pub async fn remove_contact(
         serde_json::to_value(&contacts).map_err(|e| e.to_string())?,
     );
     store.save().map_err(|e| e.to_string())?;
+    state.conn_manager.remove_contact(&node_id);
 
     state.presence.untrack_contact(&node_id).await;
     Ok(())
