@@ -45,55 +45,60 @@ const sortedConversations = computed(() => {
 </script>
 
 <template>
-  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-default safe-area-inset-min">
 
     <!-- Header -->
-    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 sticky top-0 bg-[var(--color-surface)] z-10">
-      <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">MESSAGES</h1>
+    <div class="sticky top-0 z-10 border-b border-default bg-default px-5 py-4">
+      <h1 class="label">MESSAGES</h1>
     </div>
 
     <div class="max-w-xl mx-auto">
 
       <!-- Empty state -->
-      <div
+      <UEmpty
         v-if="sortedConversations.length === 0"
-        class="px-4 py-16 text-center"
-      >
-        <p class="label text-[var(--color-muted)]">NO CONVERSATIONS</p>
-        <p class="text-xs text-[var(--color-muted)] mt-2">Start a DM from the Contacts page.</p>
-      </div>
+        icon="i-heroicons-chat-bubble-left-right"
+        title="No conversations"
+        description="Start a DM from the Contacts page."
+        class="m-5 border-0 shadow-none"
+      />
 
       <!-- Conversation rows -->
       <div
         v-for="nodeId in sortedConversations"
         :key="nodeId"
-        class="border-b border-[var(--color-border-muted)] px-4 py-3 flex items-center gap-3 cursor-pointer hover:bg-[var(--color-surface-alt)] transition-colors"
+        class="flex cursor-pointer items-center gap-3 border-b border-default px-5 py-4 transition-colors hover:bg-muted"
         @click="navigateTo('/dm/' + nodeId)"
       >
         <!-- Unread dot -->
-        <div class="shrink-0 w-2 h-2 rounded-full" :class="(unreadCounts[nodeId] ?? 0) > 0 ? 'bg-[var(--color-accent)]' : 'bg-transparent'" />
+        <span
+          class="h-2 w-2 shrink-0 rounded-full"
+          :class="(unreadCounts[nodeId] ?? 0) > 0 ? 'bg-primary' : 'bg-transparent'"
+        />
 
         <!-- Name + preview -->
-        <div class="flex-1 min-w-0">
+        <div class="min-w-0 flex-1">
           <div class="flex items-center justify-between gap-2">
-            <span class="text-sm font-bold text-[var(--color-border)] font-mono truncate">
+            <span class="truncate text-sm font-bold text-highlighted">
               {{ displayName(nodeId) }}
             </span>
-            <span class="text-[10px] text-[var(--color-muted)] shrink-0">{{ lastMessageTime(nodeId) }}</span>
+            <span class="shrink-0 text-[10px] text-dimmed">{{ lastMessageTime(nodeId) }}</span>
           </div>
-          <div class="flex items-center justify-between gap-2 mt-0.5">
-            <p class="text-xs text-[var(--color-muted)] truncate">{{ lastMessagePreview(nodeId) }}</p>
-            <span
+          <div class="mt-1 flex items-center justify-between gap-2">
+            <p class="truncate text-xs text-muted">{{ lastMessagePreview(nodeId) }}</p>
+            <UBadge
               v-if="(unreadCounts[nodeId] ?? 0) > 0"
-              class="shrink-0 text-[9px] font-bold bg-[var(--color-accent)] text-white px-1.5 py-0.5 font-mono"
-            >
-              {{ unreadCounts[nodeId] }}
-            </span>
+              :label="String(unreadCounts[nodeId])"
+              color="primary"
+              variant="solid"
+              size="xs"
+              class="shrink-0"
+            />
           </div>
         </div>
 
         <!-- Chevron -->
-        <UIcon name="i-heroicons-chevron-right" class="text-[var(--color-muted)] text-base shrink-0" />
+        <UIcon name="i-heroicons-chevron-right" class="shrink-0 text-base text-dimmed" />
       </div>
 
     </div>

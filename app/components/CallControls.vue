@@ -28,20 +28,19 @@ const camDropdownOpen = ref(false);
 </script>
 
 <template>
-  <div class="flex max-w-full flex-wrap justify-center items-center gap-2 sm:gap-3">
-    <!-- Media group: mic + cam with device chevrons -->
-    <div class="flex border-2 border-[var(--color-border-muted)]">
-      <!-- Mic toggle -->
+  <div class="flex max-w-full flex-wrap justify-center items-center gap-3 sm:gap-4">
+    <!-- Mic group: toggle + device picker -->
+    <UFieldGroup>
       <UTooltip text="Toggle mic" :kbds="['M']">
-        <button
-          class="w-10 h-10 sm:w-[46px] sm:h-[46px] flex items-center justify-center transition-colors"
-          :class="audioMuted
-            ? 'bg-[var(--color-danger)] text-white'
-            : 'text-[var(--color-border)] hover:bg-white/5'"
+        <UButton
+          :icon="audioMuted ? 'i-lucide-mic-off' : 'i-heroicons-microphone'"
+          :color="audioMuted ? 'error' : 'neutral'"
+          :variant="audioMuted ? 'solid' : 'subtle'"
+          size="xl"
+          class="size-[48px]"
+          :aria-label="audioMuted ? 'Unmute microphone' : 'Mute microphone'"
           @click="emit('toggleAudio')"
-        >
-          <UIcon :name="audioMuted ? 'i-lucide-mic-off' : 'i-heroicons-microphone'" class="text-base sm:text-lg" />
-        </button>
+        />
       </UTooltip>
 
       <!-- Mic device picker (desktop only) -->
@@ -54,18 +53,20 @@ const camDropdownOpen = ref(false);
         @update:open="micDropdownOpen = $event"
         @select="emit('switchMic', $event)"
       />
+    </UFieldGroup>
 
-      <!-- Cam toggle -->
+    <!-- Camera group: toggle + device picker -->
+    <UFieldGroup>
       <UTooltip text="Toggle camera" :kbds="['V']">
-        <button
-          class="w-10 h-10 sm:w-[46px] sm:h-[46px] flex items-center justify-center border-l border-[var(--color-border-muted)] transition-colors"
-          :class="videoMuted
-            ? 'bg-[var(--color-danger)] text-white'
-            : 'text-[var(--color-border)] hover:bg-white/5'"
+        <UButton
+          :icon="videoMuted ? 'i-heroicons-video-camera-slash' : 'i-heroicons-video-camera'"
+          :color="videoMuted ? 'error' : 'neutral'"
+          :variant="videoMuted ? 'solid' : 'subtle'"
+          size="xl"
+          class="size-[48px]"
+          :aria-label="videoMuted ? 'Turn camera on' : 'Turn camera off'"
           @click="emit('toggleVideo')"
-        >
-          <UIcon :name="videoMuted ? 'i-heroicons-video-camera-slash' : 'i-heroicons-video-camera'" class="text-base sm:text-lg" />
-        </button>
+        />
       </UTooltip>
 
       <!-- Cam device picker (desktop only) -->
@@ -78,43 +79,49 @@ const camDropdownOpen = ref(false);
         @update:open="camDropdownOpen = $event"
         @select="emit('switchCamera', $event)"
       />
-    </div>
+    </UFieldGroup>
 
     <!-- Chat toggle -->
     <UTooltip text="Toggle chat" :kbds="['C']">
-      <button
-        class="relative w-10 h-10 sm:w-[46px] sm:h-[46px] flex items-center justify-center border-2 transition-colors"
-        :class="chatOpen
-          ? 'bg-[var(--color-accent)] border-[var(--color-accent)] text-white'
-          : 'border-[var(--color-border-muted)] text-[var(--color-border)] hover:bg-white/5'"
-        @click="emit('toggleChat')"
-      >
-        <UIcon name="i-heroicons-chat-bubble-left" class="text-base sm:text-lg" />
-        <span v-if="unreadCount > 0 && !chatOpen" class="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-[var(--color-accent)]" />
-      </button>
+      <div class="relative">
+        <UButton
+          icon="i-heroicons-chat-bubble-left"
+          :color="chatOpen ? 'primary' : 'neutral'"
+          :variant="chatOpen ? 'solid' : 'subtle'"
+          size="xl"
+          class="size-[48px]"
+          aria-label="Toggle chat"
+          @click="emit('toggleChat')"
+        />
+        <span v-if="unreadCount > 0 && !chatOpen" class="pointer-events-none absolute -top-1 -right-1 size-3 rounded-full bg-primary" />
+      </div>
     </UTooltip>
 
+    <!-- Share connection -->
     <UTooltip text="Show QR / connection string">
-      <button
-        class="w-10 h-10 sm:w-[46px] sm:h-[46px] flex items-center justify-center border-2 transition-colors"
-        :class="canShareConnection
-          ? 'border-[var(--color-border-muted)] text-[var(--color-border)] hover:bg-white/5'
-          : 'border-[var(--color-border-muted)] text-[var(--color-muted)] opacity-50 cursor-not-allowed'"
+      <UButton
+        icon="i-heroicons-qr-code"
+        color="neutral"
+        variant="subtle"
+        size="xl"
+        class="size-[48px]"
+        aria-label="Show QR / connection string"
         :disabled="!canShareConnection"
         @click="emit('showConnection')"
-      >
-        <UIcon name="i-heroicons-qr-code" class="text-base sm:text-lg" />
-      </button>
+      />
     </UTooltip>
 
     <!-- End call -->
     <UTooltip text="End call">
-      <button
-        class="w-10 h-10 sm:w-[46px] sm:h-[46px] flex items-center justify-center border-2 border-[var(--color-danger)] bg-[var(--color-danger)] text-white hover:brightness-110 transition-colors"
+      <UButton
+        icon="i-heroicons-phone-x-mark"
+        color="error"
+        variant="solid"
+        size="xl"
+        class="size-[60px]"
+        aria-label="End call"
         @click="emit('endCall')"
-      >
-        <UIcon name="i-heroicons-phone-x-mark" class="text-base sm:text-lg" />
-      </button>
+      />
     </UTooltip>
   </div>
 </template>

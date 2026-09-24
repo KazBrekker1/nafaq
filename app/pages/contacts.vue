@@ -7,7 +7,7 @@ const { isOnline, startProbing, stopProbing } = usePresence();
 const { settings } = useSettings();
 
 const truncatedNodeId = computed(() => {
-  if (!nodeId.value) return "\u2014";
+  if (!nodeId.value) return "—";
   return truncateNodeId(nodeId.value);
 });
 
@@ -31,84 +31,74 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-default safe-area-inset-min">
 
     <!-- Header -->
-    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 flex items-center justify-between sticky top-0 bg-[var(--color-surface)] z-10">
-      <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">CONTACTS</h1>
-      <button
-        class="text-xs font-bold tracking-widest text-[var(--color-accent)] hover:text-white transition-colors"
-        @click="addModalOpen = true"
-      >
-        + ADD
-      </button>
+    <div class="sticky top-0 z-10 flex items-center justify-between border-b-2 border-default bg-default px-4 py-3">
+      <h1 class="label" style="letter-spacing: 4px;">Contacts</h1>
+      <UButton
+        label="Add"
+        icon="i-heroicons-plus"
+        color="primary"
+        variant="solid"
+        @click="() => { addModalOpen = true }"
+      />
     </div>
 
-    <div class="max-w-xl mx-auto">
+    <div class="mx-auto max-w-xl">
 
       <!-- Identity card -->
-      <section class="border-b-2 border-[var(--color-border)]">
-        <div class="px-4 sm:px-6 py-4">
-          <p class="text-sm font-bold text-[var(--color-border)] font-mono">{{ displayName || "—" }}</p>
-          <div class="flex items-center justify-between mt-1 gap-2">
-            <p class="text-[10px] text-[var(--color-muted)] font-mono">
+      <section class="border-b-2 border-default">
+        <div class="px-4 py-4 sm:px-6">
+          <p class="text-sm font-bold text-highlighted">{{ displayName || "—" }}</p>
+          <div class="mt-1 flex items-center justify-between gap-2">
+            <p class="text-xs text-muted">
               {{ truncatedNodeId }}
-              <span v-if="settings.persistentIdentity" class="ml-1 text-[var(--color-accent)]">· persistent</span>
+              <span v-if="settings.persistentIdentity" class="ml-1 text-primary">· persistent</span>
             </p>
-            <div class="flex gap-0 shrink-0">
-              <button
-                class="border-2 border-[var(--color-border)] px-3 py-1 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                @click="qrModalOpen = true"
-              >
-                QR
-              </button>
-              <button
-                class="border-2 border-l-0 border-[var(--color-border)] px-3 py-1 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                :class="nodeCopied ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : ''"
+            <UFieldGroup class="shrink-0">
+              <UButton label="QR" @click="() => { qrModalOpen = true }" />
+              <UButton
+                :label="nodeCopied ? 'Copied' : 'Copy'"
+                :color="nodeCopied ? 'primary' : 'neutral'"
                 @click="copyNodeId"
-              >
-                {{ nodeCopied ? "COPIED" : "COPY" }}
-              </button>
-            </div>
+              />
+            </UFieldGroup>
           </div>
         </div>
       </section>
 
       <!-- Contact list -->
       <section>
-        <!-- Empty state -->
-        <div
+        <UEmpty
           v-if="contacts.length === 0"
-          class="px-4 sm:px-6 py-12 text-center"
-        >
-          <p class="label text-[var(--color-muted)]">NO CONTACTS YET</p>
-          <p class="text-xs text-[var(--color-muted)] mt-2">Tap + ADD to save a contact.</p>
-        </div>
+          icon="i-heroicons-user-group"
+          title="No contacts yet"
+          description="Tap Add to save a contact."
+          class="mx-4 my-6 sm:mx-6"
+        />
 
         <div
           v-for="contact in contacts"
           :key="contact.node_id"
-          class="border-b border-[var(--color-border-muted)] px-4 sm:px-6 py-3"
+          class="border-b border-muted px-4 py-3 sm:px-6"
         >
           <div class="flex items-center gap-3">
-            <UAvatar
-              :text="avatarLetter(contact.display_name)"
-              size="md"
-              class="shrink-0 border-2 border-[var(--color-accent)] bg-black text-[var(--color-accent)] font-mono font-bold"
-            />
+            <UChip
+              :color="isOnline(contact.node_id) ? 'success' : 'neutral'"
+              position="bottom-right"
+              inset
+            >
+              <UAvatar :text="avatarLetter(contact.display_name)" size="md" />
+            </UChip>
 
             <!-- Name + node ID -->
-            <div class="flex-1 min-w-0">
+            <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
-                <span class="text-sm font-bold text-[var(--color-border)] font-mono truncate">{{ contact.display_name }}</span>
-                <!-- Online dot -->
-                <span
-                  class="shrink-0 inline-block w-2 h-2 rounded-full"
-                  :style="isOnline(contact.node_id) ? 'background:var(--color-online)' : 'background:var(--color-muted)'"
-                />
-                <span class="text-[10px] text-[var(--color-muted)]">{{ isOnline(contact.node_id) ? 'online' : 'offline' }}</span>
+                <span class="truncate text-sm font-bold text-highlighted">{{ contact.display_name }}</span>
+                <span class="shrink-0 text-xs text-dimmed">{{ isOnline(contact.node_id) ? 'online' : 'offline' }}</span>
               </div>
-              <p class="text-[10px] text-[var(--color-muted)] font-mono truncate">
+              <p class="truncate text-xs text-muted">
                 {{ truncateNodeId(contact.node_id) }}
               </p>
             </div>
@@ -117,32 +107,23 @@ onUnmounted(() => {
                  hard gate: a brief gossip blip can mark a reachable peer
                  "offline", so keep the actions enabled — opening a DM dials on
                  demand and succeeds even when presence lags. -->
-            <div class="flex gap-0 shrink-0">
+            <UFieldGroup class="shrink-0">
               <UTooltip text="Message">
-                <button
-                  class="border-2 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                  @click="navigateTo('/dm/' + contact.node_id)"
-                >
-                  ✉
-                </button>
+                <UButton icon="i-heroicons-envelope" aria-label="Message" @click="() => { navigateTo('/dm/' + contact.node_id) }" />
               </UTooltip>
               <UTooltip text="Call">
-                <button
-                  class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2.5 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                  @click="navigateTo('/dm/' + contact.node_id)"
-                >
-                  ☎
-                </button>
+                <UButton icon="i-heroicons-phone" aria-label="Call" @click="() => { navigateTo('/dm/' + contact.node_id) }" />
               </UTooltip>
               <UTooltip text="Remove">
-                <button
-                  class="border-2 border-l-0 border-[var(--color-border-muted)] px-3 py-2.5 text-xs text-[var(--color-muted)] hover:border-[var(--color-danger)] hover:text-[var(--color-danger)] transition-colors"
+                <UButton
+                  icon="i-heroicons-x-mark"
+                  color="error"
+                  variant="ghost"
+                  aria-label="Remove"
                   @click="remove(contact.node_id)"
-                >
-                  ✕
-                </button>
+                />
               </UTooltip>
-            </div>
+            </UFieldGroup>
           </div>
         </div>
       </section>

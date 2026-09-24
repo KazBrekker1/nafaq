@@ -16,6 +16,7 @@ mod test_support;
 
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use codec::{AudioCodecState, AudioDecoder, VideoCodecState};
@@ -27,6 +28,7 @@ use presence::PresenceManager;
 use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_store::StoreExt;
 use tokio::sync::{broadcast, Mutex};
 
@@ -156,42 +158,84 @@ pub fn run() {
 
             let conn_manager_for_rt = conn_manager.clone();
             let event_tx_for_presence = event_tx.clone();
-            let (endpoint, router, presence) = tauri::async_runtime::handle().block_on(async {
-                let node::NafaqEndpoint {
-                    endpoint,
-                    address_lookup,
-                } = node::create_endpoint_with_key(secret_key)
-                    .await
-                    .expect("Failed to create Iroh endpoint");
-                tracing::info!("Node ID: {}", endpoint.id());
+            // A UDP bind failure (port conflict, VPN/firewall/sandbox denial) must
+            // not take down the whole app before a window even shows. Retry a
+            // couple of times with a short backoff — most such failures are
+            // transient (another process still releasing the port, etc.) — and
+            // if it's still failing, exit cleanly with a visible dialog instead
+            // of panicking into a raw backtrace.
+            const ENDPOINT_INIT_ATTEMPTS: u32 = 3;
+            let endpoint_setup: anyhow::Result<(iroh::Endpoint, Router, Arc<PresenceManager>)> =
+                tauri::async_runtime::handle().block_on(async {
+                    let mut last_err = None;
+                    for attempt in 1..=ENDPOINT_INIT_ATTEMPTS {
+                        match node::create_endpoint_with_key(secret_key.clone()).await {
+                            Ok(node::NafaqEndpoint {
+                                endpoint,
+                                address_lookup,
+                            }) => {
+                                tracing::info!("Node ID: {}", endpoint.id());
 
-                // Give connection manager a reference to the endpoint for mesh formation
-                conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
+                                // Give connection manager a reference to the endpoint for mesh formation
+                                conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
 
-                let gossip = Gossip::builder().spawn(endpoint.clone());
-                let local_id = endpoint.id();
-                let presence = Arc::new(PresenceManager::new(
-                    gossip.clone(),
-                    local_id,
-                    event_tx_for_presence,
-                    address_lookup,
-                ));
-                conn_manager_for_rt.set_presence(presence.clone()).await;
+                                let gossip = Gossip::builder().spawn(endpoint.clone());
+                                let local_id = endpoint.id();
+                                let presence = Arc::new(PresenceManager::new(
+                                    gossip.clone(),
+                                    local_id,
+                                    event_tx_for_presence,
+                                    address_lookup,
+                                ));
+                                conn_manager_for_rt.set_presence(presence.clone()).await;
 
-                let router = Router::builder(endpoint.clone())
-                    .accept(
-                        node::NAFAQ_ALPN,
-                        NafaqProtocol::new(conn_manager_for_rt.clone()),
-                    )
-                    .accept(
-                        node::NAFAQ_DM_ALPN,
-                        NafaqDmProtocol::new(conn_manager_for_rt.clone()),
-                    )
-                    .accept(iroh_gossip::ALPN, gossip)
-                    .spawn();
+                                let router = Router::builder(endpoint.clone())
+                                    .accept(
+                                        node::NAFAQ_ALPN,
+                                        NafaqProtocol::new(conn_manager_for_rt.clone()),
+                                    )
+                                    .accept(
+                                        node::NAFAQ_DM_ALPN,
+                                        NafaqDmProtocol::new(conn_manager_for_rt.clone()),
+                                    )
+                                    .accept(iroh_gossip::ALPN, gossip)
+                                    .spawn();
 
-                (endpoint, router, presence)
-            });
+                                return Ok((endpoint, router, presence));
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Iroh endpoint init attempt {attempt}/{ENDPOINT_INIT_ATTEMPTS} failed: {e}"
+                                );
+                                last_err = Some(e);
+                                if attempt < ENDPOINT_INIT_ATTEMPTS {
+                                    tokio::time::sleep(Duration::from_millis(500 * attempt as u64))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Err(last_err.expect("loop always records an error before exhausting attempts"))
+                });
+
+            let (endpoint, router, presence) = match endpoint_setup {
+                Ok(parts) => parts,
+                Err(e) => {
+                    tracing::error!("Failed to initialize networking after retries: {e}");
+                    let handle = app.handle().clone();
+                    let message = format!(
+                        "nafaq couldn't start its networking (endpoint init failed after {ENDPOINT_INIT_ATTEMPTS} attempts):\n\n{e}\n\nCheck for port conflicts, VPN/firewall rules, or sandbox network restrictions, then relaunch."
+                    );
+                    handle
+                        .dialog()
+                        .message(message)
+                        .title("nafaq failed to start")
+                        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+                        .blocking_show();
+                    handle.exit(1);
+                    return Ok(());
+                }
+            };
 
             let audio_codec = Arc::new(AudioCodecState::new());
             let video_codec = Arc::new(VideoCodecState::new());
@@ -280,6 +324,9 @@ pub fn run() {
                                 Event::DmConnected { .. } => "dm-connected",
                                 Event::DmDisconnected { .. } => "dm-disconnected",
                                 Event::CallInviteReceived { .. } => "call-invite-received",
+                                Event::CallDeclineReceived { .. } => "call-decline-received",
+                                Event::CallCancelReceived { .. } => "call-cancel-received",
+                                Event::DmAckReceived { .. } => "dm-ack-received",
                                 Event::DmFileSaved { .. } => "dm-file-saved",
                                 Event::DmFileTransferFailed { .. } => "dm-file-transfer-failed",
                                 Event::DmFileProgress { .. } => "dm-file-progress",
@@ -743,6 +790,8 @@ pub fn run() {
             commands::create_call,
             commands::join_call,
             commands::end_call,
+            commands::cancel_call,
+            commands::send_call_decline,
             commands::send_chat,
             commands::send_chat_all,
             commands::send_control,

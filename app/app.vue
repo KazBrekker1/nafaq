@@ -1,10 +1,10 @@
 <template>
   <UApp>
     <div class="h-dvh flex flex-col">
-      <header v-if="showNav" class="shrink-0 flex items-center px-4 pb-3 border-b-2 border-[var(--color-border)]" style="padding-top: calc(env(safe-area-inset-top, 0px) + 0.75rem);">
-        <span class="font-black tracking-[6px] text-lg">NAFAQ</span>
+      <header v-if="showNav" class="shrink-0 flex items-center px-8 pb-6 border-b-2 border-(--ui-border-accented) bg-default" style="padding-top: calc(env(safe-area-inset-top, 0px) + 0.75rem);">
+        <span class="font-black tracking-[6px] text-lg text-highlighted">NAFAQ</span>
       </header>
-      <main class="flex-1 min-h-0 overflow-y-auto" :class="{ 'pb-16': showNav }">
+      <main class="flex-1 min-h-0 overflow-y-auto" :class="{ 'pb-20': showNav }">
         <NuxtPage />
       </main>
       <TabBar v-if="showNav" />
@@ -38,7 +38,7 @@ useHead({
   link: [
     { rel: "preconnect", href: "https://fonts.googleapis.com" },
     { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "" },
-    { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;900&display=swap" },
+    { rel: "stylesheet", href: "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap" },
   ],
 });
 </script>

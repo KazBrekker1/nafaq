@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { useWakeLock } from "@vueuse/core";
+import { useNodeRuntime } from "~/composables/useNodeRuntime";
 
 const call = useCall();
 const media = useMedia();
 const chat = useChat();
 const transport = useMediaTransport();
+const { peerConnectionStatuses } = useNodeRuntime();
 const { playPeerConnected, playPeerLeft, playMessageReceived } = useNotificationSounds();
 const { starFromCall, contacts } = useContacts();
 const { request: requestWakeLock, release: releaseWakeLock } = useWakeLock();
@@ -19,6 +21,16 @@ async function handleStar(peerId: string) {
 
 function isPeerStarred(peerId: string): boolean {
   return starredPeers.value.has(peerId) || contacts.value.some(c => c.node_id === peerId);
+}
+
+// Brief connectivity blips ("suspect") get a subtle tint so they don't alarm;
+// a sustained "reconnecting" state gets the unmistakable full-tile overlay.
+function isPeerSuspect(peerId: string): boolean {
+  return peerConnectionStatuses.value[peerId] === "suspect";
+}
+
+function isPeerReconnecting(peerId: string): boolean {
+  return peerConnectionStatuses.value[peerId] === "reconnecting";
 }
 
 const chatOpen = ref(false);
@@ -54,6 +66,14 @@ async function cleanup() {
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
   await transport.stop();
   media.stopPreview();
+}
+
+// Any state other than idle/ringing means a call is in progress or being set
+// up — ringing is excluded because it's the global incoming-call banner, not
+// an active session tied to this page.
+function isCallActive() {
+  const s = call.state.value;
+  return s !== "idle" && s !== "ringing";
 }
 
 function toggleFullscreen() {
@@ -105,6 +125,47 @@ defineShortcuts({
   f: () => toggleFullscreen(),
 });
 
+// Starts (or restarts) the receiving/sending pipeline for an active call.
+// Called both on the lobby → connected transition and, defensively, on mount
+// when the page is created with a call already connected (e.g. a stale
+// remount) — the transition watcher below only fires on a change, so it
+// never runs in that second case.
+async function startConnectedPipeline() {
+  // Guards against starting after an unmount-triggered cleanup — starting
+  // transport after cleanup would leak it with no owner to stop it.
+  if (cleaned) return;
+
+  // Clean up any previous instances (e.g. peer reconnect scenario)
+  if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
+  videoVisibilityObserver?.disconnect();
+
+  videoVisibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const peerId = (entry.target as HTMLElement).dataset.peerId;
+      if (peerId) {
+        transport.setPeerVideoPaused(peerId, !entry.isIntersecting);
+      }
+    }
+  }, { threshold: 0.1 });
+
+  await transport.initCodecs(media.localStream.value);
+  if (cleaned) return;
+  await transport.startReceiving(() => call.peers.value);
+  if (cleaned) return;
+
+  if (media.localStream.value && call.peers.value.length > 0) {
+    await transport.startSending(media.localStream.value);
+  }
+
+  const startTime = Date.now();
+  durationInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const mins = Math.floor(elapsed / 60);
+    const secs = elapsed % 60;
+    callDuration.value = `${mins}:${secs.toString().padStart(2, "0")}`;
+  }, 1000);
+}
+
 // ── Mount: redirect if no reason to be here, start camera preview ────
 onMounted(async () => {
   if (call.state.value === "idle" || call.state.value === "ringing") {
@@ -118,43 +179,29 @@ onMounted(async () => {
   if (!media.localStream.value) await media.startPreview();
 
   document.addEventListener("fullscreenchange", onFullscreenChange);
+
+  // Defense-in-depth: the transition watcher below never fires if we
+  // mounted already-connected, so start the pipeline directly here.
+  if (call.state.value === "connected") {
+    await startConnectedPipeline();
+  }
+});
+
+// ── Leaving /call always means leaving the call — no confirmation prompt,
+// the decision is unambiguous. Torn down before navigation resolves so the
+// backend session and call state are already reset by the time onUnmounted
+// (or a fresh mount of /call) runs. ──────────────────────────────────────
+onBeforeRouteLeave(async () => {
+  if (!isCallActive()) return;
+  await cleanup();
+  chat.clearMessages();
+  await call.terminateCall({ navigate: false });
 });
 
 // ── Transition: lobby → active call when state becomes connected ─────
 watch(() => call.state.value, async (newState, oldState) => {
-  // The watcher can fire while an unmount-triggered cleanup is in progress;
-  // starting transport after cleanup would leak it with no owner to stop it.
-  if (cleaned) return;
   if (newState === "connected" && oldState !== "connected") {
-    // Clean up any previous instances (e.g. peer reconnect scenario)
-    if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
-    videoVisibilityObserver?.disconnect();
-
-    videoVisibilityObserver = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        const peerId = (entry.target as HTMLElement).dataset.peerId;
-        if (peerId) {
-          transport.setPeerVideoPaused(peerId, !entry.isIntersecting);
-        }
-      }
-    }, { threshold: 0.1 });
-
-    await transport.initCodecs(media.localStream.value);
-    if (cleaned) return;
-    await transport.startReceiving(() => call.peers.value);
-    if (cleaned) return;
-
-    if (media.localStream.value && call.peers.value.length > 0) {
-      await transport.startSending(media.localStream.value);
-    }
-
-    const startTime = Date.now();
-    durationInterval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-      callDuration.value = `${mins}:${secs.toString().padStart(2, "0")}`;
-    }, 1000);
+    await startConnectedPipeline();
   }
 });
 
@@ -218,12 +265,22 @@ watch(chatOpen, (open) => {
   if (open) unreadCount.value = 0;
 });
 
-onUnmounted(() => {
+onUnmounted(async () => {
   releaseWakeLock();
   videoVisibilityObserver?.disconnect();
   videoVisibilityObserver = null;
-  cleanup();
   document.removeEventListener("fullscreenchange", onFullscreenChange);
+
+  await cleanup();
+
+  // Fallback teardown: guarantees the Rust-side session and call state don't
+  // outlive this page even if a leave path bypassed the route guard above.
+  // No-op when handleEndCall or the route guard already tore down the call,
+  // since terminateCall() always leaves state at "idle".
+  if (isCallActive()) {
+    chat.clearMessages();
+    await call.terminateCall({ navigate: false });
+  }
 });
 
 async function handleEndCall() {
@@ -242,50 +299,50 @@ function handleSendChat(text: string) {
 </script>
 
 <template>
-  <div class="h-full flex relative bg-black safe-area-inset overflow-hidden">
+  <div class="dark h-full flex relative bg-black safe-area-inset overflow-hidden">
 
     <!-- ═══════════════════════ LOBBY VIEW ═══════════════════════ -->
     <template v-if="isLobby">
-      <div class="flex-1 flex flex-col items-center justify-center p-6 gap-6">
+      <div class="flex-1 flex flex-col items-center justify-center p-8 gap-8">
 
         <!-- Camera preview -->
-        <div class="relative w-full max-w-md aspect-video bg-black border-2 border-[var(--color-border)] overflow-hidden">
+        <div class="relative w-full max-w-md aspect-video bg-black border-2 border-(--ui-border-accented) overflow-hidden">
           <video ref="lobbyVideoEl" autoplay muted playsinline class="w-full h-full object-contain bg-black" />
           <div v-if="!media.localStream.value" class="absolute inset-0 flex flex-col items-center justify-center bg-black gap-2">
-            <UIcon name="i-heroicons-video-camera" class="text-2xl text-[var(--color-border-muted)]" />
-            <p class="text-[var(--color-muted)] text-xs">
+            <UIcon name="i-heroicons-video-camera" class="text-2xl text-dimmed" />
+            <p class="text-muted text-xs">
               {{ media.error.value || "Starting camera..." }}
             </p>
           </div>
         </div>
 
         <!-- Mic / camera toggles + VU meter -->
-        <div class="flex items-center gap-4">
-          <button
-            class="w-10 h-10 flex items-center justify-center border-2 transition-colors"
-            :class="media.audioMuted.value
-              ? 'border-[var(--color-danger)] bg-[var(--color-danger)] text-white'
-              : 'border-[var(--color-border-muted)] text-[var(--color-border)] hover:bg-white/5'"
+        <div class="flex items-center gap-5">
+          <UButton
+            :icon="media.audioMuted.value ? 'i-lucide-mic-off' : 'i-heroicons-microphone'"
+            :color="media.audioMuted.value ? 'error' : 'neutral'"
+            :variant="media.audioMuted.value ? 'solid' : 'subtle'"
+            size="xl"
+            class="size-[48px]"
+            :aria-label="media.audioMuted.value ? 'Unmute microphone' : 'Mute microphone'"
             @click="media.toggleAudio()"
-          >
-            <UIcon :name="media.audioMuted.value ? 'i-lucide-mic-off' : 'i-heroicons-microphone'" class="text-base" />
-          </button>
-          <div class="h-1.5 w-24 bg-[var(--color-border-muted)]">
-            <div class="h-full bg-[var(--color-accent)] transition-all duration-75" :style="{ width: `${media.micLevel.value * 100}%` }" />
+          />
+          <div class="h-2 w-32 bg-accented">
+            <div class="h-full bg-primary transition-all duration-75" :style="{ width: `${media.micLevel.value * 100}%` }" />
           </div>
-          <button
-            class="w-10 h-10 flex items-center justify-center border-2 transition-colors"
-            :class="media.videoMuted.value
-              ? 'border-[var(--color-danger)] bg-[var(--color-danger)] text-white'
-              : 'border-[var(--color-border-muted)] text-[var(--color-border)] hover:bg-white/5'"
+          <UButton
+            :icon="media.videoMuted.value ? 'i-heroicons-video-camera-slash' : 'i-heroicons-video-camera'"
+            :color="media.videoMuted.value ? 'error' : 'neutral'"
+            :variant="media.videoMuted.value ? 'solid' : 'subtle'"
+            size="xl"
+            class="size-[48px]"
+            :aria-label="media.videoMuted.value ? 'Turn camera on' : 'Turn camera off'"
             @click="media.toggleVideo()"
-          >
-            <UIcon :name="media.videoMuted.value ? 'i-heroicons-video-camera-slash' : 'i-heroicons-video-camera'" class="text-base" />
-          </button>
+          />
         </div>
 
         <!-- State indicator + ticket display (reuse TicketCreate) -->
-        <div v-if="call.state.value === 'joining'" class="text-xs text-[var(--color-muted)] tracking-widest text-center uppercase">
+        <div v-if="call.state.value === 'joining'" class="text-xs text-muted tracking-widest text-center uppercase">
           Connecting...
         </div>
         <div v-else class="w-full max-w-md">
@@ -293,12 +350,13 @@ function handleSendChat(text: string) {
         </div>
 
         <!-- Cancel -->
-        <button
-          class="border-2 border-[var(--color-border-muted)] px-6 py-2 text-[10px] font-bold tracking-widest text-[var(--color-muted)] hover:border-[var(--color-danger)] hover:text-[var(--color-danger)] transition-colors"
+        <UButton
+          label="Cancel"
+          color="neutral"
+          variant="subtle"
+          size="lg"
           @click="handleEndCall"
-        >
-          CANCEL
-        </button>
+        />
       </div>
     </template>
 
@@ -316,38 +374,41 @@ function handleSendChat(text: string) {
         v-if="call.allPeersLeft.value"
         class="absolute inset-0 z-30 flex items-center justify-center bg-black/80"
       >
-        <div class="text-center space-y-4">
-          <p class="text-sm text-[var(--color-muted)] tracking-wider">Everyone has left</p>
-          <UButton class="rounded-none" @click="handleEndCall">Leave Call</UButton>
+        <div class="text-center space-y-5">
+          <p class="text-sm text-dimmed tracking-wider">Everyone has left</p>
+          <UButton label="Leave Call" color="primary" variant="solid" size="lg" @click="handleEndCall" />
         </div>
       </div>
 
-      <div class="flex-1 min-w-0 bg-[var(--color-surface-alt)] relative flex flex-col">
+      <div class="flex-1 min-w-0 bg-black relative flex flex-col">
         <!-- Top bar -->
-        <div class="absolute top-0 left-0 right-0 flex justify-between px-3 sm:px-4 py-2 sm:py-3 z-20 bg-gradient-to-b from-black/80 to-transparent">
-          <div class="flex items-center gap-3 sm:gap-4">
-            <span class="text-xs sm:text-sm font-black tracking-widest">{{ callDuration }}</span>
-            <span class="text-[9px] sm:text-[10px] text-[var(--color-muted)] tracking-wider">
+        <div class="absolute top-0 left-0 right-0 flex justify-between px-4 sm:px-5 py-3 sm:py-4 z-20 bg-gradient-to-b from-black/80 to-transparent">
+          <div class="flex items-center gap-4 sm:gap-5">
+            <span class="text-xs sm:text-sm font-black tracking-widest text-highlighted">{{ callDuration }}</span>
+            <span class="text-[9px] sm:text-[10px] text-dimmed tracking-wider">
               {{ call.peers.value.length }} peer{{ call.peers.value.length !== 1 ? "s" : "" }}
             </span>
           </div>
-          <div class="flex items-center gap-2 sm:gap-3">
+          <div class="flex items-center gap-3 sm:gap-4">
             <CallConnectionQuality :quality="transport.connectionQuality.value" />
-            <span class="text-[9px] sm:text-[10px] text-[var(--color-accent)] tracking-widest font-bold">P2P</span>
-            <button class="text-[var(--color-muted)] hover:text-white transition-colors flex items-center justify-center w-11 h-11 sm:w-auto sm:h-auto" @click="toggleFullscreen">
-              <UIcon
-                :name="isFullscreen ? 'i-heroicons-arrows-pointing-in' : 'i-heroicons-arrows-pointing-out'"
-                class="text-sm"
-              />
-            </button>
+            <span class="text-[9px] sm:text-[10px] text-primary tracking-widest font-bold">P2P</span>
+            <UButton
+              :icon="isFullscreen ? 'i-heroicons-arrows-pointing-in' : 'i-heroicons-arrows-pointing-out'"
+              color="neutral"
+              variant="ghost"
+              size="lg"
+              class="size-[40px]"
+              :aria-label="isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'"
+              @click="toggleFullscreen"
+            />
           </div>
         </div>
 
         <!-- Video area -->
-        <div ref="videoContainer" class="flex-1 min-h-0 relative px-1 pb-1 pt-11 sm:px-2 sm:pb-2 sm:pt-14">
+        <div ref="videoContainer" class="flex-1 min-h-0 relative px-2 pb-2 pt-16 sm:px-3 sm:pb-3 sm:pt-[4.5rem]">
           <!-- Per-peer video grid -->
           <div
-            class="w-full h-full grid auto-rows-fr gap-1 sm:gap-2"
+            class="w-full h-full grid auto-rows-fr gap-2 sm:gap-3"
             :class="remoteGridClass"
             :style="{ gridTemplateRows: remoteGridRows }"
           >
@@ -356,7 +417,8 @@ function handleSendChat(text: string) {
               :key="peer"
               :ref="registerPeerContainerRef(peer)"
               :data-peer-id="peer"
-              class="relative min-h-0 bg-black overflow-hidden border border-[var(--color-border)] flex items-center justify-center"
+              class="relative min-h-0 bg-black overflow-hidden border-2 flex items-center justify-center"
+              :style="{ borderColor: isPeerSuspect(peer) || isPeerReconnecting(peer) ? 'var(--ui-warning)' : 'var(--ui-border-accented)' }"
             >
               <canvas
                 :ref="registerPeerCanvasRef(peer)"
@@ -364,39 +426,47 @@ function handleSendChat(text: string) {
                 :class="{ 'speaking-glow': transport.peerSpeakingMap.value[peer] }"
                 @dblclick="toggleFullscreen"
               />
-              <span class="absolute bottom-1 left-2 text-[9px] text-[var(--color-muted)] bg-black/70 px-2 py-0.5 font-mono">
+              <span
+                class="absolute bottom-1.5 left-2 flex items-center gap-1.5 text-[9px] bg-black/70 px-2 py-0.5 transition-colors"
+                :class="isPeerSuspect(peer) ? 'text-warning' : 'text-dimmed'"
+              >
+                <span v-if="isPeerSuspect(peer)" class="suspect-dot" aria-hidden="true" />
                 {{ peer.slice(0, 12) }}...
               </span>
-              <div class="absolute top-1 right-1 flex items-center gap-1">
-                <span v-if="transport.activeSpeaker.value === peer" class="text-[8px] text-[var(--color-accent)] bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
+              <div class="absolute top-1.5 right-1.5 flex items-center gap-1.5">
+                <span v-if="transport.activeSpeaker.value === peer" class="text-[8px] text-primary bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
                 <button
-                  class="text-base leading-none bg-black/70 px-1.5 py-0.5 transition-colors"
-                  :class="isPeerStarred(peer) ? 'text-yellow-400' : 'text-[var(--color-muted)] hover:text-yellow-400'"
+                  class="flex items-center justify-center bg-black/70 p-1.5 transition-colors"
+                  :class="isPeerStarred(peer) ? 'text-yellow-400' : 'text-dimmed hover:text-yellow-400'"
                   :title="isPeerStarred(peer) ? 'Saved as contact' : 'Save as contact'"
+                  :aria-label="isPeerStarred(peer) ? 'Saved as contact' : 'Save as contact'"
                   @click.stop="handleStar(peer)"
-                >&#9733;</button>
+                >
+                  <UIcon :name="isPeerStarred(peer) ? 'i-heroicons-star-solid' : 'i-heroicons-star'" class="text-base" />
+                </button>
               </div>
+              <CallPeerReconnectingOverlay :reconnecting="isPeerReconnecting(peer)" />
             </div>
           </div>
 
           <!-- Fallback when no peers -->
           <div v-if="call.peers.value.length === 0" class="text-center z-10">
-            <span class="text-[10px] text-[var(--color-muted)]">Waiting for peers...</span>
+            <span class="text-[10px] text-dimmed">Waiting for peers...</span>
           </div>
 
           <!-- Self PiP -->
-          <div class="absolute bottom-3 right-3 sm:bottom-4 sm:right-4 w-[128px] aspect-video sm:w-[208px] bg-black border-2 border-[var(--color-border)] overflow-hidden z-10">
+          <div class="absolute bottom-4 right-4 sm:bottom-5 sm:right-5 w-[128px] aspect-video sm:w-[208px] bg-black border-2 border-(--ui-border-accented) overflow-hidden z-10">
             <div v-if="!media.localStream.value" class="absolute inset-0 flex items-center justify-center bg-black">
-              <UIcon name="i-heroicons-video-camera" class="text-lg text-[var(--color-border-muted)]" />
+              <UIcon name="i-heroicons-video-camera" class="text-lg text-dimmed" />
             </div>
             <video ref="localVideoEl" autoplay muted playsinline class="w-full h-full object-contain bg-black" />
             <CallSelfVideoOverlay :audio-muted="media.audioMuted.value" :video-muted="media.videoMuted.value" />
-            <span class="absolute bottom-0.5 left-1.5 sm:bottom-1 sm:left-2 text-[8px] sm:text-[9px] text-[var(--color-accent)] bg-black/70 px-1.5 sm:px-2 py-0.5 font-bold tracking-wider">You</span>
+            <span class="absolute bottom-1 left-2 sm:bottom-1.5 sm:left-2.5 text-[8px] sm:text-[9px] text-primary bg-black/70 px-1.5 sm:px-2 py-0.5 font-bold tracking-wider">You</span>
           </div>
         </div>
 
         <!-- Controls -->
-        <div class="shrink-0 border-t border-[var(--color-border-muted)] bg-black/90 px-3 py-2.5 sm:px-4 sm:py-3">
+        <div class="shrink-0 border-t-2 border-(--ui-border-accented) bg-black/95 px-4 py-4 sm:px-5 sm:py-5">
           <div class="flex items-center justify-between gap-3">
             <div class="flex min-w-[42px] sm:min-w-[56px] gap-[2px] items-end">
               <div
@@ -405,7 +475,7 @@ function handleSendChat(text: string) {
                 class="w-[3px]"
                 :style="{
                   height: `${3 + (i <= media.micLevel.value / 12 ? (media.micLevel.value / 12) * 1.5 : 0)}px`,
-                  background: i <= media.micLevel.value / 12 ? 'var(--color-accent)' : 'var(--color-border-muted)'
+                  background: i <= media.micLevel.value / 12 ? 'var(--ui-primary)' : 'var(--ui-border-muted)'
                 }"
               />
             </div>
@@ -454,3 +524,17 @@ function handleSendChat(text: string) {
     </template>
   </div>
 </template>
+
+<style scoped>
+.suspect-dot {
+  width: 5px;
+  height: 5px;
+  background: var(--ui-warning);
+  animation: call-suspect-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes call-suspect-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+</style>

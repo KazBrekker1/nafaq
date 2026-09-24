@@ -15,40 +15,29 @@ function closeModal() {
 </script>
 
 <template>
-  <UModal v-model:open="open">
-    <template #content>
-      <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)]">
-        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-          <p class="label" style="letter-spacing: 4px;">NODE ID</p>
-          <button
-            class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors"
-            aria-label="Close QR modal"
-            @click="closeModal"
+  <UModal v-model:open="open" title="Node ID">
+    <template #body>
+      <div class="space-y-3">
+        <div class="flex justify-center bg-white p-3">
+          <img
+            v-if="qrDataUrl && nodeId"
+            :src="qrDataUrl"
+            alt="Node ID QR code"
+            class="h-48 w-48"
+          />
+          <div
+            v-else
+            class="flex h-48 w-48 items-center justify-center text-center text-xs text-black"
           >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
-        </div>
-        <div class="p-4 space-y-3">
-          <div class="flex justify-center bg-white p-3">
-            <img
-              v-if="qrDataUrl && nodeId"
-              :src="qrDataUrl"
-              alt="Node ID QR code"
-              class="w-48 h-48"
-            />
-            <div
-              v-else
-              class="w-48 h-48 flex items-center justify-center text-xs text-black text-center"
-            >
-              {{ nodeId ? "Generating..." : "No node ID" }}
-            </div>
+            {{ nodeId ? "Generating..." : "No node ID" }}
           </div>
-          <p class="text-[10px] text-[var(--color-muted)] break-all text-center font-mono">{{ nodeId || "\u2014" }}</p>
-          <UButton variant="outline" class="w-full rounded-none" @click="closeModal">
-            CLOSE
-          </UButton>
         </div>
+        <p class="break-all text-center text-xs text-muted">{{ nodeId || "—" }}</p>
       </div>
+    </template>
+
+    <template #footer>
+      <UButton label="Close" variant="outline" class="w-full" @click="closeModal" />
     </template>
   </UModal>
 </template>

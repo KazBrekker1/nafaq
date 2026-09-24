@@ -22,17 +22,35 @@ function openScanner() {
 
 <template>
   <div>
-    <p class="label mb-4">ENTER TICKET</p>
-    <UInput v-model="ticketInput" placeholder="Paste ticket..." class="mb-4 rounded-none font-mono"
-      :disabled="disabled || state === 'joining'" @keyup.enter="submit" />
-    <div class="flex gap-0">
-      <UButton class="flex-1 rounded-none" :disabled="disabled || !ticketInput.trim() || state === 'joining'" @click="submit">
-        {{ state === "joining" ? "Connecting..." : "Connect" }}
-      </UButton>
-      <UButton variant="outline" class="rounded-none border-l-0" :disabled="disabled || state === 'joining'" @click="openScanner">
-        <UIcon name="i-heroicons-camera" />
-      </UButton>
-    </div>
+    <p class="label mb-3">ENTER TICKET</p>
+    <UFieldGroup class="w-full">
+      <UInput
+        v-model="ticketInput"
+        placeholder="Paste ticket..."
+        class="flex-1"
+        :disabled="disabled || state === 'joining'"
+        @keyup.enter="submit"
+      />
+      <UButton
+        icon="i-heroicons-camera"
+        variant="subtle"
+        color="neutral"
+        :disabled="disabled || state === 'joining'"
+        aria-label="Scan QR code"
+        @click="openScanner"
+      />
+    </UFieldGroup>
+    <UButton
+      block
+      variant="solid"
+      color="primary"
+      class="mt-3"
+      :disabled="disabled || !ticketInput.trim() || state === 'joining'"
+      :loading="state === 'joining'"
+      @click="submit"
+    >
+      {{ state === "joining" ? "Connecting..." : "Connect" }}
+    </UButton>
   </div>
 
   <QrScanner v-model:open="showScanner" @scan="onScan" />

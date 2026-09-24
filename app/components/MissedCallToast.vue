@@ -14,7 +14,7 @@ onUnmounted(() => clearTimeout(timer));
   <Transition name="fade">
     <div
       v-if="visible"
-      class="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-black/90 border border-[var(--color-border-muted)] px-4 py-2 text-xs text-[var(--color-muted)] tracking-wider"
+      class="fixed top-4 left-1/2 -translate-x-1/2 z-50 border-2 border-(--ui-border-accented) bg-default shadow-(--ui-shadow-hard) px-5 py-3 text-xs text-muted tracking-wider"
       style="margin-top: env(safe-area-inset-top, 0px);"
     >
       Missed call from {{ name }}

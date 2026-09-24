@@ -2,16 +2,34 @@
 @import "@nuxt/ui";
 
 @theme {
-  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', ui-monospace, monospace;
-  --color-accent: #8B5CF6;
-  --color-surface: #000000;
-  --color-surface-alt: #0a0a0a;
-  --color-border: #e2e8f0;
-  --color-border-muted: #333333;
-  --color-muted: #666666;
-  --color-online: #4ade80;
-  --color-warning: #EAB308;
-  --color-danger: #ff0000;
+  --font-sans: 'Inter', sans-serif;
+  --spacing: 0.2rem;
+}
+
+html {
+  font-size: 14.5px;
+}
+
+:root {
+  --ui-radius: 0rem;
+}
+
+:root, .light {
+  --ui-shadow-color: var(--ui-color-neutral-950);
+  --ui-shadow-offset-x: 3px;
+  --ui-shadow-offset-y: 3px;
+  --ui-shadow-blur: 0px;
+  --ui-shadow-spread: 0px;
+  --ui-shadow-hard: var(--ui-shadow-offset-x) var(--ui-shadow-offset-y) var(--ui-shadow-blur) var(--ui-shadow-spread) var(--ui-shadow-final-hard);
+  --ui-shadow-hard-lg: calc(var(--ui-shadow-offset-x) * 1.5) calc(var(--ui-shadow-offset-y) * 1.5) var(--ui-shadow-blur) var(--ui-shadow-spread) var(--ui-shadow-final-hard);
+  --ui-shadow-hard-sm: calc(var(--ui-shadow-offset-x) * 0.66) calc(var(--ui-shadow-offset-y) * 0.66) var(--ui-shadow-blur) var(--ui-shadow-spread) var(--ui-shadow-final-hard);
+  --ui-shadow-hard-half: calc(var(--ui-shadow-offset-x) / 2) calc(var(--ui-shadow-offset-y) / 2) var(--ui-shadow-blur) var(--ui-shadow-spread) var(--ui-shadow-final-hard);
+  --ui-shadow-final-hard: color-mix(in oklab, var(--ui-shadow-color) var(--ui-shadow-opacity, 100%), transparent);
+  --ui-shadow-final-soft: color-mix(in oklab, var(--ui-shadow-color) var(--ui-shadow-opacity, 25%), transparent);
+}
+
+.dark {
+  --ui-shadow-color: black;
 }
 
 *,
@@ -21,12 +39,6 @@
 }
 
 body {
-  margin: 0;
-  background: var(--color-surface);
-  color: var(--color-border);
-  font-family: var(--font-mono);
-  font-size: 14px;
-  line-height: 1.6;
   touch-action: manipulation;
   overscroll-behavior: contain;
   -webkit-user-select: none;
@@ -45,16 +57,16 @@ input, textarea, [contenteditable],
   text-transform: uppercase;
   letter-spacing: 3px;
   font-weight: 700;
-  color: var(--color-muted);
+  color: var(--ui-text-muted);
 }
 
 @keyframes speaking-glow {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(139, 92, 246, 0); }
-  50% { box-shadow: 0 0 12px 3px rgba(139, 92, 246, 0.6); }
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklab, var(--ui-primary) 0%, transparent); }
+  50% { box-shadow: 0 0 12px 3px color-mix(in oklab, var(--ui-primary) 60%, transparent); }
 }
 .speaking-glow {
   animation: speaking-glow 1.2s ease-in-out infinite;
-  border-color: var(--color-accent) !important;
+  border-color: var(--ui-primary) !important;
 }
 
 .safe-area-inset {

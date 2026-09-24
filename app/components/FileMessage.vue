@@ -26,24 +26,24 @@ async function openFile() {
 
 <template>
   <div
-    class="border-2 border-[var(--color-accent)] bg-black max-w-[240px]"
+    class="max-w-[240px] border-2 border-primary bg-elevated"
     :class="from === 'self' ? 'ml-auto' : ''"
   >
     <!-- File info row -->
-    <div class="px-3 py-2 flex items-center gap-2">
-      <span class="text-[var(--color-accent)] text-base shrink-0 font-mono">■</span>
-      <div class="flex-1 min-w-0">
-        <p class="text-xs font-bold text-[var(--color-border)] font-mono truncate">{{ name }}</p>
-        <p class="text-[10px] text-[var(--color-muted)] font-mono">{{ formatSize(size) }}</p>
+    <div class="flex items-center gap-2 px-3 py-2">
+      <UIcon name="i-heroicons-document" class="shrink-0 text-base text-primary" />
+      <div class="min-w-0 flex-1">
+        <p class="truncate text-xs font-bold text-highlighted">{{ name }}</p>
+        <p class="text-[10px] text-dimmed">{{ formatSize(size) }}</p>
       </div>
     </div>
 
     <!-- Failed transfer -->
     <div
       v-if="failed && !isComplete"
-      class="border-t border-[var(--color-danger)]/60 px-3 py-1.5"
+      class="border-t border-error/60 px-3 py-2"
     >
-      <p class="text-[10px] font-bold tracking-widest text-[var(--color-danger)] font-mono">
+      <p class="text-[10px] font-bold tracking-widest text-error">
         TRANSFER FAILED
       </p>
     </div>
@@ -51,34 +51,32 @@ async function openFile() {
     <!-- Progress bar -->
     <div
       v-else-if="!isComplete"
-      class="border-t border-[var(--color-accent)]/40 px-3 py-2"
+      class="border-t border-primary/40 px-3 py-2"
     >
-      <div class="h-1 bg-[var(--color-surface-alt)] w-full">
-        <div
-          class="h-1 bg-[var(--color-accent)] transition-all duration-300"
-          :style="{ width: progressPct + '%' }"
-        />
-      </div>
-      <p class="text-[9px] text-[var(--color-muted)] font-mono mt-1">{{ progressPct }}%</p>
+      <UProgress :model-value="progressPct" :max="100" color="primary" size="xs" />
+      <p class="mt-1 text-[9px] text-dimmed">{{ progressPct }}%</p>
     </div>
 
     <!-- Completion: OPEN button if localPath available, otherwise status badge -->
     <div
       v-if="isComplete && localPath"
-      class="border-t border-[var(--color-accent)]/40"
+      class="border-t border-primary/40"
     >
-      <button
-        class="w-full px-3 py-1.5 text-[10px] font-bold tracking-widest text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-black transition-colors"
+      <UButton
+        label="OPEN"
+        variant="ghost"
+        color="primary"
+        size="xs"
+        block
+        class="tracking-widest"
         @click="openFile"
-      >
-        OPEN
-      </button>
+      />
     </div>
     <div
       v-else-if="isComplete"
-      class="border-t border-[var(--color-accent)]/40 px-3 py-1.5"
+      class="border-t border-primary/40 px-3 py-2"
     >
-      <p class="text-[10px] font-bold tracking-widest text-[var(--color-accent)] font-mono">
+      <p class="text-[10px] font-bold tracking-widest text-primary">
         {{ from === 'self' ? 'SENT' : 'RECEIVED' }}
       </p>
     </div>

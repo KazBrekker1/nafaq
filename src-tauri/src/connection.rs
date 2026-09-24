@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::endpoint::{Connection, PathId, RecvStream, SendStream};
+use iroh::endpoint::{Connection, ConnectionError, PathId, RecvStream, SendStream};
 use tokio::sync::{Mutex, Notify, broadcast};
 
 #[derive(Clone)]
@@ -59,10 +59,20 @@ const DM_DUPLICATE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const MESH_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 const DM_CONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(21);
+/// A single DM frame write must complete in this long or the peer's flow
+/// control window is stuck (e.g. it stopped reading). Without this,
+/// `write_all` blocks forever and the frontend's message sits "sending"
+/// indefinitely instead of surfacing a failure.
+const DM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SUSPECT_AFTER_MS: u64 = 20_000;
 const RECONNECT_AFTER_MS: u64 = 35_000;
 const DISCONNECT_AFTER_MS: u64 = 120_000;
 const RECONNECT_RETRY_AFTER_MS: u64 = 15_000;
+/// One extra attempt for the initial call/DM dial, after a short pause. Covers
+/// a peer whose relay path is still settling without turning a genuine
+/// failure into a long retry loop. Mesh auto-connect and the liveness-driven
+/// reconnect ladder already have their own retry cadence and are untouched.
+const INITIAL_DIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 async fn with_timeout<T, F>(
     timeout_duration: Duration,
@@ -348,30 +358,93 @@ async fn handle_dm_file_message(
     }
 }
 
-async fn handle_dm_frame_payload(
-    data: &[u8],
-    peer_id: &str,
-    active_files: &mut HashMap<String, ActiveFileReceive>,
-    event_tx: &broadcast::Sender<Event>,
-) {
-    if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(data) {
-        if matches!(dm_msg, DmMessage::Heartbeat) {
-            return;
-        }
-        if let DmMessage::CallInvite { ref ticket } = dm_msg {
-            let _ = event_tx.send(Event::CallInviteReceived {
+/// Call-signaling variants (CallInvite/CallDecline/CallCancel) are handled
+/// before generic DmReceived/file processing and never reach it. Returns
+/// `true` if the message was fully handled here.
+///
+/// CallDecline additionally clears our own `call_session_active` flag: if we
+/// are the caller and the callee just declined, our outstanding ticket must
+/// stop accepting inbound call dials (see `setup_connection`'s gate) even
+/// though no call peer was ever established to disconnect.
+fn handle_call_signal(manager: &ConnectionManager, dm_msg: &DmMessage, peer_id: &str) -> bool {
+    match dm_msg {
+        DmMessage::CallInvite { ticket } => {
+            let _ = manager.event_tx.send(Event::CallInviteReceived {
                 peer_id: peer_id.to_string(),
                 ticket: ticket.clone(),
             });
+            true
+        }
+        DmMessage::CallDecline => {
+            manager.set_call_session_active(false);
+            let _ = manager.event_tx.send(Event::CallDeclineReceived {
+                peer_id: peer_id.to_string(),
+            });
+            true
+        }
+        DmMessage::CallCancel => {
+            let _ = manager.event_tx.send(Event::CallCancelReceived {
+                peer_id: peer_id.to_string(),
+            });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Shared DM frame dispatch — used by both the dedicated DM connection reader
+/// (`run_dm_reader`) and the DM stream multiplexed onto a call connection
+/// (`handle_bi_stream`), so call-signal/ack/dedup handling is identical on
+/// both paths.
+async fn handle_dm_frame_payload(
+    manager: &ConnectionManager,
+    data: &[u8],
+    peer_id: &str,
+    active_files: &mut HashMap<String, ActiveFileReceive>,
+) {
+    let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(data) else {
+        // Malformed frame, or a variant this build doesn't know about (e.g.
+        // a newer peer's message) — drop just this frame, keep reading.
+        return;
+    };
+    if matches!(dm_msg, DmMessage::Heartbeat) {
+        return;
+    }
+    if let DmMessage::Ack { id } = &dm_msg {
+        let _ = manager.event_tx.send(Event::DmAckReceived {
+            peer_id: peer_id.to_string(),
+            id: id.clone(),
+        });
+        return;
+    }
+    if handle_call_signal(manager, &dm_msg, peer_id) {
+        return;
+    }
+
+    // Text messages carry an optional client id used for dedup + ack. Files
+    // reuse the `id` field for transfer ids (a different namespace), so this
+    // only applies to Text.
+    if let DmMessage::Text { id: Some(id), .. } = &dm_msg {
+        let is_duplicate = manager.record_and_check_duplicate_dm_id(peer_id, id).await;
+        // Ack every receipt, including duplicates — the sender's earlier Ack
+        // may have been lost, and re-acking is harmless (idempotent on the
+        // sender's side, keyed by id).
+        let ack = DmMessage::Ack { id: id.clone() };
+        if let Err(e) = manager.send_dm_frame_strict(peer_id, &ack).await {
+            tracing::debug!("Failed to ack DM {id} to {peer_id}: {e}");
+        }
+        if is_duplicate {
             return;
         }
-        let skip_dm_event = handle_dm_file_message(&dm_msg, peer_id, active_files, event_tx).await;
-        if !skip_dm_event {
-            let _ = event_tx.send(Event::DmReceived {
-                peer_id: peer_id.to_string(),
-                message: dm_msg,
-            });
-        }
+    }
+
+    let skip_dm_event =
+        handle_dm_file_message(&dm_msg, peer_id, active_files, &manager.event_tx).await;
+    if !skip_dm_event {
+        let _ = manager.event_tx.send(Event::DmReceived {
+            peer_id: peer_id.to_string(),
+            message: dm_msg,
+        });
     }
 }
 
@@ -396,7 +469,7 @@ async fn cleanup_active_dm_files(
 async fn drain_duplicate_dm_frame_once(
     recv: &mut iroh::endpoint::RecvStream,
     peer_id: &str,
-    event_tx: &broadcast::Sender<Event>,
+    manager: &ConnectionManager,
 ) {
     let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
     match tokio::time::timeout(
@@ -406,7 +479,7 @@ async fn drain_duplicate_dm_frame_once(
     .await
     {
         Ok(Ok(Some(data))) => {
-            handle_dm_frame_payload(&data, peer_id, &mut active_files, event_tx).await;
+            handle_dm_frame_payload(manager, &data, peer_id, &mut active_files).await;
         }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => {
@@ -416,27 +489,23 @@ async fn drain_duplicate_dm_frame_once(
             tracing::debug!("Duplicate DM drain timed out for {peer_id}");
         }
     }
-    cleanup_active_dm_files(active_files, peer_id, event_tx).await;
+    cleanup_active_dm_files(active_files, peer_id, &manager.event_tx).await;
 }
 
 /// Shared DM stream reader loop — reads framed messages, handles files,
 /// emits events. Used by both connect_dm and setup_dm_connection.
-async fn run_dm_reader(
-    recv: &mut iroh::endpoint::RecvStream,
-    peer_id: &str,
-    event_tx: &broadcast::Sender<Event>,
-) {
+async fn run_dm_reader(recv: &mut iroh::endpoint::RecvStream, peer_id: &str, manager: &ConnectionManager) {
     let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
     loop {
         match crate::messages::read_framed(recv).await {
             Ok(Some(data)) => {
-                handle_dm_frame_payload(&data, peer_id, &mut active_files, event_tx).await;
+                handle_dm_frame_payload(manager, &data, peer_id, &mut active_files).await;
             }
             Ok(None) => break,
             Err(_) => break,
         }
     }
-    cleanup_active_dm_files(active_files, peer_id, event_tx).await;
+    cleanup_active_dm_files(active_files, peer_id, &manager.event_tx).await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -646,6 +715,39 @@ pub struct ConnectionManager {
     audio_media_tx: broadcast::Sender<AudioPacket>,
     video_media_tx: broadcast::Sender<VideoPacket>,
     presence: Arc<Mutex<Option<Arc<crate::presence::PresenceManager>>>>,
+    /// True while we've deliberately created or joined a call (create_call /
+    /// join_call) and haven't cancelled or fully left it yet. Gates inbound
+    /// call-media connection acceptance in `setup_connection` — see the
+    /// wave-2 ghost-call fix. DM/presence/file streams are unaffected.
+    call_session_active: Arc<AtomicBool>,
+    /// Recently-seen DM `Text` message ids per peer, for ack + dedup. Bounded
+    /// per peer so a chatty (or malicious) peer can't grow this unbounded.
+    recent_dm_ids: Arc<Mutex<HashMap<String, RecentIds>>>,
+}
+
+const RECENT_DM_IDS_CAPACITY: usize = 256;
+
+#[derive(Default)]
+struct RecentIds {
+    order: VecDeque<String>,
+    set: HashSet<String>,
+}
+
+impl RecentIds {
+    /// Returns true if `id` was already seen, otherwise records it.
+    fn check_and_insert(&mut self, id: &str) -> bool {
+        if self.set.contains(id) {
+            return true;
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+        if self.order.len() > RECENT_DM_IDS_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        false
+    }
 }
 
 /// A NeighborUp this recent is treated as "the peer is freshly reachable", used
@@ -702,7 +804,30 @@ impl ConnectionManager {
             audio_media_tx,
             video_media_tx,
             presence: Arc::new(Mutex::new(None)),
+            call_session_active: Arc::new(AtomicBool::new(false)),
+            recent_dm_ids: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Mark whether we currently intend to accept inbound call-media dials —
+    /// set on create_call/join_call, cleared when the call is cancelled
+    /// before anyone joined or once the last peer leaves. See
+    /// `setup_connection`'s inbound gate.
+    pub fn set_call_session_active(&self, active: bool) {
+        self.call_session_active.store(active, Ordering::SeqCst);
+    }
+
+    fn is_call_session_active(&self) -> bool {
+        self.call_session_active.load(Ordering::SeqCst)
+    }
+
+    /// Records `id` as seen for `peer_id` and returns whether it was already
+    /// present (i.e. this is a duplicate delivery).
+    async fn record_and_check_duplicate_dm_id(&self, peer_id: &str, id: &str) -> bool {
+        let mut map = self.recent_dm_ids.lock().await;
+        map.entry(peer_id.to_string())
+            .or_default()
+            .check_and_insert(id)
     }
 
     pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
@@ -1344,7 +1469,7 @@ impl ConnectionManager {
                 tracing::info!(
                     "Draining duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
                 );
-                let event_tx = self.event_tx.clone();
+                let manager = self.clone();
                 tokio::spawn(async move {
                     match tokio::time::timeout(DM_DUPLICATE_DRAIN_TIMEOUT, connection.accept_bi())
                         .await
@@ -1357,7 +1482,7 @@ impl ConnectionManager {
                             )
                             .await;
                             if matches!(typed, Ok(Ok(_))) && type_buf[0] == STREAM_DM {
-                                drain_duplicate_dm_frame_once(&mut recv, &peer_id, &event_tx).await;
+                                drain_duplicate_dm_frame_once(&mut recv, &peer_id, &manager).await;
                             }
                         }
                         Ok(Err(error)) => {
@@ -1385,7 +1510,6 @@ impl ConnectionManager {
         }
 
         let manager = self.clone();
-        let event_tx = self.event_tx.clone();
         let peer_id_reader = peer_id.clone();
         let connection_reader = connection.clone();
         let connection_reader_id = connection_reader.stable_id();
@@ -1419,17 +1543,17 @@ impl ConnectionManager {
                             };
                             match registration {
                                 DmStreamRegistration::Stored => {
-                                    let event_tx = event_tx.clone();
+                                    let manager = manager.clone();
                                     let peer_id = peer_id_reader.clone();
                                     tokio::spawn(async move {
-                                        run_dm_reader(&mut recv, &peer_id, &event_tx).await;
+                                        run_dm_reader(&mut recv, &peer_id, &manager).await;
                                     });
                                 }
                                 DmStreamRegistration::DrainDuplicate => {
                                     drain_duplicate_dm_frame_once(
                                         &mut recv,
                                         &peer_id_reader,
-                                        &event_tx,
+                                        &manager,
                                     )
                                     .await;
                                     connection_reader.close(0u32.into(), b"duplicate_dm_drained");
@@ -1448,7 +1572,7 @@ impl ConnectionManager {
             Self::cleanup_dm_internal(
                 &peer_id_reader,
                 &manager.dm_peers,
-                &event_tx,
+                &manager.event_tx,
                 None,
                 Some(connection_reader_id),
             )
@@ -1495,7 +1619,15 @@ impl ConnectionManager {
         let addr = endpoint_ticket.endpoint_addr().clone();
         let peer_id = addr.id.to_string();
         self.upsert_peer_ticket(&peer_id, ticket).await;
-        let result = self.connect_to_peer(endpoint, addr).await;
+
+        let mut result = self.connect_to_peer(endpoint, addr.clone()).await;
+        if result.is_err() {
+            // One quick retry for the initial join dial — covers a peer whose
+            // relay path hasn't finished settling without leaving the user to
+            // manually retry a failed join.
+            tokio::time::sleep(INITIAL_DIAL_RETRY_BACKOFF).await;
+            result = self.connect_to_peer(endpoint, addr).await;
+        }
         if result.is_err() {
             self.record_peer_ticket_dial_failure(&peer_id).await;
         }
@@ -1564,6 +1696,21 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
     ) -> Result<()> {
+        // Ghost-call protocol fix: an inbound call dial with no locally active
+        // call session (never created/joined one, or it was cancelled/ended)
+        // is rejected outright — regardless of any per-peer duplicate/replace
+        // logic below. Outbound dials are never gated here: they only happen
+        // because we ourselves just called create_call/join_call, which sets
+        // the flag before dialing. DM/presence/file streams don't go through
+        // this path at all.
+        if direction == ConnectionDirection::Inbound && !self.is_call_session_active() {
+            tracing::info!(
+                "Rejecting inbound call connection from {peer_id}: no active call session"
+            );
+            connection.close(0u32.into(), b"call_not_active");
+            return Ok(());
+        }
+
         if !self
             .should_accept_call_connection(&peer_id, direction)
             .await
@@ -1933,6 +2080,7 @@ impl ConnectionManager {
             }
         });
 
+        let manager_closed = self.clone();
         let peers_ref_closed = peers_ref.clone();
         let dm_peers_ref_closed = self.dm_peers.clone();
         let peer_tickets_ref = peer_tickets_ref.clone();
@@ -1944,6 +2092,21 @@ impl ConnectionManager {
         tokio::spawn(async move {
             let close_reason = connection_closed.closed().await;
             tracing::info!("Connection closed for peer {peer_id_closed}: {close_reason}");
+
+            // A silent QUIC idle-timeout (no CONNECTION_CLOSE frame reached us)
+            // means the network dropped, not that either side ended the call —
+            // give the peer a chance to reconnect instead of tearing the call
+            // down immediately. Any other close reason (explicit close by us
+            // or the peer, reset, protocol error) is treated as final, exactly
+            // as before.
+            if matches!(close_reason, ConnectionError::TimedOut)
+                && manager_closed
+                    .try_begin_peer_reconnect(&peer_id_closed, connection_closed_id)
+                    .await
+            {
+                return;
+            }
+
             Self::cleanup_peer_internal(
                 &peer_id_closed,
                 &peers_ref_closed,
@@ -1958,7 +2121,6 @@ impl ConnectionManager {
             .await;
         });
 
-        let event_tx = self.event_tx.clone();
         let peer_id_bi = peer_id.clone();
         let peers_ref_bi = peers_ref.clone();
         let manager_bi = self.clone();
@@ -1968,7 +2130,7 @@ impl ConnectionManager {
                 match connection.accept_bi().await {
                     Ok((send, mut recv)) => {
                         let peer_id = peer_id_bi.clone();
-                        let event_tx = event_tx.clone();
+                        let manager = manager_bi.clone();
                         let peers_ref = peers_ref_bi.clone();
                         let mut type_buf = [0u8; 1];
                         if recv.read_exact(&mut type_buf).await.is_err() {
@@ -1989,7 +2151,7 @@ impl ConnectionManager {
                             match registration {
                                 DmStreamRegistration::Stored => {}
                                 DmStreamRegistration::DrainDuplicate => {
-                                    drain_duplicate_dm_frame_once(&mut recv, &peer_id, &event_tx)
+                                    drain_duplicate_dm_frame_once(&mut recv, &peer_id, &manager)
                                         .await;
                                     continue;
                                 }
@@ -2001,7 +2163,7 @@ impl ConnectionManager {
                                 type_buf[0],
                                 &peer_id,
                                 recv,
-                                event_tx,
+                                manager,
                                 peers_ref,
                             )
                             .await;
@@ -2020,7 +2182,7 @@ impl ConnectionManager {
         stream_type: u8,
         peer_id: &str,
         mut recv: RecvStream,
-        event_tx: broadcast::Sender<Event>,
+        manager: ConnectionManager,
         peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     ) {
         let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
@@ -2031,7 +2193,7 @@ impl ConnectionManager {
                     STREAM_CHAT => {
                         Self::mark_peer_active_internal(&peers, peer_id).await;
                         if let Ok(message) = String::from_utf8(data) {
-                            let _ = event_tx.send(Event::ChatReceived {
+                            let _ = manager.event_tx.send(Event::ChatReceived {
                                 peer_id: peer_id.to_string(),
                                 message,
                             });
@@ -2043,40 +2205,17 @@ impl ConnectionManager {
                             if matches!(action, ControlAction::Heartbeat) {
                                 continue;
                             }
-                            let _ = event_tx.send(Event::ControlReceived {
+                            let _ = manager.event_tx.send(Event::ControlReceived {
                                 peer_id: peer_id.to_string(),
                                 action,
                             });
                         }
                     }
+                    // DM riding a call connection goes through the exact same
+                    // dispatch (call-signal/ack/dedup handling) as the
+                    // dedicated DM connection reader.
                     STREAM_DM => {
-                        if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(&data) {
-                            if matches!(dm_msg, DmMessage::Heartbeat) {
-                                continue;
-                            }
-                            if let DmMessage::CallInvite { ref ticket } = dm_msg {
-                                let _ = event_tx.send(Event::CallInviteReceived {
-                                    peer_id: peer_id.to_string(),
-                                    ticket: ticket.clone(),
-                                });
-                                // Handled as a call invite — don't also emit a
-                                // generic DmReceived for it.
-                                continue;
-                            }
-                            let skip_dm_event = handle_dm_file_message(
-                                &dm_msg,
-                                peer_id,
-                                &mut active_files,
-                                &event_tx,
-                            )
-                            .await;
-                            if !skip_dm_event {
-                                let _ = event_tx.send(Event::DmReceived {
-                                    peer_id: peer_id.to_string(),
-                                    message: dm_msg,
-                                });
-                            }
-                        }
+                        handle_dm_frame_payload(&manager, &data, peer_id, &mut active_files).await;
                     }
                     _ => tracing::warn!("Unknown bi stream type: {stream_type}"),
                 },
@@ -2088,16 +2227,7 @@ impl ConnectionManager {
             }
         }
 
-        // Clean up any incomplete temp files on stream close
-        for (id, recv) in active_files {
-            tracing::debug!("Cleaning up incomplete file transfer {id}");
-            drop(recv.file);
-            let _ = tokio::fs::remove_file(&recv.temp_path).await;
-            let _ = event_tx.send(Event::DmFileTransferFailed {
-                peer_id: peer_id.to_string(),
-                file_id: id,
-            });
-        }
+        cleanup_active_dm_files(active_files, peer_id, &manager.event_tx).await;
     }
 
     fn timestamped_payload(data: &[u8], timestamp: u64) -> Vec<u8> {
@@ -2431,6 +2561,15 @@ impl ConnectionManager {
             .await
             {
                 Ok(connection) => {
+                    // The call may have ended (user hung up, or the liveness
+                    // ladder's own final timeout already gave up) while this
+                    // redial was in flight. Check the peer is still expected
+                    // before reviving it, so a straggler reconnect can't
+                    // resurrect a call that was intentionally torn down.
+                    if !manager.peers.lock().await.contains_key(&peer_id) {
+                        connection.close(0u32.into(), b"reconnect_no_longer_wanted");
+                        return;
+                    }
                     if let Err(e) = manager.setup_outgoing_connection(connection).await {
                         tracing::warn!("Reconnect: failed to set up peer {peer_id}: {e}");
                         manager.record_peer_ticket_dial_failure(&peer_id).await;
@@ -2442,6 +2581,47 @@ impl ConnectionManager {
                 }
             }
         });
+    }
+
+    /// Move a peer straight to `Reconnecting` and kick off a redial when its
+    /// connection ends via a silent QUIC idle-timeout — the transport gives up
+    /// (`max_idle_timeout`, node.rs) well before the liveness ladder's own
+    /// Suspect→Reconnecting promotion would (`SUSPECT_AFTER_MS`/
+    /// `RECONNECT_AFTER_MS` above), so without this the peer is evicted before
+    /// a reconnect is ever attempted. Returns `false` (doing nothing) if the
+    /// connection was already superseded/evicted, or no ticket is cached to
+    /// redial with — callers fall back to the normal teardown in that case.
+    /// The liveness loop's `DISCONNECT_AFTER_MS` bound still applies from
+    /// here: it sees the same `Reconnecting` status and unchanged
+    /// `last_activity_ms`, and keeps retrying (or finally gives up) exactly as
+    /// it does for a liveness-ladder-detected drop.
+    async fn try_begin_peer_reconnect(&self, peer_id: &str, expected_connection_id: usize) -> bool {
+        let now = Self::current_timestamp_ms();
+        let Some(ticket) = self.latest_reconnect_ticket(peer_id, now).await else {
+            return false;
+        };
+
+        let became_reconnecting = {
+            let mut peers = self.peers.lock().await;
+            match peers.get_mut(peer_id) {
+                Some(peer) if peer.connection.stable_id() == expected_connection_id => {
+                    peer.connection_status = PeerConnectionKind::Reconnecting;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !became_reconnecting {
+            return false;
+        }
+
+        self.emit_peer_connection_status(
+            peer_id,
+            PeerConnectionKind::Reconnecting,
+            Some("connection dropped; attempting reconnect".to_string()),
+        );
+        self.spawn_peer_reconnect(peer_id.to_string(), ticket).await;
+        true
     }
 
     pub async fn maintain_peer_liveness(&self) {
@@ -2680,14 +2860,29 @@ impl ConnectionManager {
                     .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
             };
 
-            let connection: iroh::endpoint::Connection = dial_peer_with_timeout(
+            let connection: iroh::endpoint::Connection = match dial_peer_with_timeout(
                 &endpoint,
-                addr,
+                addr.clone(),
                 crate::node::NAFAQ_DM_ALPN,
                 DM_DIAL_TIMEOUT,
                 "timed out dialing DM peer",
             )
-            .await?;
+            .await
+            {
+                Ok(connection) => connection,
+                Err(_) => {
+                    // One quick retry — same rationale as connect_to_peer_with_ticket.
+                    tokio::time::sleep(INITIAL_DIAL_RETRY_BACKOFF).await;
+                    dial_peer_with_timeout(
+                        &endpoint,
+                        addr,
+                        crate::node::NAFAQ_DM_ALPN,
+                        DM_DIAL_TIMEOUT,
+                        "timed out dialing DM peer",
+                    )
+                    .await?
+                }
+            };
             let peer_id = connection.remote_id().to_string();
 
             let (dm_send, mut dm_recv): (iroh::endpoint::SendStream, iroh::endpoint::RecvStream) =
@@ -2704,7 +2899,7 @@ impl ConnectionManager {
             match registration {
                 DmStreamRegistration::Stored => {}
                 DmStreamRegistration::DrainDuplicate => {
-                    drain_duplicate_dm_frame_once(&mut dm_recv, &peer_id, &self.event_tx).await;
+                    drain_duplicate_dm_frame_once(&mut dm_recv, &peer_id, self).await;
                     connection.close(0u32.into(), b"duplicate_dm_drained");
                     return Ok(());
                 }
@@ -2717,14 +2912,15 @@ impl ConnectionManager {
             // Spawn a reader for the initial bistream's recv side so the remote
             // peer can reply on the same bistream (via accept_bi's send half).
             {
-                let event_tx = self.event_tx.clone();
+                let manager = self.clone();
                 let peer_id = peer_id.clone();
                 tokio::spawn(async move {
-                    run_dm_reader(&mut dm_recv, &peer_id, &event_tx).await;
+                    run_dm_reader(&mut dm_recv, &peer_id, &manager).await;
                 });
             }
 
             // Spawn a reader task for additional incoming DM bistreams on this connection
+            let manager = self.clone();
             let event_tx = self.event_tx.clone();
             let dm_peers_ref = self.dm_peers.clone();
             let peer_id_reader = peer_id.clone();
@@ -2741,7 +2937,7 @@ impl ConnectionManager {
                             if type_buf[0] != STREAM_DM {
                                 continue;
                             }
-                            drain_duplicate_dm_frame_once(&mut recv, &peer_id_reader, &event_tx)
+                            drain_duplicate_dm_frame_once(&mut recv, &peer_id_reader, &manager)
                                 .await;
                             connection_reader.close(0u32.into(), b"duplicate_dm_drained");
                             break;
@@ -2868,7 +3064,12 @@ impl ConnectionManager {
 
         let mut guard = s.lock().await;
         if let Some(ref mut send) = *guard {
-            crate::messages::write_framed(send, data).await?;
+            with_timeout(
+                DM_WRITE_TIMEOUT,
+                format!("timed out writing DM frame to peer {peer_id}"),
+                async { Ok(crate::messages::write_framed(send, data).await?) },
+            )
+            .await?;
             Ok(())
         } else {
             anyhow::bail!("DM stream for peer {peer_id} is unavailable");
@@ -2948,6 +3149,19 @@ impl ConnectionManager {
             false, // user ended the call — forget the ticket
         )
         .await;
+        // This is the explicit, user-initiated hang-up path (the `end_call`
+        // command, invoked per-peer by the frontend's terminateCall). Once
+        // the last peer is gone, the call is genuinely over from our side —
+        // stop accepting new inbound dials for the outstanding ticket.
+        //
+        // Deliberately NOT done in the automatic liveness/reconnect-timeout
+        // disconnect paths: those exist specifically so a transient network
+        // drop can self-heal via redial (including the other side racing us
+        // with its own inbound reconnect), and clearing the flag there could
+        // reject a legitimate in-flight reconnect.
+        if self.peer_count().await == 0 {
+            self.set_call_session_active(false);
+        }
         Ok(())
     }
 }
@@ -3042,6 +3256,12 @@ mod tests {
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
+
+        // Mirrors production's create_call/join_call, which mark a call
+        // session active before anyone can dial in — without this, the
+        // protocol-level ghost-call gate (setup_connection) rejects the
+        // inbound test connection below.
+        mgr_a.set_call_session_active(true);
 
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -3775,6 +3995,168 @@ mod tests {
         endpoint_a.close().await;
     }
 
+    #[test]
+    fn timed_out_is_the_only_close_reason_that_triggers_reconnect() {
+        use iroh::endpoint::ApplicationClose;
+
+        // The per-connection watcher only treats a silent QUIC idle-timeout as
+        // "network dropped, try to reconnect" — every other close reason (ours
+        // or the peer's explicit close, a reset, a protocol error) is final,
+        // exactly as it was before this behavior existed.
+        assert!(matches!(ConnectionError::TimedOut, ConnectionError::TimedOut));
+        assert!(!matches!(ConnectionError::LocallyClosed, ConnectionError::TimedOut));
+        assert!(!matches!(ConnectionError::Reset, ConnectionError::TimedOut));
+        assert!(!matches!(
+            ConnectionError::ApplicationClosed(ApplicationClose {
+                error_code: 0u32.into(),
+                reason: Bytes::from_static(b"call ended"),
+            }),
+            ConnectionError::TimedOut
+        ));
+    }
+
+    #[tokio::test]
+    async fn ungraceful_close_marks_peer_reconnecting_and_redials_successfully() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+
+        // A cached ticket is exactly what `maintain_peer_liveness` relies on
+        // too — in production both sides get one via the mutual self-announce
+        // exchange right after connecting (see `setup_connection`).
+        mgr_b
+            .upsert_peer_ticket(&peer_id, &node::generate_ticket(&endpoint_a))
+            .await;
+        let connection_id = mgr_b
+            .peers
+            .lock()
+            .await
+            .get(&peer_id)
+            .expect("peer should be connected")
+            .connection
+            .stable_id();
+
+        let began = mgr_b
+            .try_begin_peer_reconnect(&peer_id, connection_id)
+            .await;
+        assert!(
+            began,
+            "a silent drop with a cached ticket should start a reconnect"
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status: PeerConnectionKind::Reconnecting,
+                        ..
+                    }) if id == peer_id => break,
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for reconnecting status");
+
+        // The peer must stay cached while the redial is in flight — this is
+        // exactly the structurally-unreachable path the bug report described:
+        // a mid-call drop must not end the call outright.
+        assert!(mgr_b.peers.lock().await.contains_key(&peer_id));
+
+        // The cached ticket still points at a live listener, so the reconnect
+        // should succeed and bring the peer back to Connected — reusing the
+        // ordinary PeerConnected path, not a new protocol.
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerConnected { peer_id: id }) if id == peer_id => break,
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for reconnect to succeed");
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn ungraceful_close_without_cached_ticket_declines_reconnect() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (_mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b).await;
+
+        let connection_id = mgr_b
+            .peers
+            .lock()
+            .await
+            .get(&peer_id)
+            .expect("peer should be connected")
+            .connection
+            .stable_id();
+
+        let began = mgr_b
+            .try_begin_peer_reconnect(&peer_id, connection_id)
+            .await;
+        assert!(!began, "no cached ticket means there is nothing to redial");
+
+        let peers = mgr_b.peers.lock().await;
+        let peer = peers.get(&peer_id).expect("peer should remain cached");
+        assert_eq!(peer.connection_status, PeerConnectionKind::Connected);
+        drop(peers);
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn peer_hangup_reason_evicts_remote_side_immediately_without_reconnect_attempt() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a.clone(), event_tx_b).await;
+        let mut rx_a = event_tx_a.subscribe();
+        let b_id = endpoint_b.id().to_string();
+
+        // mgr_b hangs up — this sends an explicit "call ended" CONNECTION_CLOSE
+        // to mgr_a, distinct from a silent idle-timeout.
+        mgr_b.disconnect_peer(&peer_id).await.unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id: id }) if id == b_id => break,
+                    Ok(Event::PeerConnectionStatusChanged {
+                        peer_id: id,
+                        status: PeerConnectionKind::Reconnecting,
+                        ..
+                    }) if id == b_id => {
+                        panic!("an explicit hangup must not trigger a reconnect attempt");
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for immediate disconnect after explicit hangup");
+
+        assert!(!mgr_a.peers.lock().await.contains_key(&b_id));
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
     #[tokio::test]
     async fn dm_connection_status_uses_dm_events_without_peer_status_events() {
         let (event_tx_a, _) = broadcast::channel::<Event>(64);
@@ -3871,6 +4253,7 @@ mod tests {
                 &DmMessage::Text {
                     content: "hello without explicit connect".to_string(),
                     timestamp: 1,
+                    id: None,
                 },
             )
             .await
@@ -3881,7 +4264,7 @@ mod tests {
                 match rx_a.recv().await {
                     Ok(Event::DmReceived {
                         peer_id,
-                        message: DmMessage::Text { content, timestamp },
+                        message: DmMessage::Text { content, timestamp, .. },
                     }) if peer_id == endpoint_b.id().to_string()
                         && content == "hello without explicit connect"
                         && timestamp == 1 =>
@@ -3946,6 +4329,7 @@ mod tests {
                 &DmMessage::Text {
                     content: "retry after stale stream".to_string(),
                     timestamp: 2,
+                    id: None,
                 },
             )
             .await
@@ -3956,7 +4340,7 @@ mod tests {
                 match rx_a.recv().await {
                     Ok(Event::DmReceived {
                         peer_id,
-                        message: DmMessage::Text { content, timestamp },
+                        message: DmMessage::Text { content, timestamp, .. },
                     }) if peer_id == endpoint_b.id().to_string()
                         && content == "retry after stale stream"
                         && timestamp == 2 =>
@@ -4080,6 +4464,7 @@ mod tests {
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
 
+        mgr_a.set_call_session_active(true);
         let mut rx_a = event_tx_a.subscribe();
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -4225,10 +4610,12 @@ mod tests {
             let first = DmMessage::Text {
                 content: format!("duplicate-first-{index}"),
                 timestamp: index as u64,
+                id: None,
             };
             let second = DmMessage::Text {
                 content: format!("duplicate-second-{index}"),
                 timestamp: index as u64,
+                id: None,
             };
             crate::messages::write_framed(&mut send, &serde_json::to_vec(&first).unwrap())
                 .await
@@ -4285,6 +4672,7 @@ mod tests {
                 &DmMessage::Text {
                     content: "dm-survived-duplicate-flood".to_string(),
                     timestamp: 99,
+                    id: None,
                 },
             )
             .await
@@ -4333,6 +4721,7 @@ mod tests {
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
             .spawn();
 
+        mgr_a.set_call_session_active(true);
         let mut rx_a = event_tx_a.subscribe();
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -4477,5 +4866,218 @@ mod tests {
         let pending = writer.pending.lock().await.clone().expect("pending frame");
         assert!(pending.is_keyframe);
         assert_eq!(pending.timestamp_ms, 1);
+    }
+
+    // ── Ghost-call protocol gate (wave 2) ───────────────────────────────
+
+    #[tokio::test]
+    async fn inbound_call_dial_rejected_without_active_call_session() {
+        use iroh::endpoint::ApplicationClose;
+
+        let (event_tx_a, _) = broadcast::channel::<Event>(16);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a, audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(16);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        // mgr_a never called create_call/join_call (call_session_active
+        // defaults false) — a dial for its ticket must be rejected.
+        //
+        // Dial with the raw endpoint (bypassing ConnectionManager) so the
+        // assertion is purely about what mgr_a's *acceptor* does: QUIC lets a
+        // locally-initiated stream open/write succeed before the peer's
+        // rejection is observed, so asserting on the dialer-side
+        // ConnectionManager's return value would be racy/wrong — the
+        // authoritative signal is the close reason the acceptor sends back.
+        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
+            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let connection = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
+
+        let close_reason = timeout(Duration::from_secs(10), connection.closed())
+            .await
+            .expect("gate should close the connection instead of leaving it open");
+        match close_reason {
+            ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) => {
+                assert_eq!(&reason[..], b"call_not_active");
+            }
+            other => panic!("expected call_not_active application close, got {other:?}"),
+        }
+        assert!(mgr_a.peers.lock().await.is_empty());
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn call_session_deactivates_after_last_peer_disconnects() {
+        use iroh::endpoint::ApplicationClose;
+
+        let (event_tx_a, _) = broadcast::channel::<Event>(16);
+        let (event_tx_b, _) = broadcast::channel::<Event>(16);
+        let (mgr_a, _mgr_b, endpoint_a, endpoint_b, router_a, _peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b).await;
+
+        let b_id = endpoint_b.id().to_string();
+        mgr_a.disconnect_peer(&b_id).await.unwrap();
+        assert!(mgr_a.peers.lock().await.is_empty());
+
+        // A stray/late dial for the now-abandoned call session must be
+        // rejected — mirrors a callee's join arriving after the caller hung
+        // up (or cancelled) and nobody re-armed create_call/join_call.
+        let endpoint_c = node::create_test_endpoint().await.unwrap();
+        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
+            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let connection = endpoint_c.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
+
+        let close_reason = timeout(Duration::from_secs(10), connection.closed())
+            .await
+            .expect("gate should close the connection instead of leaving it open");
+        match close_reason {
+            ConnectionError::ApplicationClosed(ApplicationClose { reason, .. }) => {
+                assert_eq!(&reason[..], b"call_not_active");
+            }
+            other => panic!("expected call_not_active application close, got {other:?}"),
+        }
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_c.close().await;
+        endpoint_a.close().await;
+    }
+
+    // ── DM delivery ack + dedup (wave 2) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn dm_ack_received_after_text_with_id() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a, audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b.clone(), audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        wait_for_relay_addr(&endpoint_a).await;
+
+        let mut rx_b = event_tx_b.subscribe();
+        let a_id = endpoint_a.id().to_string();
+        mgr_b
+            .send_dm(
+                &a_id,
+                &DmMessage::Text {
+                    content: "hello".to_string(),
+                    timestamp: 1,
+                    id: Some("msg-1".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::DmAckReceived { peer_id, id })
+                        if peer_id == a_id && id == "msg-1" =>
+                    {
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for delivery ack");
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_text_id_is_deduped_but_still_emits_dm_received_once() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+
+        wait_for_relay_addr(&endpoint_a).await;
+
+        let mut rx_a = event_tx_a.subscribe();
+        let a_id = endpoint_a.id().to_string();
+        let msg = DmMessage::Text {
+            content: "duplicate-payload".to_string(),
+            timestamp: 1,
+            id: Some("dup-1".to_string()),
+        };
+        mgr_b.send_dm(&a_id, &msg).await.unwrap();
+        mgr_b.send_dm(&a_id, &msg).await.unwrap();
+
+        let mut received_count = 0usize;
+        // Bounded window: count DmReceived for this content, then confirm no
+        // second one shows up.
+        let _ = timeout(Duration::from_millis(1500), async {
+            loop {
+                match rx_a.recv().await {
+                    Ok(Event::DmReceived {
+                        message: DmMessage::Text { content, .. },
+                        ..
+                    }) if content == "duplicate-payload" => {
+                        received_count += 1;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            received_count, 1,
+            "duplicate text id must be deduped to a single DmReceived"
+        );
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
     }
 }

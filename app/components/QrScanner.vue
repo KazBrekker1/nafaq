@@ -73,37 +73,26 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <UModal v-model:open="open">
-    <template #content>
-      <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
-        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] p-3 sm:p-4">
-          <p class="label">SCAN QR CODE</p>
-          <button
-            class="text-[var(--color-muted)] transition-colors hover:text-white"
-            aria-label="Close scanner"
-            @click="closeScanner"
-          >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
+  <UModal v-model:open="open" title="Scan QR Code">
+    <template #body>
+      <UAlert
+        v-if="error"
+        color="error"
+        variant="subtle"
+        icon="i-heroicons-exclamation-triangle"
+        :description="error"
+      />
+      <div v-else class="relative aspect-square w-full overflow-hidden border-2 border-default bg-black">
+        <div v-if="!streaming" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black">
+          <UIcon name="i-heroicons-camera" class="text-2xl text-dimmed" />
+          <p class="text-xs text-muted">Opening camera...</p>
         </div>
-
-        <div class="p-3 sm:p-4">
-          <div v-if="error" class="border-2 border-[var(--color-danger)] p-3 text-xs text-[var(--color-danger)] text-center">
-            {{ error }}
-          </div>
-          <div v-else class="relative aspect-square w-full overflow-hidden bg-black">
-            <div v-if="!streaming" class="absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-black">
-              <UIcon name="i-heroicons-camera" class="text-2xl text-[var(--color-border-muted)]" />
-              <p class="text-xs text-[var(--color-muted)]">Opening camera...</p>
-            </div>
-            <video ref="videoRef" class="h-full w-full object-cover" />
-          </div>
-
-          <UButton variant="outline" class="w-full rounded-none mt-3" @click="closeScanner">
-            Cancel
-          </UButton>
-        </div>
+        <video ref="videoRef" class="h-full w-full object-cover" />
       </div>
+    </template>
+
+    <template #footer>
+      <UButton label="Cancel" variant="outline" class="w-full" @click="closeScanner" />
     </template>
   </UModal>
 </template>

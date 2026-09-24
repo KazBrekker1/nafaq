@@ -1,4 +1,4 @@
-export type DmMessageStatus = "sending" | "sent" | "failed";
+export type DmMessageStatus = "sending" | "sent" | "delivered" | "failed";
 
 export interface DmTextMessage {
   type: "text";
@@ -34,6 +34,10 @@ const connectedPeers = new Set<string>();
 // Peers with an in-flight connect_dm invoke, to de-dup concurrent connect()
 // calls without falsely marking them connected.
 const connectingPeers = new Set<string>();
+// Peers whose most recent connect_dm attempt failed — cleared on the next
+// successful connect (dm-connected event). Surfaced as a minimal inline
+// notice; the failed message itself still retries via retryFailedMessages.
+const connectErrors = ref<Record<string, boolean>>({});
 
 let dmListenerInitialized = false;
 let dmUnlisteners: Array<() => void> = [];
@@ -54,6 +58,21 @@ function pushMessage(nodeId: string, msg: DmMessageItem) {
     unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] || 0) + 1;
     unreadCounts.value = { ...unreadCounts.value };
   }
+}
+
+// Patch an existing file message in place (by id) and trigger reactivity.
+// Used for the sender side of a transfer, whose card is created before the
+// transfer completes so a failure mid-transfer stays visible instead of the
+// card simply never appearing (see sendFile).
+function updateFileMessage(nodeId: string, fileId: string, patch: Partial<DmFileMessage>) {
+  const msgs = conversations.value[nodeId];
+  if (!msgs) return;
+  const idx = msgs.findIndex(m => m.type === "file" && m.id === fileId);
+  if (idx === -1) return;
+  const updated = { ...(msgs[idx] as DmFileMessage), ...patch };
+  const next = [...msgs];
+  next[idx] = updated;
+  conversations.value = { ...conversations.value, [nodeId]: next };
 }
 
 function updateDmTextMessageStatus(
@@ -98,7 +117,12 @@ async function deliverText(nodeId: string, message: DmTextMessage): Promise<bool
     try {
       await invoke("send_dm", {
         peerId: nodeId,
-        message: { type: "text", content: message.content, timestamp: message.timestamp },
+        message: {
+          type: "text",
+          content: message.content,
+          timestamp: message.timestamp,
+          id: message.clientId,
+        },
       });
       setDmTextStatus(nodeId, message, "sent");
       return true;
@@ -115,13 +139,23 @@ async function deliverText(nodeId: string, message: DmTextMessage): Promise<bool
 // Re-send any text messages still marked "failed" for this peer — called when
 // a DM connection (re)establishes, so a message that failed during a transient
 // disconnect is delivered automatically once the peer is reachable again.
-function retryFailedMessages(nodeId: string) {
+//
+// Sequential, in the conversation's original order — firing them all
+// concurrently (as this used to) races multiple DM writes against each
+// other with no guarantee the earlier message lands first, so a reader could
+// see message 2 delivered before message 1. Each retry is awaited before the
+// next starts; a message that fails again is left "failed" (not retried
+// again in this pass) and the loop continues to the rest rather than
+// aborting, since one still-unreachable message shouldn't block delivery of
+// later ones that might succeed (e.g. after a partial network recovery).
+async function retryFailedMessages(nodeId: string) {
   const msgs = conversations.value[nodeId];
   if (!msgs) return;
-  for (const m of msgs) {
-    if (m.type === "text" && m.from === "self" && m.status === "failed") {
-      void deliverText(nodeId, m as DmTextMessage);
-    }
+  const toRetry = msgs.filter(
+    m => m.type === "text" && m.from === "self" && m.status === "failed",
+  ) as DmTextMessage[];
+  for (const m of toRetry) {
+    await deliverText(nodeId, m);
   }
 }
 
@@ -197,14 +231,34 @@ async function initDmListeners() {
     const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
     if (pid) {
       connectedPeers.add(pid);
+      if (connectErrors.value[pid]) {
+        const { [pid]: _removed, ...rest } = connectErrors.value;
+        connectErrors.value = rest;
+      }
       // A reconnect just landed — flush anything that failed while we were down.
-      retryFailedMessages(pid);
+      void retryFailedMessages(pid);
     }
   }));
 
   dmUnlisteners.push(await listen<any>("dm-disconnected", (event) => {
     const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
     if (pid) connectedPeers.delete(pid);
+  }));
+
+  // Delivery ack for a Text message we sent — resolves "sent" to "delivered".
+  // Backward compatible: an older peer never sends this, so our messages to
+  // it simply stay at "sent" forever (no regression from today's behavior).
+  dmUnlisteners.push(await listen<any>("dm-ack-received", (event) => {
+    const { peer_id, id } = event.payload;
+    if (!peer_id || !id) return;
+    const msgs = conversations.value[peer_id];
+    if (!msgs) return;
+    conversations.value = {
+      ...conversations.value,
+      [peer_id]: msgs.map(m => (
+        m.type === "text" && m.clientId === id ? { ...m, status: "delivered" as const } : m
+      )),
+    };
   }));
 }
 
@@ -226,6 +280,7 @@ export function useDM() {
       // fires and a later connect() correctly re-dials.
     } catch (error) {
       console.warn("[dm] connect_dm failed:", error);
+      connectErrors.value = { ...connectErrors.value, [nodeId]: true };
     } finally {
       connectingPeers.delete(nodeId);
     }
@@ -263,13 +318,29 @@ export function useDM() {
   }
 
   async function sendFile(nodeId: string, filePath: string) {
-    const { invoke } = await import("@tauri-apps/api/core");
     const name = filePath.split(/[/\\]/).pop() || "file";
-    const result = await invoke<{ id: string; size: number }>("send_file", { peerId: nodeId, filePath });
+    // Create the card BEFORE the transfer invoke resolves — send_file only
+    // returns once the whole file has streamed, so waiting for it to create
+    // the card means a failed (or merely slow) outgoing transfer is
+    // invisible until it either finishes or throws. A locally-unique
+    // placeholder id lets the card render immediately in a pending state;
+    // it's swapped for the backend's real transfer id on success.
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     pushMessage(nodeId, {
-      type: "file", name, size: result.size, id: result.id, progress: 1,
-      localPath: filePath, from: "self", timestamp: Date.now(),
+      type: "file", name, size: 0, id: pendingId, progress: 0,
+      localPath: null, from: "self", timestamp: Date.now(),
     });
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result = await invoke<{ id: string; size: number }>("send_file", { peerId: nodeId, filePath });
+      updateFileMessage(nodeId, pendingId, {
+        id: result.id, size: result.size, progress: 1, localPath: filePath, failed: false,
+      });
+    } catch (error) {
+      console.warn("[dm] send_file failed:", error);
+      updateFileMessage(nodeId, pendingId, { failed: true });
+      throw error;
+    }
   }
 
   function markRead(nodeId: string) {
@@ -285,7 +356,7 @@ export function useDM() {
   }
 
   return {
-    conversations, activeConversation, unreadCounts,
+    conversations, activeConversation, unreadCounts, connectErrors,
     connect, disconnect, clearActiveConversation,
     sendText, resend, sendFile, pushMessage, markRead, totalUnread,
   };
@@ -301,5 +372,6 @@ if (import.meta.hot) {
     dmListenerInitialized = false;
     connectedPeers.clear();
     connectingPeers.clear();
+    connectErrors.value = {};
   });
 }

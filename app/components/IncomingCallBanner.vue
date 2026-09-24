@@ -18,30 +18,34 @@ onUnmounted(() => {
 <template>
   <Transition name="slide-down">
     <div
-      class="fixed top-0 left-0 right-0 z-50 border-b-2 border-[var(--color-border)] bg-black"
+      class="fixed top-0 left-0 right-0 z-50 border-b-2 border-(--ui-border-accented) bg-default shadow-(--ui-shadow-hard-lg)"
       style="padding-top: calc(env(safe-area-inset-top, 0px) + 0.5rem);"
     >
-      <div class="px-4 pb-3 flex items-center gap-3">
+      <div class="px-5 pb-4 flex items-center gap-4">
         <div class="flex-1 min-w-0">
-          <p class="text-[10px] font-bold tracking-[3px] text-[var(--color-muted)] uppercase">Incoming Call</p>
-          <p class="text-sm font-bold font-mono text-[var(--color-border)] truncate mt-0.5">
+          <p class="label mb-1">Incoming Call</p>
+          <p class="text-sm font-bold text-highlighted truncate mt-0.5">
             {{ caller.peerId.slice(0, 16) }}...
           </p>
         </div>
 
-        <button
-          class="shrink-0 border-2 border-[var(--color-danger)] px-4 py-2 text-[10px] font-bold tracking-widest text-[var(--color-danger)] hover:bg-[var(--color-danger)] hover:text-black transition-colors"
+        <UButton
+          label="DECLINE"
+          color="error"
+          variant="solid"
+          size="lg"
+          class="shrink-0 min-h-[44px]"
           @click="emit('decline')"
-        >
-          DECLINE
-        </button>
+        />
 
-        <button
-          class="shrink-0 border-2 border-[var(--color-accent)] bg-[var(--color-accent)] px-4 py-2 text-[10px] font-bold tracking-widest text-black hover:bg-transparent hover:text-[var(--color-accent)] transition-colors"
+        <UButton
+          label="ACCEPT"
+          color="success"
+          variant="solid"
+          size="lg"
+          class="shrink-0 min-h-[44px]"
           @click="emit('accept')"
-        >
-          ACCEPT
-        </button>
+        />
       </div>
     </div>
   </Transition>

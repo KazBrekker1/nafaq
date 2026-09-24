@@ -48,56 +48,47 @@ function closeModal() {
 </script>
 
 <template>
-  <UModal v-model:open="open">
-    <template #content>
-      <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
-        <div class="flex items-start justify-between gap-4 border-b border-[var(--color-border-muted)] p-3 sm:p-4">
-          <div>
-            <p class="label mb-1">{{ title }}</p>
-            <p class="text-xs text-[var(--color-muted)]">{{ description }}</p>
-          </div>
-          <button
-            class="text-[var(--color-muted)] transition-colors hover:text-white"
-            aria-label="Close share modal"
-            @click="closeModal"
+  <UModal
+    v-model:open="open"
+    :title="title"
+    :description="description"
+    :ui="{ title: 'label', description: 'mt-1 text-xs text-muted' }"
+  >
+    <template #body>
+      <div class="space-y-4">
+        <div class="flex justify-center bg-white p-2">
+          <img
+            v-if="qrDataUrl"
+            :src="qrDataUrl"
+            alt="Connection QR code"
+            class="h-[200px] w-[200px] sm:h-[240px] sm:w-[240px]"
+          />
+          <div
+            v-else
+            class="flex h-[200px] w-[200px] items-center justify-center text-center text-xs text-black sm:h-[240px] sm:w-[240px]"
           >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
+            QR unavailable
+          </div>
         </div>
 
-        <div class="space-y-3 p-3 sm:p-4">
-          <div class="flex justify-center bg-white p-2">
-            <img
-              v-if="qrDataUrl"
-              :src="qrDataUrl"
-              alt="Connection QR code"
-              class="h-[200px] w-[200px] sm:h-[240px] sm:w-[240px]"
-            />
-            <div
-              v-else
-              class="flex h-[200px] w-[200px] items-center justify-center text-center text-xs text-black sm:h-[240px] sm:w-[240px]"
-            >
-              QR unavailable
-            </div>
-          </div>
-
-          <div>
-            <p class="label mb-1">CONNECTION STRING</p>
-            <div class="border-2 border-[var(--color-accent)] bg-black p-2 text-[10px] break-all text-[var(--color-border)] max-h-16 overflow-y-auto">
-              {{ ticket || "Waiting for connection string..." }}
-            </div>
-          </div>
-
-          <div class="flex gap-0">
-            <UButton class="flex-1 rounded-none" :disabled="!ticket" @click="copyTicket">
-              {{ copied ? "Copied!" : "Copy" }}
-            </UButton>
-            <UButton variant="outline" class="flex-1 rounded-none border-l-0" @click="closeModal">
-              Close
-            </UButton>
+        <div>
+          <p class="label mb-2">CONNECTION STRING</p>
+          <div class="max-h-16 overflow-y-auto border-2 border-primary bg-elevated p-2 text-[10px] break-all text-highlighted">
+            {{ ticket || "Waiting for connection string..." }}
           </div>
         </div>
       </div>
+    </template>
+
+    <template #footer>
+      <UFieldGroup class="w-full">
+        <UButton class="flex-1" block :disabled="!ticket" @click="copyTicket">
+          {{ copied ? "Copied!" : "Copy" }}
+        </UButton>
+        <UButton class="flex-1" block variant="outline" @click="closeModal">
+          Close
+        </UButton>
+      </UFieldGroup>
     </template>
   </UModal>
 </template>

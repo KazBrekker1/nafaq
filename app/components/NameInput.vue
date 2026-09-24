@@ -48,16 +48,19 @@ onUnmounted(() => clearTimeout(persistTimer));
     <UInput
       v-model="model"
       placeholder="Your name"
-      class="flex-1 rounded-none text-sm text-center"
+      class="flex-1"
+      :ui="{ base: 'text-center' }"
     />
-    <button
-      v-if="loaded"
-      class="w-8 h-8 flex items-center justify-center transition-colors"
-      :class="pinned ? 'text-[var(--color-accent)]' : 'text-[var(--color-muted)] hover:text-[var(--color-border)]'"
-      :title="pinned ? 'Name pinned — persists across sessions' : 'Pin name to remember it'"
-      @click="togglePin"
-    >
-      <UIcon :name="pinned ? 'i-heroicons-lock-closed' : 'i-heroicons-lock-open'" class="text-sm" />
-    </button>
+    <UTooltip :text="pinned ? 'Name pinned — persists across sessions' : 'Pin name to remember it'">
+      <UButton
+        v-if="loaded"
+        :icon="pinned ? 'i-heroicons-lock-closed' : 'i-heroicons-lock-open'"
+        variant="ghost"
+        :color="pinned ? 'primary' : 'neutral'"
+        square
+        :aria-label="pinned ? 'Name pinned — persists across sessions' : 'Pin name to remember it'"
+        @click="togglePin"
+      />
+    </UTooltip>
   </div>
 </template>

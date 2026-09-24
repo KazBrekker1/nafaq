@@ -22,6 +22,11 @@ pub enum DmMessage {
     Text {
         content: String,
         timestamp: u64,
+        /// Client-generated message id, used for delivery ACKs and dedup.
+        /// Optional + defaulted so frames from an older peer (which never
+        /// sent this field) still deserialize cleanly.
+        #[serde(default)]
+        id: Option<String>,
     },
     FileStart {
         name: String,
@@ -42,8 +47,32 @@ pub enum DmMessage {
     },
     CallAccept,
     CallDecline,
+    /// Caller gives up on a pending invite (explicit cancel or ring timeout)
+    /// before the callee answered. New variant — see wire-compat note below.
+    CallCancel,
+    /// Delivery acknowledgement for a `Text` message carrying an `id`. New
+    /// variant — see wire-compat note below.
+    Ack {
+        id: String,
+    },
     Heartbeat,
 }
+
+// Wire-compat note (additive enum variants over serde_json):
+// DmMessage frames are encoded with `serde_json::to_vec` and decoded with
+// `serde_json::from_slice::<DmMessage>` (see `write_framed`/`read_framed`
+// below). Every call site that parses an inbound frame does so as
+// `if let Ok(dm_msg) = serde_json::from_slice::<DmMessage>(data) { .. }` (or
+// equivalent) and silently drops the frame on a parse error — there is no
+// site that propagates an unknown-variant error up to close the DM stream.
+// That means an OLDER peer (pre-`CallCancel`/`Ack`) receiving one of these
+// new variants gets a JSON deserialize error for that single frame, drops it,
+// and keeps reading — the stream itself is unaffected. So `CallCancel` and
+// `Ack` are safe additive variants for one-way skew (new -> old). The
+// `Text.id` field is `Option` + `#[serde(default)]`, so an old peer's
+// id-less `Text` still deserializes on a new receiver, and a new peer's
+// `Text{id: Some(_)}` still deserializes on an old receiver (unknown fields
+// are ignored by default; no `deny_unknown_fields` is set on this enum).
 
 /// Stream type identifiers for binary frame protocol
 pub const STREAM_AUDIO: u8 = 0x01;
@@ -269,6 +298,16 @@ pub enum Event {
         peer_id: String,
         ticket: String,
     },
+    CallDeclineReceived {
+        peer_id: String,
+    },
+    CallCancelReceived {
+        peer_id: String,
+    },
+    DmAckReceived {
+        peer_id: String,
+        id: String,
+    },
     DmFileSaved {
         peer_id: String,
         file_id: String,
@@ -488,5 +527,66 @@ mod tests {
     #[test]
     fn test_audio_datagram_decode_too_short() {
         assert!(AudioDatagram::decode(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn test_dm_text_id_roundtrip() {
+        let msg = DmMessage::Text {
+            content: "hi".into(),
+            timestamp: 42,
+            id: Some("client-id-1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: DmMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DmMessage::Text { id, .. } => assert_eq!(id.as_deref(), Some("client-id-1")),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_dm_text_without_id_defaults_to_none() {
+        // Simulates a frame from an older peer that never had the `id` field.
+        let json = r#"{"type":"text","content":"hi","timestamp":42}"#;
+        let parsed: DmMessage = serde_json::from_str(json).unwrap();
+        match parsed {
+            DmMessage::Text { id, .. } => assert_eq!(id, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_dm_ack_roundtrip() {
+        let msg = DmMessage::Ack {
+            id: "client-id-1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"ack\""));
+        let parsed: DmMessage = serde_json::from_str(&json).unwrap();
+        match parsed {
+            DmMessage::Ack { id } => assert_eq!(id, "client-id-1"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_dm_call_cancel_roundtrip() {
+        let json = serde_json::to_string(&DmMessage::CallCancel).unwrap();
+        assert_eq!(json, r#"{"type":"call_cancel"}"#);
+        assert!(matches!(
+            serde_json::from_str::<DmMessage>(&json).unwrap(),
+            DmMessage::CallCancel
+        ));
+    }
+
+    #[test]
+    fn test_dm_message_unknown_variant_is_tolerated_not_propagated() {
+        // An unrecognized `type` tag (e.g. a future variant an older build
+        // doesn't know about) must fail to parse as a single bad frame, not
+        // panic or produce something callers mistake for a known variant.
+        // Every read site in connection.rs treats this Err as "drop the
+        // frame, keep reading" rather than closing the stream.
+        let json = r#"{"type":"some_future_variant","stuff":1}"#;
+        assert!(serde_json::from_str::<DmMessage>(json).is_err());
     }
 }

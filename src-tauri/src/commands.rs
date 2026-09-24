@@ -76,6 +76,11 @@ pub async fn get_node_info(state: State<'_, AppState>) -> Result<NodeInfo, Strin
 
 #[tauri::command]
 pub async fn create_call(state: State<'_, AppState>) -> Result<String, String> {
+    // Declares intent to accept an inbound call dial for our ticket — must be
+    // set before the ticket is handed out (via CallInvite) so a fast joiner
+    // can't race the gate. See ConnectionManager::setup_connection.
+    state.conn_manager.set_call_session_active(true);
+
     if let Some(ticket) = state.latest_ticket.lock().await.clone() {
         return Ok(ticket);
     }
@@ -103,6 +108,9 @@ pub async fn join_call(
     if ticket.len() > MAX_TICKET_LEN {
         return Err("Ticket too large".into());
     }
+    // We're deliberately joining a call too, so we must also be able to
+    // accept inbound mesh dials from other participants once connected.
+    state.conn_manager.set_call_session_active(true);
     let peer_id = state
         .conn_manager
         .connect_to_peer_with_ticket(&state.endpoint, &ticket)
@@ -120,6 +128,38 @@ pub async fn end_call(peer_id: String, state: State<'_, AppState>) -> Result<(),
     state
         .conn_manager
         .disconnect_peer(&peer_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Caller gives up on a pending invite before the callee answered — either an
+/// explicit cancel (hang up while "waiting") or the caller-side ring timeout.
+/// Best-effort notifies the callee so it can dismiss the ringing banner and
+/// record a missed call, and unconditionally clears our own call-session-
+/// active flag so a late/stray join dial for the now-abandoned ticket is
+/// rejected at the protocol level (see setup_connection).
+#[tauri::command]
+pub async fn cancel_call(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_peer_id(&peer_id)?;
+    if let Err(e) = state
+        .conn_manager
+        .send_dm(&peer_id, &DmMessage::CallCancel)
+        .await
+    {
+        tracing::warn!("Failed to deliver call cancel to {peer_id}: {e}");
+    }
+    state.conn_manager.set_call_session_active(false);
+    Ok(())
+}
+
+/// Callee explicitly declines a ringing invite (or its 30s auto-timeout
+/// fires). Tells the caller so it can stop waiting instead of ringing out.
+#[tauri::command]
+pub async fn send_call_decline(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_peer_id(&peer_id)?;
+    state
+        .conn_manager
+        .send_dm(&peer_id, &DmMessage::CallDecline)
         .await
         .map_err(|e| e.to_string())
 }

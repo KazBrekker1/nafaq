@@ -25,16 +25,16 @@ const isProblem = computed(() => step === "relay-degraded" || step === "relay-of
 <template>
   <div v-if="step !== 'idle'" class="flex items-center gap-2 text-xs">
     <div
-      class="w-2 h-2 rounded-full"
+      class="h-2 w-2 shrink-0 rounded-full"
       :class="isActive
-        ? 'bg-[var(--color-accent)] animate-pulse'
+        ? 'bg-primary animate-pulse'
         : isHealthy
-          ? 'bg-[var(--color-accent)]'
+          ? 'bg-primary'
           : isProblem
-            ? 'bg-[var(--color-danger)]'
-            : 'bg-[var(--color-muted)]'"
+            ? 'bg-error'
+            : 'bg-muted'"
     />
-    <span class="text-[var(--color-muted)] tracking-wider">
+    <span class="text-muted tracking-wider">
       {{ current?.label || "" }}
     </span>
   </div>

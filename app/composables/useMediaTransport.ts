@@ -169,8 +169,63 @@ const peerVideoDecoders = new Map<string, VideoDecoder>();
 // requests on join) arrives.
 const peersAwaitingKeyframe = new Set<string>();
 
+// Per-peer decode error tracking so a persistently broken stream (e.g. a
+// corrupt or unsupported bitstream) doesn't spin the CPU recreating and
+// immediately re-erroring the decoder on every incoming frame.
+const peerDecoderErrorTimestamps = new Map<string, number[]>();
+const peerDecoderCooldownUntil = new Map<string, number>();
+const DECODER_ERROR_STORM_LIMIT = 3;
+const DECODER_ERROR_STORM_WINDOW_MS = 10_000;
+const DECODER_ERROR_COOLDOWN_MS = 10_000;
+
+function isVideoDecoderInCooldown(peerId: string): boolean {
+  const until = peerDecoderCooldownUntil.get(peerId);
+  if (until === undefined) return false;
+  if (Date.now() >= until) {
+    peerDecoderCooldownUntil.delete(peerId);
+    return false;
+  }
+  return true;
+}
+
+// Called whenever a peer's decoder can no longer be trusted (WebCodecs
+// `error` callback, or a synchronous throw from decode()/getOrCreateVideoDecoder
+// finding an already-closed decoder). Tears the decoder down, re-arms the
+// awaiting-first-keyframe gate so the replacement never gets fed a delta
+// before an IDR, and asks the peer for a fresh keyframe. If errors keep
+// recurring in a short window, backs off from recreating the decoder for a
+// cooldown period instead of spinning.
+function recoverVideoDecoder(peerId: string, reason: string) {
+  destroyVideoDecoder(peerId);
+  peersAwaitingKeyframe.add(peerId);
+
+  const now = Date.now();
+  const recent = (peerDecoderErrorTimestamps.get(peerId) ?? []).filter(
+    (t) => now - t < DECODER_ERROR_STORM_WINDOW_MS,
+  );
+  recent.push(now);
+  peerDecoderErrorTimestamps.set(peerId, recent);
+
+  if (recent.length > DECODER_ERROR_STORM_LIMIT) {
+    peerDecoderCooldownUntil.set(peerId, now + DECODER_ERROR_COOLDOWN_MS);
+    console.warn(
+      `VideoDecoder for ${peerId} errored ${recent.length} times in ${DECODER_ERROR_STORM_WINDOW_MS}ms (${reason}); pausing decoder recreation for ${DECODER_ERROR_COOLDOWN_MS}ms`,
+    );
+  } else {
+    console.warn(`VideoDecoder recovery for ${peerId}: ${reason}`);
+  }
+
+  requestKeyframe(peerId).catch(() => {});
+}
+
 function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): VideoDecoder {
   let decoder = peerVideoDecoders.get(peerId);
+  if (decoder && decoder.state === "closed") {
+    // Per the WebCodecs spec, once `error` fires the decoder is permanently
+    // closed — returning it here would silently drop every future frame.
+    peerVideoDecoders.delete(peerId);
+    decoder = undefined;
+  }
   if (decoder) return decoder;
 
   peersAwaitingKeyframe.add(peerId);
@@ -183,7 +238,7 @@ function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): Vid
       frame.close();
     },
     error(e: DOMException) {
-      console.warn(`VideoDecoder error for ${peerId}:`, e);
+      recoverVideoDecoder(peerId, `VideoDecoder error: ${e.message}`);
     },
   });
   decoder.configure({
@@ -201,6 +256,12 @@ function destroyVideoDecoder(peerId: string) {
   }
   peerVideoDecoders.delete(peerId);
   peersAwaitingKeyframe.delete(peerId);
+}
+
+function forgetPeerVideoDecoderState(peerId: string) {
+  destroyVideoDecoder(peerId);
+  peerDecoderErrorTimestamps.delete(peerId);
+  peerDecoderCooldownUntil.delete(peerId);
 }
 
 const corePromise = import("@tauri-apps/api/core");
@@ -504,10 +565,10 @@ async function sendControl(peerId: string, action: Record<string, unknown>) {
   await invoke("send_control", { peerId, action });
 }
 
-async function requestKeyframe(peerId: string) {
+async function requestKeyframe(peerId: string, force = false) {
   const peerState = getOrCreatePeerState(peerId);
   const now = Date.now();
-  if (now - peerState.lastKeyframeRequestAt < KEYFRAME_REQUEST_DEBOUNCE_MS) return;
+  if (!force && now - peerState.lastKeyframeRequestAt < KEYFRAME_REQUEST_DEBOUNCE_MS) return;
   peerState.lastKeyframeRequestAt = now;
   sendControl(peerId, { action: "keyframe_request", layer: "high" }).catch(() => {});
 }
@@ -786,8 +847,17 @@ async function setupReceiveBridge(forceEventMode = false) {
         const peerState = peerMediaStates.get(peerId);
         if (!peerState || peerState.videoPaused) return;
         if (!peerState.canvas) return;
+        if (isVideoDecoderInCooldown(peerId)) {
+          // Backing off from a recent error storm — keep asking for a
+          // keyframe (debounced) but don't recreate the decoder every frame.
+          requestKeyframe(peerId).catch(() => {});
+          return;
+        }
         const decoder = getOrCreateVideoDecoder(peerId, peerState.canvas);
-        if (decoder.state === "closed") return;
+        if (decoder.state === "closed") {
+          recoverVideoDecoder(peerId, "decoder was already closed before decode");
+          return;
+        }
         if (isKeyframe) {
           peersAwaitingKeyframe.delete(peerId);
         } else if (peersAwaitingKeyframe.has(peerId)) {
@@ -802,7 +872,7 @@ async function setupReceiveBridge(forceEventMode = false) {
             data: h264Data,
           }));
         } catch (e) {
-          console.warn("WebCodecs decode error:", e);
+          recoverVideoDecoder(peerId, `decode() threw: ${e instanceof Error ? e.message : String(e)}`);
         }
         return; // Skip JPEG path
       }
@@ -1007,7 +1077,12 @@ export function useMediaTransport() {
       handleIncomingVideoFrame(peerId, frame.timestamp, frame.width, frame.height, frame.jpegBytes)
         .catch(() => {});
     } else {
-      requestKeyframe(peerId).catch(() => {});
+      // Bypass the debounce: syncSubscriptions may have already requested a
+      // keyframe for this peer moments ago (e.g. on join), which would
+      // otherwise suppress this request and leave the canvas black until the
+      // next periodic IDR.
+      peersAwaitingKeyframe.add(peerId);
+      requestKeyframe(peerId, true).catch(() => {});
     }
   }
 
@@ -1233,7 +1308,7 @@ export function useMediaTransport() {
       if (state?.audioGainNode) {
         try { state.audioGainNode.disconnect(); } catch {}
       }
-      destroyVideoDecoder(pid);
+      forgetPeerVideoDecoderState(pid);
       peerMediaStates.delete(pid);
       peerNetworkStats.delete(pid);
       initialKeyframeRequests.delete(pid);
@@ -1408,6 +1483,8 @@ export function useMediaTransport() {
     for (const peerId of peerVideoDecoders.keys()) {
       destroyVideoDecoder(peerId);
     }
+    peerDecoderErrorTimestamps.clear();
+    peerDecoderCooldownUntil.clear();
 
     // Release the Rust-side per-peer Opus/H.264 codec state too; the frontend
     // decoders above are separate, and without this the backend maps leak

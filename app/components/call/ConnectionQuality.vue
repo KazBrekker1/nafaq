@@ -5,10 +5,10 @@ const { quality } = defineProps<{
 
 const config = computed(() => {
   switch (quality) {
-    case "good": return { bars: 4, color: "var(--color-accent)" };
-    case "degraded": return { bars: 2, color: "var(--color-warning)" };
-    case "poor": return { bars: 1, color: "var(--color-danger)" };
-    default: return { bars: 1, color: "var(--color-danger)" };
+    case "good": return { bars: 4, color: "var(--ui-primary)" };
+    case "degraded": return { bars: 2, color: "var(--ui-warning)" };
+    case "poor": return { bars: 1, color: "var(--ui-error)" };
+    default: return { bars: 1, color: "var(--ui-error)" };
   }
 });
 
@@ -23,7 +23,7 @@ const barHeights = [6, 10, 14, 18];
       class="w-[3px]"
       :style="{
         height: `${h}px`,
-        background: i < config.bars ? config.color : 'var(--color-border-muted)',
+        background: i < config.bars ? config.color : 'var(--ui-border-muted)',
       }"
     />
   </div>

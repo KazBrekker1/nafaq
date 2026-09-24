@@ -115,7 +115,8 @@ describe("AppUpdateModal", () => {
 
 const updateModalStubs = {
   UModal: {
-    template: "<div><slot name=\"content\" /></div>",
+    props: ["title", "description"],
+    template: "<div><h1>{{ title }}</h1><p>{{ description }}</p><slot name=\"body\" /><slot name=\"footer\" /></div>",
   },
   UButton: {
     template: "<button v-bind=\"$attrs\"><slot /></button>",

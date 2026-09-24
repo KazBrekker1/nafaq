@@ -5,10 +5,12 @@ import { formatTime } from "~/utils/format";
 const route = useRoute();
 const peerId = computed(() => route.params.nodeId as string);
 
-const { conversations, connect, clearActiveConversation, sendText, resend, sendFile, markRead } = useDM();
+const {
+  conversations, connect, connectErrors, clearActiveConversation, sendText, resend, sendFile, markRead,
+} = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
 const { isOnline, startProbing, stopProbing } = usePresence();
-const { createCall, error: callError, state: callState } = useCall();
+const { createCall, error: callError, state: callState, startWaitingForAnswer } = useCall();
 
 const isContact = computed(() => contacts.value.some(c => c.node_id === peerId.value));
 const contactName = computed(() => resolveDisplayName(peerId.value));
@@ -90,6 +92,7 @@ async function initiateCall() {
     callState.value = "idle";
     return;
   }
+  startWaitingForAnswer(peerId.value);
   navigateTo("/call");
 }
 
@@ -124,53 +127,72 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex flex-col bg-[var(--color-surface)] safe-area-inset" :style="{ height: viewportHeight }">
+  <div class="flex flex-col bg-default safe-area-inset" :style="{ height: viewportHeight }">
 
     <!-- Header -->
-    <div class="border-b-2 border-[var(--color-border)] px-4 py-3 flex items-center gap-3 shrink-0 sticky top-0 bg-[var(--color-surface)] z-10">
-      <button
-        class="text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors flex items-center gap-1.5"
+    <div class="sticky top-0 z-10 flex shrink-0 items-center gap-3 border-b-2 border-(--ui-border-accented) bg-default px-5 py-4">
+      <UButton
+        icon="i-heroicons-arrow-left"
+        variant="ghost"
+        color="neutral"
+        size="xs"
         aria-label="Back"
-        @click="navigateTo('/messages')"
-      >
-        <UIcon name="i-heroicons-arrow-left" class="text-base" />
-      </button>
+        @click="() => { navigateTo('/messages') }"
+      />
 
       <!-- Name + online status -->
-      <div class="flex items-center gap-2 flex-1 min-w-0">
-        <span class="text-sm font-bold text-[var(--color-border)] font-mono truncate">{{ contactName }}</span>
+      <div class="flex min-w-0 flex-1 items-center gap-2">
+        <span class="truncate text-sm font-bold text-highlighted">{{ contactName }}</span>
         <span
-          class="shrink-0 inline-block w-2 h-2 rounded-full"
-          :style="online ? 'background:var(--color-online)' : 'background:var(--color-muted)'"
+          class="inline-block h-2 w-2 shrink-0 rounded-full"
+          :class="online ? 'bg-success' : 'bg-accented'"
           :title="online ? 'online' : 'offline'"
         />
-        <span class="text-[10px] text-[var(--color-muted)] shrink-0">{{ online ? "online" : "offline" }}</span>
+        <span class="shrink-0 text-[10px] text-dimmed">{{ online ? "online" : "offline" }}</span>
       </div>
 
       <!-- Add contact button -->
-      <button
+      <UButton
         v-if="!isContact"
-        class="border-2 border-[var(--color-accent)] px-3 py-1.5 text-[10px] font-bold tracking-widest text-[var(--color-accent)] hover:bg-[var(--color-accent)] hover:text-white transition-colors shrink-0"
+        icon="i-heroicons-user-plus"
+        label="ADD"
+        variant="subtle"
+        color="primary"
+        size="xs"
+        class="shrink-0"
         @click="handleAddContact"
-      >
-        + ADD
-      </button>
+      />
 
       <!-- Call button -->
-      <button
-        class="border-2 border-[var(--color-border)] px-3 py-1.5 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors shrink-0"
+      <UButton
+        icon="i-heroicons-phone"
+        label="CALL"
+        variant="subtle"
+        color="neutral"
+        size="xs"
+        class="shrink-0"
         @click="initiateCall"
-      >
-        ☎ CALL
-      </button>
+      />
+    </div>
+
+    <!-- Connect error banner -->
+    <div
+      v-if="connectErrors[peerId]"
+      class="shrink-0 border-b-2 border-(--ui-border-accented) bg-elevated px-5 py-2 text-[9px] tracking-widest text-dimmed"
+    >
+      CAN'T REACH PEER — MESSAGES WILL RETRY
     </div>
 
     <!-- Message list -->
-    <div ref="messages-el" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+    <div ref="messages-el" class="flex-1 overflow-y-auto px-5 py-5 space-y-5">
 
-      <div v-if="messages.length === 0" class="flex items-center justify-center h-full">
-        <p class="text-xs text-[var(--color-muted)] text-center">No messages yet.<br />Say hello!</p>
-      </div>
+      <UEmpty
+        v-if="messages.length === 0"
+        icon="i-heroicons-chat-bubble-left-right"
+        title="No messages yet"
+        description="Say hello!"
+        class="h-full justify-center border-0 shadow-none"
+      />
 
       <div
         v-for="(msg, idx) in messages"
@@ -180,38 +202,50 @@ onUnmounted(() => {
       >
         <!-- Sender label + time -->
         <div
-          class="flex items-center gap-2 mb-1"
+          class="mb-1 flex items-center gap-2"
           :class="msg.from === 'self' ? 'flex-row-reverse' : ''"
         >
-          <span class="text-[9px] font-bold tracking-widest font-mono" :class="msg.from === 'self' ? 'text-[var(--color-accent)]' : 'text-[var(--color-muted)]'">
+          <span class="text-[9px] font-bold tracking-widest" :class="msg.from === 'self' ? 'text-primary' : 'text-dimmed'">
             {{ msg.from === "self" ? "YOU" : contactName.toUpperCase() }}
           </span>
-          <span class="text-[9px] text-[var(--color-muted)] font-mono">{{ formatTime(msg.timestamp) }}</span>
+          <span class="text-[9px] text-dimmed">{{ formatTime(msg.timestamp) }}</span>
         </div>
 
         <!-- Text message -->
         <div
           v-if="msg.type === 'text'"
-          class="select-text max-w-[75%] px-3 py-2 text-xs text-[var(--color-border)] font-mono"
+          class="select-text max-w-[75%] border-2 px-3 py-2 text-xs"
           :class="msg.from === 'self'
-            ? 'bg-[var(--color-surface-alt)] border-2 border-[var(--color-border)]'
-            : 'border-l-2 border-[var(--color-accent)] pl-3'"
+            ? 'border-(--ui-border-accented) bg-primary text-inverted'
+            : 'border-(--ui-border-accented) bg-elevated text-highlighted'"
         >
           {{ msg.content }}
         </div>
         <button
           v-if="msg.type === 'text' && msg.from === 'self' && msg.status === 'failed'"
-          class="mt-1 text-[9px] font-mono tracking-widest text-[var(--color-danger)] hover:underline"
+          class="mt-1 text-[9px] tracking-widest text-error hover:underline"
           title="Tap to resend"
           @click="resend(peerId, msg)"
         >
           FAILED · TAP TO RESEND
         </button>
         <div
-          v-else-if="msg.type === 'text' && msg.from === 'self' && msg.status !== 'sent'"
-          class="mt-1 text-[9px] font-mono tracking-widest text-[var(--color-muted)]"
+          v-else-if="msg.type === 'text' && msg.from === 'self' && msg.status === 'sending'"
+          class="mt-1 text-[9px] tracking-widest text-dimmed"
         >
           SENDING…
+        </div>
+        <div
+          v-else-if="msg.type === 'text' && msg.from === 'self' && msg.status === 'delivered'"
+          class="mt-1 text-[9px] tracking-widest text-dimmed"
+        >
+          ✓✓ DELIVERED
+        </div>
+        <div
+          v-else-if="msg.type === 'text' && msg.from === 'self' && msg.status === 'sent'"
+          class="mt-1 text-[9px] tracking-widest text-dimmed"
+        >
+          ✓ SENT
         </div>
 
         <!-- File message -->
@@ -229,34 +263,38 @@ onUnmounted(() => {
     </div>
 
     <!-- Input bar -->
-    <div class="border-t-2 border-[var(--color-border)] px-3 py-2 flex items-center gap-2 shrink-0 bg-[var(--color-surface)]">
+    <div class="flex shrink-0 items-center gap-2 border-t-2 border-(--ui-border-accented) bg-default px-4 py-3">
 
       <!-- Attach button -->
-      <button
-        class="shrink-0 text-[var(--color-muted)] hover:text-[var(--color-border)] transition-colors text-base"
+      <UButton
+        icon="i-heroicons-paper-clip"
+        variant="ghost"
+        color="neutral"
+        size="xs"
         title="Attach file"
+        aria-label="Attach file"
         @click="openFilePicker"
-      >
-        <UIcon name="i-heroicons-paper-clip" class="text-lg" />
-      </button>
+      />
 
       <!-- Text input -->
       <UInput
         v-model="inputText"
         placeholder="Type a message..."
-        class="flex-1 rounded-none font-mono text-xs"
+        class="flex-1"
         @keydown.enter="send"
       />
 
       <!-- Send button -->
-      <button
-        class="shrink-0 border-2 border-[var(--color-border)] px-3 py-2 text-xs font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-        :class="inputText.trim() ? 'opacity-100' : 'opacity-40'"
+      <UButton
+        icon="i-heroicons-paper-airplane"
+        variant="solid"
+        color="primary"
+        size="xs"
+        class="shrink-0"
         :disabled="!inputText.trim()"
+        aria-label="Send"
         @click="send"
-      >
-        →
-      </button>
+      />
     </div>
 
   </div>

@@ -17,7 +17,7 @@ function openUpdateModal() {
 // ── Identity ─────────────────────────────────────────────
 
 const truncatedNodeId = computed(() => {
-  if (!nodeId.value) return "\u2014";
+  if (!nodeId.value) return "—";
   return truncateNodeId(nodeId.value);
 });
 
@@ -32,12 +32,12 @@ const relayStatusLabel = computed(() => relayStatus.value.replace("_", " ").toUp
 const relayStatusClass = computed(() => {
   switch (relayStatus.value) {
     case "online":
-      return "text-[var(--color-accent)]";
+      return "text-primary";
     case "degraded":
     case "offline":
-      return "text-[var(--color-danger)]";
+      return "text-error";
     default:
-      return "text-[var(--color-muted)]";
+      return "text-muted";
   }
 });
 
@@ -83,7 +83,7 @@ const recentItems = computed<RecentItem[]>(() => {
     const last = msgs[msgs.length - 1]!;
     let preview: string;
     if (last.type === "text") {
-      preview = last.content.length > 40 ? last.content.slice(0, 40) + "\u2026" : last.content;
+      preview = last.content.length > 40 ? last.content.slice(0, 40) + "…" : last.content;
     } else {
       preview = `[File] ${last.name}`;
     }
@@ -101,190 +101,193 @@ const recentItems = computed<RecentItem[]>(() => {
 </script>
 
 <template>
-  <div class="min-h-full bg-[var(--color-surface)] safe-area-inset-min">
+  <div class="min-h-full bg-default safe-area-inset-min">
 
     <!-- Header -->
-    <div class="border-b border-[var(--color-border-muted)] px-4 py-3 sticky top-0 bg-[var(--color-surface)] z-10">
-      <h1 class="label text-[var(--color-border)]" style="letter-spacing: 4px;">HOME</h1>
+    <div class="sticky top-0 z-10 border-b border-default bg-default px-5 py-4">
+      <h1 class="label">HOME</h1>
     </div>
 
-    <div class="max-w-xl mx-auto">
+    <div class="mx-auto max-w-xl space-y-4 p-4">
 
       <!-- ── IDENTITY CARD ── -->
-      <section class="border-b-2 border-[var(--color-border)]">
-        <div class="px-4 sm:px-6 py-4">
-          <div class="flex items-center justify-between gap-3">
-            <div class="min-w-0">
-              <p class="text-sm font-bold text-[var(--color-border)] font-mono truncate">
-                {{ displayName || "\u2014" }}
-              </p>
-              <div class="flex items-center gap-2 mt-1">
-                <p class="text-[10px] text-[var(--color-muted)] font-mono truncate">
-                  {{ truncatedNodeId }}
-                </p>
-                <span
-                  v-if="settings.persistentIdentity"
-                  class="text-[9px] text-[var(--color-accent)] font-bold tracking-wider shrink-0"
-                >
-                  PERSISTENT
-                </span>
-              </div>
-            </div>
-            <div class="flex gap-0 shrink-0">
-              <button
-                class="border-2 border-[var(--color-border)] px-3 py-1 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                @click="qrModalOpen = true"
-              >
-                QR
-              </button>
-              <button
-                class="border-2 border-l-0 border-[var(--color-border)] px-3 py-1 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                :class="nodeCopied ? 'bg-[var(--color-accent)] text-white border-[var(--color-accent)]' : ''"
-                @click="copyNodeId"
-              >
-                {{ nodeCopied ? "COPIED" : "COPY" }}
-              </button>
-            </div>
-          </div>
-
-          <div class="mt-3 space-y-2">
-            <ConnectionProgress :step="connectionProgress" />
-            <div class="flex items-center justify-between gap-3 text-[10px] font-mono tracking-wider">
-              <span class="text-[var(--color-muted)]">RELAY</span>
-              <span class="font-bold" :class="relayStatusClass">{{ relayStatusLabel }}</span>
-            </div>
-            <p v-if="nodeError" class="text-[10px] text-[var(--color-danger)] font-mono">
-              {{ nodeError }}
+      <UCard>
+        <div class="flex items-center justify-between gap-3">
+          <div class="min-w-0">
+            <p class="truncate text-sm font-bold text-highlighted">
+              {{ displayName || "—" }}
             </p>
+            <div class="mt-1 flex items-center gap-2">
+              <p class="truncate text-[10px] text-muted">
+                {{ truncatedNodeId }}
+              </p>
+              <UBadge v-if="settings.persistentIdentity" color="primary" class="shrink-0">
+                Persistent
+              </UBadge>
+            </div>
           </div>
+          <UFieldGroup class="shrink-0">
+            <UButton variant="subtle" color="neutral" @click="() => { qrModalOpen = true }">QR</UButton>
+            <UButton
+              :variant="nodeCopied ? 'solid' : 'subtle'"
+              :color="nodeCopied ? 'primary' : 'neutral'"
+              @click="copyNodeId"
+            >
+              {{ nodeCopied ? "Copied" : "Copy" }}
+            </UButton>
+          </UFieldGroup>
         </div>
-      </section>
 
-      <!-- ── ONLINE NOW ── -->
-      <section class="border-b-2 border-[var(--color-border)]">
-        <div class="px-4 sm:px-6 py-3 border-b border-[var(--color-border-muted)]">
-          <p class="label" style="letter-spacing: 4px;">
-            ONLINE NOW
-            <span v-if="onlineContacts.length > 0" class="text-[var(--color-accent)] ml-1">({{ onlineContacts.length }})</span>
+        <div class="mt-4 space-y-2">
+          <ConnectionProgress :step="connectionProgress" />
+          <div class="flex items-center justify-between gap-3 text-[10px] tracking-wider">
+            <span class="text-muted">RELAY</span>
+            <span class="font-bold" :class="relayStatusClass">{{ relayStatusLabel }}</span>
+          </div>
+          <p v-if="nodeError" class="text-[10px] text-error">
+            {{ nodeError }}
           </p>
         </div>
+      </UCard>
 
-        <div v-if="contacts.length === 0" class="px-4 sm:px-6 py-8 text-center">
-          <p class="text-xs text-[var(--color-muted)] mb-3">Add your first contact to get started.</p>
-          <button
-            class="border-2 border-[var(--color-accent)] text-[var(--color-accent)] px-4 py-2 text-[10px] font-bold tracking-widest hover:bg-[var(--color-accent)] hover:text-white transition-colors"
-            @click="navigateTo('/contacts')"
+      <!-- ── ONLINE NOW ── -->
+      <UCard>
+        <template #header>
+          <p class="label">
+            ONLINE NOW
+            <span v-if="onlineContacts.length > 0" class="ml-1 text-primary">({{ onlineContacts.length }})</span>
+          </p>
+        </template>
+
+        <UEmpty
+          v-if="contacts.length === 0"
+          icon="i-heroicons-user-plus"
+          title="No contacts yet"
+          description="Add your first contact to get started."
+        >
+          <template #actions>
+            <UButton variant="solid" color="primary" @click="() => { navigateTo('/contacts') }">+ Add contact</UButton>
+          </template>
+        </UEmpty>
+
+        <UEmpty
+          v-else-if="onlineContacts.length === 0"
+          icon="i-heroicons-signal-slash"
+          description="No contacts online right now."
+        />
+
+        <div v-else class="flex gap-3 overflow-x-auto">
+          <div
+            v-for="contact in onlineContacts"
+            :key="contact.node_id"
+            class="w-28 shrink-0 cursor-pointer border-2 border-(--ui-border-accented) p-3 transition-colors hover:bg-elevated"
+            @click="navigateTo('/dm/' + contact.node_id)"
           >
-            + ADD CONTACT
-          </button>
-        </div>
-
-        <div v-else-if="onlineContacts.length === 0" class="px-4 sm:px-6 py-8 text-center">
-          <p class="text-xs text-[var(--color-muted)]">No contacts online right now.</p>
-        </div>
-
-        <div v-else class="px-4 sm:px-6 py-4 overflow-x-auto">
-          <div class="flex gap-3" :style="{ minWidth: 'min-content' }">
-            <div
-              v-for="contact in onlineContacts"
-              :key="contact.node_id"
-              class="shrink-0 border-2 border-[var(--color-border)] p-3 w-28 cursor-pointer hover:bg-[var(--color-surface-alt)] transition-colors"
-              @click="navigateTo('/dm/' + contact.node_id)"
-            >
-              <UAvatar
-                :text="avatarLetter(contact.display_name)"
-                size="md"
-                class="mx-auto mb-2 border-2 border-[var(--color-accent)] bg-black text-[var(--color-accent)] font-mono font-bold"
-              />
-              <p class="text-[10px] font-bold text-[var(--color-border)] font-mono text-center truncate mb-2">
-                {{ contact.display_name }}
-              </p>
-              <div class="flex gap-0 justify-center">
-                <UTooltip text="Message">
-                  <button
-                    class="border-2 border-[var(--color-border)] px-2 py-1 text-[10px] hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                    @click.stop="navigateTo('/dm/' + contact.node_id)"
-                  >
-                    ✉
-                  </button>
-                </UTooltip>
-                <UTooltip text="Call">
-                  <button
-                    class="border-2 border-l-0 border-[var(--color-border)] px-2 py-1 text-[10px] hover:bg-[var(--color-border)] hover:text-black transition-colors"
-                    @click.stop="navigateTo('/dm/' + contact.node_id)"
-                  >
-                    ☎
-                  </button>
-                </UTooltip>
-              </div>
+            <UAvatar
+              :text="avatarLetter(contact.display_name)"
+              color="primary"
+              size="md"
+              class="mx-auto mb-2"
+            />
+            <p class="mb-2 truncate text-center text-[10px] font-bold text-highlighted">
+              {{ contact.display_name }}
+            </p>
+            <div class="flex justify-center gap-1">
+              <UTooltip text="Message">
+                <UButton
+                  variant="ghost"
+                  color="neutral"
+                  square
+                  aria-label="Message"
+                  @click.stop="() => { navigateTo('/dm/' + contact.node_id) }"
+                >
+                  ✉
+                </UButton>
+              </UTooltip>
+              <UTooltip text="Call">
+                <UButton
+                  variant="ghost"
+                  color="neutral"
+                  square
+                  aria-label="Call"
+                  @click.stop="() => { navigateTo('/dm/' + contact.node_id) }"
+                >
+                  ☎
+                </UButton>
+              </UTooltip>
             </div>
           </div>
         </div>
-      </section>
+      </UCard>
 
       <!-- ── RECENT ── -->
-      <section class="border-b-2 border-[var(--color-border)]">
-        <div class="px-4 sm:px-6 py-3 border-b border-[var(--color-border-muted)]">
-          <p class="label" style="letter-spacing: 4px;">RECENT</p>
-        </div>
+      <UCard>
+        <template #header>
+          <p class="label">RECENT</p>
+        </template>
 
-        <div v-if="recentItems.length === 0" class="px-4 sm:px-6 py-8 text-center">
-          <p class="text-xs text-[var(--color-muted)]">No recent activity.</p>
-        </div>
+        <UEmpty
+          v-if="recentItems.length === 0"
+          icon="i-heroicons-chat-bubble-left-right"
+          description="No recent activity."
+        />
 
-        <div
-          v-for="item in recentItems"
-          :key="item.nodeId"
-          class="border-b border-[var(--color-border-muted)] px-4 sm:px-6 py-3 flex items-center gap-3 cursor-pointer hover:bg-[var(--color-surface-alt)] transition-colors"
-          @click="navigateTo('/dm/' + item.nodeId)"
-        >
+        <div v-else class="-mx-4 -my-4 divide-y divide-default sm:-mx-6 sm:-my-6">
           <div
-            class="shrink-0 w-2 h-2 rounded-full"
-            :class="item.unread > 0 ? 'bg-[var(--color-accent)]' : 'bg-transparent'"
-          />
-          <div class="flex-1 min-w-0">
-            <div class="flex items-center justify-between gap-2">
-              <span class="text-xs font-bold text-[var(--color-border)] font-mono truncate">
-                {{ item.name }}
-              </span>
-              <span class="text-[10px] text-[var(--color-muted)] shrink-0">
-                {{ formatTime(item.timestamp) }}
-              </span>
+            v-for="item in recentItems"
+            :key="item.nodeId"
+            class="flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-elevated sm:px-6"
+            @click="navigateTo('/dm/' + item.nodeId)"
+          >
+            <div
+              class="h-2 w-2 shrink-0 rounded-full"
+              :class="item.unread > 0 ? 'bg-primary' : 'bg-transparent'"
+            />
+            <div class="min-w-0 flex-1">
+              <div class="flex items-center justify-between gap-2">
+                <span class="truncate text-xs font-bold text-highlighted">
+                  {{ item.name }}
+                </span>
+                <span class="shrink-0 text-[10px] text-muted">
+                  {{ formatTime(item.timestamp) }}
+                </span>
+              </div>
+              <div class="mt-0.5 flex items-center justify-between gap-2">
+                <p class="truncate text-[10px] text-muted">{{ item.preview }}</p>
+                <UBadge v-if="item.unread > 0" color="primary" class="shrink-0">
+                  {{ item.unread }}
+                </UBadge>
+              </div>
             </div>
-            <div class="flex items-center justify-between gap-2 mt-0.5">
-              <p class="text-[10px] text-[var(--color-muted)] truncate">{{ item.preview }}</p>
-              <span
-                v-if="item.unread > 0"
-                class="shrink-0 text-[9px] font-bold bg-[var(--color-accent)] text-white px-1.5 py-0.5 font-mono"
-              >
-                {{ item.unread }}
-              </span>
-            </div>
+            <UIcon name="i-heroicons-chevron-right" class="shrink-0 text-base text-muted" />
           </div>
-          <UIcon name="i-heroicons-chevron-right" class="text-[var(--color-muted)] text-base shrink-0" />
         </div>
-      </section>
+      </UCard>
 
     </div>
 
-    <footer class="max-w-xl mx-auto border-t border-[var(--color-border-muted)] px-4 py-3 text-center text-[10px] font-mono tracking-wider text-[var(--color-muted)]">
+    <footer class="mx-auto max-w-xl border-t border-default px-4 py-3 text-center text-[10px] tracking-wider text-muted">
       <span>Nafaq v{{ appVersion }}</span>
-      <button
+      <UButton
         v-if="isUpdateAvailable"
-        type="button"
-        class="ml-2 border border-[var(--color-accent)] px-2 py-0.5 text-[var(--color-accent)] transition-colors hover:bg-[var(--color-accent)] hover:text-white"
+        size="xs"
+        variant="subtle"
+        color="primary"
+        class="ml-2"
         @click="openUpdateModal"
       >
-        UPDATE TO v{{ latestVersion }}
-      </button>
-      <button
+        Update to v{{ latestVersion }}
+      </UButton>
+      <UButton
         v-else-if="updateStatus === 'error'"
-        type="button"
-        class="ml-2 text-[var(--color-danger)] underline decoration-dotted underline-offset-2"
+        size="xs"
+        variant="link"
+        color="error"
+        class="ml-2"
         @click="openUpdateModal"
       >
-        UPDATE CHECK FAILED
-      </button>
+        Update check failed
+      </UButton>
     </footer>
 
     <NodeIdQrModal v-model:open="qrModalOpen" />

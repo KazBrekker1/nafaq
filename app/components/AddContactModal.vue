@@ -58,83 +58,65 @@ async function handleSave() {
 </script>
 
 <template>
-  <UModal v-model:open="open">
-    <template #content>
-      <div class="border-2 border-[var(--color-border)] bg-[var(--color-surface-alt)] shadow-2xl">
+  <UModal v-model:open="open" title="Add Contact">
+    <template #body>
+      <div class="space-y-4">
 
-        <!-- Header -->
-        <div class="flex items-center justify-between border-b border-[var(--color-border-muted)] px-4 py-3">
-          <p class="label" style="letter-spacing: 4px;">ADD CONTACT</p>
-          <button
-            class="text-[var(--color-muted)] transition-colors hover:text-white"
-            aria-label="Close"
-            @click="close"
-          >
-            <UIcon name="i-heroicons-x-mark" class="text-lg" />
-          </button>
-        </div>
-
-        <div class="p-4 space-y-4">
-
-          <!-- Node ID input -->
-          <div>
-            <p class="label mb-2">NODE ID</p>
-            <div class="flex gap-0">
-              <UInput
-                v-model="nodeIdInput"
-                placeholder="Paste node ID..."
-                class="flex-1 rounded-none font-mono text-xs"
-                @keydown.enter="handleSave"
-              />
-              <button
-                class="border-2 border-l-0 border-[var(--color-border)] px-3 py-2 text-[10px] font-bold tracking-widest hover:bg-[var(--color-border)] hover:text-black transition-colors shrink-0"
-                title="Scan QR code"
-                @click="showScanner = true"
-              >
-                QR
-              </button>
-            </div>
-          </div>
-
-          <!-- Display name input -->
-          <div>
-            <p class="label mb-2">DISPLAY NAME</p>
+        <!-- Node ID input -->
+        <UFormField label="Node ID" :ui="{ label: 'label mb-1' }">
+          <UFieldGroup class="w-full">
             <UInput
-              v-model="nameInput"
-              placeholder="Optional name..."
-              class="w-full rounded-none font-mono text-xs"
+              v-model="nodeIdInput"
+              placeholder="Paste node ID..."
+              class="flex-1"
               @keydown.enter="handleSave"
             />
-          </div>
-
-          <!-- Error -->
-          <div
-            v-if="error"
-            class="border-2 border-[var(--color-danger)] p-2 text-xs text-[var(--color-danger)]"
-          >
-            {{ error }}
-          </div>
-
-          <!-- Actions -->
-          <div class="flex gap-0">
             <UButton
-              class="flex-1 rounded-none"
-              :disabled="saving || !nodeIdInput.trim()"
-              @click="handleSave"
-            >
-              {{ saving ? "SAVING..." : "SAVE" }}
-            </UButton>
-            <UButton
-              variant="outline"
-              class="flex-1 rounded-none border-l-0"
-              @click="close"
-            >
-              CANCEL
-            </UButton>
-          </div>
+              icon="i-heroicons-qr-code"
+              aria-label="Scan QR code"
+              @click="() => { showScanner = true }"
+            />
+          </UFieldGroup>
+        </UFormField>
 
-        </div>
+        <!-- Display name input -->
+        <UFormField label="Display Name" :ui="{ label: 'label mb-1' }">
+          <UInput
+            v-model="nameInput"
+            placeholder="Optional name..."
+            class="w-full"
+            @keydown.enter="handleSave"
+          />
+        </UFormField>
+
+        <!-- Error -->
+        <UAlert
+          v-if="error"
+          color="error"
+          variant="subtle"
+          icon="i-heroicons-exclamation-triangle"
+          :description="error"
+        />
+
       </div>
+    </template>
+
+    <template #footer>
+      <UFieldGroup class="w-full">
+        <UButton
+          label="Save"
+          class="flex-1"
+          :loading="saving"
+          :disabled="saving || !nodeIdInput.trim()"
+          @click="handleSave"
+        />
+        <UButton
+          label="Cancel"
+          variant="outline"
+          class="flex-1"
+          @click="close"
+        />
+      </UFieldGroup>
     </template>
   </UModal>
 
