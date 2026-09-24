@@ -23,8 +23,9 @@ use tokio::sync::Notify;
 use crate::messages::STREAM_VIDEO;
 
 pub const VIDEO_FRAME_HEADER_LEN: usize = 4 + 8;
-/// Upper bound for one encoded frame on the wire; anything larger is refused.
-pub const MAX_VIDEO_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound for one encoded frame's payload; anything larger is refused.
+/// Generous for our profiles (a 640x360 keyframe is tens of KiB).
+pub const MAX_VIDEO_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Frames written but not yet acknowledged. At 12 fps and a 300 ms RTT about
 /// four frames are legitimately in flight; beyond this the path can't keep up
@@ -34,6 +35,11 @@ const MAX_IN_FLIGHT_FRAMES: usize = 6;
 const DELTA_DELIVERY_DEADLINE: Duration = Duration::from_millis(1200);
 /// Keyframes are several times larger than deltas; give them longer.
 const KEYFRAME_DELIVERY_DEADLINE: Duration = Duration::from_millis(2500);
+/// Receiver: a frame stream must complete within this long. The sender
+/// abandons (resets) any frame past its delivery deadline, so this only
+/// bites a peer that stalls a stream deliberately to pin memory.
+pub const VIDEO_FRAME_READ_TIMEOUT: Duration =
+    KEYFRAME_DELIVERY_DEADLINE.saturating_add(Duration::from_millis(1500));
 /// A frame that waited this long for in-flight capacity is too stale to send.
 const MAX_QUEUED_FRAME_AGE: Duration = Duration::from_millis(500);
 const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(3);

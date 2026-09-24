@@ -386,28 +386,48 @@ pub async fn write_framed(
     Ok(())
 }
 
-/// Maximum frame size (10 MB) — prevents OOM from malicious length prefixes.
-const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+/// Frame size cap for chat streams: chat messages are raw UTF-8 and the
+/// sender rejects anything over 64 KiB (`commands::MAX_CHAT_LEN`).
+pub const MAX_CHAT_FRAME_BYTES: usize = 64 * 1024;
+/// Frame size cap for control streams: small JSON `ControlAction`s (the
+/// largest is a `PeerAnnounce` carrying a ticket of at most a few KiB).
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+/// Frame size cap for DM streams. The largest legitimate frames:
+/// - a 64 KiB `FileChunk` in the (still sent) JSON number-array encoding:
+///   at most 4 bytes per byte (`255,`) = 256 KiB, plus a ~100 byte envelope
+///   (base64 would be ~88 KiB);
+/// - a 64 KiB `Text` whose JSON escaping expands control chars 6x
+///   (`\u0001`) = 384 KiB, plus envelope.
+///
+/// 512 KiB covers both with headroom (was a blanket 10 MiB).
+pub const MAX_DM_FRAME_BYTES: usize = 512 * 1024;
+
+/// Frames are read in slices of this size, so a peer declaring a large
+/// length only costs memory for bytes it actually sends.
+const FRAME_READ_SLICE: usize = 16 * 1024;
 
 /// Read a length-prefixed message from a QUIC stream.
-/// Returns None if the stream is finished.
+/// Returns None if the stream is finished, or if the peer declared a frame
+/// larger than `max_len` (the caller stops reading the stream).
 pub async fn read_framed(
     recv: &mut iroh::endpoint::RecvStream,
+    max_len: usize,
 ) -> Result<Option<Vec<u8>>, iroh::endpoint::ReadExactError> {
     let mut len_buf = [0u8; 4];
-    match recv.read_exact(&mut len_buf).await {
-        Ok(()) => {}
-        Err(e) => {
-            return Err(e);
-        }
-    }
+    recv.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        tracing::warn!("Frame too large ({len} bytes), dropping connection");
+    if len > max_len {
+        tracing::warn!("Frame too large ({len} > {max_len} bytes), dropping stream");
         return Ok(None);
     }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
+    // Grow the buffer as data arrives instead of allocating `len` up front.
+    let mut buf = Vec::with_capacity(len.min(FRAME_READ_SLICE));
+    while buf.len() < len {
+        let start = buf.len();
+        let slice = (len - start).min(FRAME_READ_SLICE);
+        buf.resize(start + slice, 0);
+        recv.read_exact(&mut buf[start..]).await?;
+    }
     Ok(Some(buf))
 }
 

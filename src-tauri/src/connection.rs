@@ -12,11 +12,12 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use crate::codec::is_keyframe;
 use crate::video_transport::{
     MAX_VIDEO_FRAME_BYTES, PeerVideoWriter, PendingVideoFrame, ReceivedVideoFrame,
-    VideoReorderBuffer, decode_video_frame,
+    VIDEO_FRAME_HEADER_LEN, VIDEO_FRAME_READ_TIMEOUT, VideoReorderBuffer, decode_video_frame,
 };
 use crate::messages::{
-    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, PeerConnectionKind, STREAM_AUDIO,
-    STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO, VideoLayerRequest, VideoPacket,
+    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, MAX_CHAT_FRAME_BYTES,
+    MAX_CONTROL_FRAME_BYTES, MAX_DM_FRAME_BYTES, PeerConnectionKind, STREAM_AUDIO, STREAM_CHAT,
+    STREAM_CONTROL, STREAM_DM, STREAM_VIDEO, VideoLayerRequest, VideoPacket,
 };
 
 const CALL_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
@@ -95,6 +96,12 @@ fn relay_targets_for_announce<'a>(
         .filter(|id| id.as_str() != sender_id && id.as_str() != announced_peer_id)
         .cloned()
         .collect()
+}
+
+/// Whether a peer-opened bidi stream of `stream_type` may be accepted on a
+/// call connection: one each of chat, control and DM; records it as seen.
+fn accept_call_bi_stream_type(seen: &mut HashSet<u8>, stream_type: u8) -> bool {
+    matches!(stream_type, STREAM_CHAT | STREAM_CONTROL | STREAM_DM) && seen.insert(stream_type)
 }
 
 /// Tickets to announce to a newly connected call peer: every cached ticket of
@@ -540,7 +547,7 @@ async fn drain_duplicate_dm_frame_once(
     let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
     match tokio::time::timeout(
         DM_DUPLICATE_DRAIN_TIMEOUT,
-        crate::messages::read_framed(recv),
+        crate::messages::read_framed(recv, MAX_DM_FRAME_BYTES),
     )
     .await
     {
@@ -563,7 +570,7 @@ async fn drain_duplicate_dm_frame_once(
 async fn run_dm_reader(recv: &mut iroh::endpoint::RecvStream, peer_id: &str, manager: &ConnectionManager) {
     let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
     loop {
-        match crate::messages::read_framed(recv).await {
+        match crate::messages::read_framed(recv, MAX_DM_FRAME_BYTES).await {
             Ok(Some(data)) => {
                 handle_dm_frame_payload(manager, &data, peer_id, &mut active_files).await;
             }
@@ -2192,7 +2199,12 @@ impl ConnectionManager {
                             }
                             match type_buf[0] {
                                 STREAM_AUDIO => loop {
-                                    match crate::messages::read_framed(&mut recv).await {
+                                    match crate::messages::read_framed(
+                                        &mut recv,
+                                        MAX_CONTROL_FRAME_BYTES,
+                                    )
+                                    .await
+                                    {
                                         Ok(Some(data)) => {
                                             if let Some(packet) = AudioDatagram::decode(&data) {
                                                 Self::mark_peer_active_internal(
@@ -2215,8 +2227,17 @@ impl ConnectionManager {
                                     // One frame per stream. A read error means
                                     // the sender abandoned it (reset) — the
                                     // reorder buffer handles the hole.
-                                    let Ok(body) = recv.read_to_end(MAX_VIDEO_FRAME_BYTES).await
-                                    else {
+                                    // Bounded in size and time, so a peer
+                                    // can't pin memory with stalled streams.
+                                    let read = tokio::time::timeout(
+                                        VIDEO_FRAME_READ_TIMEOUT,
+                                        recv.read_to_end(
+                                            MAX_VIDEO_FRAME_BYTES + VIDEO_FRAME_HEADER_LEN,
+                                        ),
+                                    )
+                                    .await;
+                                    let Ok(Ok(body)) = read else {
+                                        let _ = recv.stop(0u32.into());
                                         return;
                                     };
                                     let Some((seq, timestamp_ms, payload)) =
@@ -2368,6 +2389,10 @@ impl ConnectionManager {
         let manager_bi = self.clone();
         let connection_bi = connection.clone();
         tokio::spawn(async move {
+            // A call connection carries exactly one chat, control and DM
+            // stream from the peer; anything beyond that (or an unknown type)
+            // would only buy the peer another reader task.
+            let mut seen_stream_types: HashSet<u8> = HashSet::new();
             loop {
                 match connection.accept_bi().await {
                     Ok((send, mut recv)) => {
@@ -2376,6 +2401,14 @@ impl ConnectionManager {
                         let peers_ref = peers_ref_bi.clone();
                         let mut type_buf = [0u8; 1];
                         if recv.read_exact(&mut type_buf).await.is_err() {
+                            continue;
+                        }
+                        if !accept_call_bi_stream_type(&mut seen_stream_types, type_buf[0]) {
+                            tracing::warn!(
+                                "Rejecting duplicate or unknown bi stream type {} from {peer_id}",
+                                type_buf[0]
+                            );
+                            let _ = recv.stop(0u32.into());
                             continue;
                         }
                         // For incoming DM streams, store the send side so we
@@ -2428,9 +2461,14 @@ impl ConnectionManager {
         peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     ) {
         let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+        let max_frame_len = match stream_type {
+            STREAM_CHAT => MAX_CHAT_FRAME_BYTES,
+            STREAM_DM => MAX_DM_FRAME_BYTES,
+            _ => MAX_CONTROL_FRAME_BYTES,
+        };
 
         loop {
-            match crate::messages::read_framed(&mut recv).await {
+            match crate::messages::read_framed(&mut recv, max_frame_len).await {
                 Ok(Some(data)) => match stream_type {
                     STREAM_CHAT => {
                         Self::mark_peer_active_internal(&peers, peer_id).await;
@@ -2522,6 +2560,17 @@ impl ConnectionManager {
     }
 
     pub async fn send_video_frame_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
+        if data.len() > MAX_VIDEO_FRAME_BYTES {
+            // Receivers refuse it anyway; treat it as a lost frame so every
+            // peer waits for (and we produce) the next keyframe.
+            tracing::warn!("Dropping oversized video frame ({} bytes)", data.len());
+            let peers = self.peers.lock().await;
+            for peer in peers.values() {
+                peer.video_writer.mark_gap();
+                peer.pending_keyframe.store(true, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
         let (active, skipped): (Vec<PeerVideoWriter>, Vec<PeerVideoWriter>) = {
             let peers_guard = self.peers.lock().await;
             let mut active = Vec::with_capacity(peers_guard.len());
@@ -3589,6 +3638,30 @@ mod tests {
             next_transfer_failure(&mut rx),
             Some((id, Some("incomplete transfer".to_string())))
         );
+    }
+
+    #[test]
+    fn call_connection_accepts_one_bi_stream_per_type() {
+        let mut seen = HashSet::new();
+        assert!(accept_call_bi_stream_type(&mut seen, STREAM_CHAT));
+        assert!(accept_call_bi_stream_type(&mut seen, STREAM_CONTROL));
+        assert!(accept_call_bi_stream_type(&mut seen, STREAM_DM));
+        assert!(!accept_call_bi_stream_type(&mut seen, STREAM_CHAT));
+        assert!(!accept_call_bi_stream_type(&mut seen, STREAM_CONTROL));
+        assert!(!accept_call_bi_stream_type(&mut seen, STREAM_DM));
+        assert!(!accept_call_bi_stream_type(&mut HashSet::new(), STREAM_VIDEO));
+        assert!(!accept_call_bi_stream_type(&mut HashSet::new(), 0x7f));
+    }
+
+    #[test]
+    fn dm_frame_cap_fits_a_full_file_chunk() {
+        let chunk = DmMessage::FileChunk {
+            id: "x".repeat(64),
+            offset: u64::MAX,
+            data: vec![255u8; 64 * 1024],
+        };
+        let encoded = serde_json::to_vec(&chunk).unwrap();
+        assert!(encoded.len() <= MAX_DM_FRAME_BYTES, "{} bytes", encoded.len());
     }
 
     #[test]
