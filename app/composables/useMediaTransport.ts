@@ -1338,8 +1338,10 @@ export function useMediaTransport() {
       // requestVideoFrameCallback exists in WKWebView but never fires for
       // programmatically-created video elements, so RAF is more reliable.
       const rafCaptureLoop = () => {
+        // A stale loop must not touch captureRafId — it belongs to the new run.
+        if (token !== captureRunToken) return;
         captureRafId = null;
-        if (token !== captureRunToken || !encoding.value || !captureVideoEl) return;
+        if (!encoding.value || !captureVideoEl) return;
         // Schedule first: a throw below (drawImage, VideoFrame, encode) must
         // not silently end capture for the rest of the call.
         captureRafId = requestAnimationFrame(rafCaptureLoop);
