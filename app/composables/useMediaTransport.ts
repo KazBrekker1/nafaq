@@ -72,6 +72,8 @@ interface PeerMediaState {
   lastAudioRms: number;
   speakingSince: number;
   lastSpeakingTime: number;
+  /** When the last audio packet arrived; silence decays speaking state. */
+  lastAudioAt: number;
   lastKeyframeRequestAt: number;
   pendingVideoFrame: PendingVideoFrame | null;
   /** A JPEG frame is being decoded/drawn; newer ones wait in pendingVideoFrame. */
@@ -535,6 +537,7 @@ function getOrCreatePeerState(peerId: string): PeerMediaState {
       lastAudioRms: 0,
       speakingSince: 0,
       lastSpeakingTime: 0,
+      lastAudioAt: 0,
       lastKeyframeRequestAt: 0,
       pendingVideoFrame: null,
       jpegRendering: false,
@@ -544,6 +547,16 @@ function getOrCreatePeerState(peerId: string): PeerMediaState {
     peerMediaStates.set(peerId, state);
   }
   return state;
+}
+
+// For paths driven by packets or timers rather than the peer's tile: a peer
+// that already left (late audio packet, keyframe retry) must not be
+// resurrected with fresh state and an orphan AudioWorkletNode.
+function peerStateIfInCall(peerId: string): PeerMediaState | null {
+  const existing = peerMediaStates.get(peerId);
+  if (existing) return existing;
+  if (!peerIdsProvider?.().includes(peerId)) return null;
+  return getOrCreatePeerState(peerId);
 }
 
 function ensurePeerAudioNode(peerState: PeerMediaState) {
@@ -633,7 +646,8 @@ async function sendControl(peerId: string, action: Record<string, unknown>) {
 }
 
 async function requestKeyframe(peerId: string, force = false) {
-  const peerState = getOrCreatePeerState(peerId);
+  const peerState = peerStateIfInCall(peerId);
+  if (!peerState) return;
   const now = Date.now();
   if (!force && now - peerState.lastKeyframeRequestAt < KEYFRAME_REQUEST_DEBOUNCE_MS) return;
   peerState.lastKeyframeRequestAt = now;
@@ -799,6 +813,8 @@ function handleIncomingPcm(peerId: string, _timestamp: number, pcmBytes: Uint8Ar
   if (handleBridgeProbe(peerId)) return;
   if (!playbackCtx) return;
   if (pcmBytes.byteLength < 2) return;
+  const peerState = peerStateIfInCall(peerId);
+  if (!peerState) return;
 
   // Copy out of the IPC buffer (it may be unaligned for Int16Array).
   const int16 = new Int16Array(pcmBytes.slice(0, pcmBytes.byteLength & ~1).buffer);
@@ -810,12 +826,12 @@ function handleIncomingPcm(peerId: string, _timestamp: number, pcmBytes: Uint8Ar
     sum += sample * sample;
   }
 
-  const peerState = getOrCreatePeerState(peerId);
   ensurePeerAudioNode(peerState);
   peerState.audioNode?.port.postMessage({ pcm: samples }, [samples.buffer]);
 
   const rms = Math.sqrt(sum / int16.length);
   const now = Date.now();
+  peerState.lastAudioAt = now;
   peerState.lastAudioRms = 0.7 * peerState.lastAudioRms + 0.3 * rms;
 
   const wasSpeaking = peerState.speaking;
@@ -880,7 +896,8 @@ async function handleIncomingVideoFrame(
   height: number,
   jpegBytes: Uint8Array,
 ) {
-  const peerState = getOrCreatePeerState(peerId);
+  const peerState = peerStateIfInCall(peerId);
+  if (!peerState) return;
   const frame: PendingVideoFrame = { jpegBytes, width, height, timestamp };
   // Image decoding is async, so frames could finish out of order. Keep one
   // render in flight per peer; anything arriving meanwhile replaces the
@@ -1284,8 +1301,10 @@ export function useMediaTransport() {
   function registerPeerCanvas(peerId: string, canvas: HTMLCanvasElement | null) {
     // Function refs fire on every re-render of the tile, not just on mount —
     // only a real change may cost a decoder reset and a keyframe request.
-    const peerState = getOrCreatePeerState(peerId);
-    if (peerState.canvas === canvas) return;
+    // A tile unmounting after its peer left must not recreate that peer's
+    // state; a mounted tile always belongs to a peer in the call.
+    const peerState = canvas ? getOrCreatePeerState(peerId) : peerMediaStates.get(peerId);
+    if (!peerState || peerState.canvas === canvas) return;
     peerState.canvas = canvas;
     // The decoder's output callback draws to the canvas it was created with.
     destroyVideoDecoder(peerId);
