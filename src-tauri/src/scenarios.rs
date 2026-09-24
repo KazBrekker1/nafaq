@@ -136,7 +136,7 @@ async fn dm_survives_peer_restart_with_persistent_identity() {
     b_new.presence.track_contact(&a_id).await.unwrap();
 
     // A should see B come back online via gossip — this is what triggers
-    // the `peer_recently_rejoined_gossip` branch in should_accept_dm_connection.
+    // the `dm_entry_predates_recent_rejoin` eviction in dm_connection_handling.
     let a_sees_b_again = wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
         matches!(e,
             Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id

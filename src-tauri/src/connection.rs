@@ -825,13 +825,6 @@ impl RecentIds {
     }
 }
 
-/// A NeighborUp this recent is treated as "the peer is freshly reachable", used
-/// as one (lenient) trigger for evicting a stale DM entry on an inbound
-/// reconnect. The unbounded `*_predates_recent_rejoin` checks additionally
-/// cover the case where the NeighborUp is older than this window but still
-/// newer than the stale entry (slow-relay reconnect past QUIC's idle timeout).
-const DM_RECENT_NEIGHBOR_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
-
 impl std::fmt::Debug for ConnectionManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionManager").finish()
@@ -949,17 +942,6 @@ impl ConnectionManager {
 
     pub async fn set_presence(&self, presence: Arc<crate::presence::PresenceManager>) {
         *self.presence.lock().await = Some(presence);
-    }
-
-    async fn peer_recently_rejoined_gossip(&self, peer_id: &str) -> bool {
-        let presence = self.presence.lock().await.clone();
-        match presence {
-            Some(p) => {
-                p.is_recent_neighbor(peer_id, DM_RECENT_NEIGHBOR_WINDOW)
-                    .await
-            }
-            None => false,
-        }
     }
 
     /// True if the existing DM entry for `peer_id` pre-dates the most recent
@@ -1169,15 +1151,14 @@ impl ConnectionManager {
             return true;
         }
 
-        // Gossip presence shows the peer is freshly reachable — the remote
-        // restarted and its old QUIC connection is dead on its side. Prefer the
-        // new inbound and evict the stale entry instead of rejecting it via the
-        // lexicographic tiebreak. Same dual trigger as the DM path: recent
-        // NeighborUp (short window) or any NeighborUp newer than this entry
-        // (unbounded, covers a slow reconnect past QUIC's idle timeout).
+        // Gossip presence saw the peer rejoin after this entry was established
+        // — the remote restarted and its old QUIC connection is dead on its
+        // side. Prefer the new inbound and evict the stale entry instead of
+        // rejecting it via the lexicographic tiebreak. Same trigger as the DM
+        // path: a NeighborUp newer than the entry. (A merely *recent*
+        // NeighborUp is not evidence — initial presence is recent too.)
         if matches!(direction, ConnectionDirection::Inbound)
-            && (self.peer_recently_rejoined_gossip(peer_id).await
-                || self.call_entry_predates_recent_rejoin(peer_id).await)
+            && self.call_entry_predates_recent_rejoin(peer_id).await
         {
             self.evict_stale_call_peer(peer_id, existing_conn_id, b"peer_rejoined_gossip")
                 .await;

@@ -139,14 +139,6 @@ impl PresenceManager {
         self.online.lock().await.clone()
     }
 
-    /// Has `remote_id` been reported as a gossip neighbor in the last `within`?
-    /// Used by the DM accept path to decide "this is a fresh reconnect, evict stale entry".
-    pub async fn is_recent_neighbor(&self, remote_id_str: &str, within: Duration) -> bool {
-        let ups = self.recent_neighbor_ups.lock().await;
-        ups.get(remote_id_str)
-            .is_some_and(|t| t.elapsed() <= within)
-    }
-
     /// Returns the Instant of the most recent `NeighborUp` for this peer, if any.
     /// Used by the outbound DM path to detect stale DM entries that pre-date a remote restart.
     pub async fn last_neighbor_up(&self, remote_id_str: &str) -> Option<Instant> {
