@@ -26,8 +26,7 @@
 
 <script setup lang="ts">
 const route = useRoute();
-const { totalUnread } = useDM();
-const unread = computed(() => totalUnread());
+const { totalUnread: unread } = useDM();
 
 // The tab bar is hidden on /dm/* and /call (see app.vue), so exact matches suffice.
 const tabs = [

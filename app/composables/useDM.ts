@@ -1,3 +1,8 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { computed, effectScope, ref, watch } from "vue";
+import { usePresence } from "./usePresence";
+
 export type DmMessageStatus = "sending" | "sent" | "delivered" | "failed";
 
 export interface DmTextMessage {
@@ -23,16 +28,19 @@ export interface DmFileMessage {
 
 export type DmMessageItem = DmTextMessage | DmFileMessage;
 
+// Deep refs: messages are mutated in place.
 const conversations = ref<Record<string, DmMessageItem[]>>({});
-const activeConversation = ref<string | null>(null);
 const unreadCounts = ref<Record<string, number>>({});
+const totalUnread = computed(() => Object.values(unreadCounts.value).reduce((a, b) => a + b, 0));
+// Conversation the DM page is showing; its incoming messages don't count as unread.
+let activeConversation: string | null = null;
 // Peers the Rust backend has confirmed a live DM connection for (populated
 // ONLY by the "dm-connected" event, never optimistically — otherwise the local
 // view can claim "connected" when the backend actually rejected the stream and
 // then refuse to re-dial).
 const connectedPeers = new Set<string>();
-// Peers with an in-flight connect_dm invoke, to de-dup concurrent connect()
-// calls without falsely marking them connected.
+// Peers with an in-flight connect_dm invoke, to de-dup concurrent dials
+// without falsely marking them connected.
 const connectingPeers = new Set<string>();
 // Peers whose most recent connect_dm attempt failed — cleared on the next
 // successful connect (dm-connected event). Surfaced as a minimal inline
@@ -43,126 +51,153 @@ let dmListenerInitialized = false;
 let dmUnlisteners: Array<() => void> = [];
 
 function findFileMsg(peerId: string, fileId: string): DmFileMessage | undefined {
-  const msgs = conversations.value[peerId];
-  if (!msgs) return undefined;
-  return msgs.find(m => m.type === "file" && (m as DmFileMessage).id === fileId) as DmFileMessage | undefined;
+  return conversations.value[peerId]?.find(
+    (m): m is DmFileMessage => m.type === "file" && m.id === fileId,
+  );
+}
+
+function findTextMsg(peerId: string, clientId: string): DmTextMessage | undefined {
+  return conversations.value[peerId]?.find(
+    (m): m is DmTextMessage => m.type === "text" && m.clientId === clientId,
+  );
 }
 
 function pushMessage(nodeId: string, msg: DmMessageItem) {
-  if (!conversations.value[nodeId]) {
-    conversations.value[nodeId] = [];
-  }
-  conversations.value[nodeId].push(msg);
-  conversations.value = { ...conversations.value };
-  if (activeConversation.value !== nodeId) {
-    unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] || 0) + 1;
-    unreadCounts.value = { ...unreadCounts.value };
+  (conversations.value[nodeId] ??= []).push(msg);
+  if (activeConversation !== nodeId) {
+    unreadCounts.value[nodeId] = (unreadCounts.value[nodeId] ?? 0) + 1;
   }
 }
 
-// Patch an existing file message in place (by id) and trigger reactivity.
-// Used for the sender side of a transfer, whose card is created before the
-// transfer completes so a failure mid-transfer stays visible instead of the
-// card simply never appearing (see sendFile).
-function updateFileMessage(nodeId: string, fileId: string, patch: Partial<DmFileMessage>) {
-  const msgs = conversations.value[nodeId];
-  if (!msgs) return;
-  const idx = msgs.findIndex(m => m.type === "file" && m.id === fileId);
-  if (idx === -1) return;
-  const updated = { ...(msgs[idx] as DmFileMessage), ...patch };
-  const next = [...msgs];
-  next[idx] = updated;
-  conversations.value = { ...conversations.value, [nodeId]: next };
+// Status only moves forward: an ack can arrive before send_dm resolves, and
+// the late "sent" must not downgrade "delivered". "sending" and "failed" share
+// the lowest rank so a failed message can be retried.
+const STATUS_RANK: Record<DmMessageStatus, number> = { sending: 0, failed: 0, sent: 1, delivered: 2 };
+
+function setDmTextStatus(nodeId: string, clientId: string, status: DmMessageStatus) {
+  const message = findTextMsg(nodeId, clientId);
+  if (message && STATUS_RANK[status] >= STATUS_RANK[message.status]) {
+    message.status = status;
+  }
 }
 
-function updateDmTextMessageStatus(
-  messages: DmMessageItem[],
-  target: DmTextMessage,
-  status: DmMessageStatus,
-): DmMessageItem[] {
-  return messages.map(message => {
-    if (
-      message.type === "text"
-      && (message === target || (target.clientId && message.clientId === target.clientId))
-    ) {
-      return { ...message, status };
-    }
-    return message;
+// Per-peer send queue: every text delivery (first send, manual resend,
+// reconnect retry) runs strictly one after another in enqueue order, so a
+// retry can't race a fresh send and land messages out of order.
+const sendQueues = new Map<string, Promise<unknown>>();
+
+function enqueue<T>(nodeId: string, task: () => Promise<T>): Promise<T> {
+  const run = (sendQueues.get(nodeId) ?? Promise.resolve()).then(task);
+  const tail = run.catch(() => {});
+  sendQueues.set(nodeId, tail);
+  void tail.then(() => {
+    if (sendQueues.get(nodeId) === tail) sendQueues.delete(nodeId);
   });
+  return run;
 }
 
-function setDmTextStatus(nodeId: string, target: DmTextMessage, status: DmMessageStatus) {
-  const messages = conversations.value[nodeId] ?? [];
-  conversations.value = {
-    ...conversations.value,
-    [nodeId]: updateDmTextMessageStatus(messages, target, status),
-  };
-}
-
-// Deliveries currently in flight, keyed by clientId. Prevents a manual resend
-// racing the automatic retry on reconnect for the same message — both would
-// write the final status, and the loser's verdict would win.
-const inFlightTexts = new Set<string>();
+// Messages queued or in flight, keyed by clientId, so a manual resend and the
+// automatic retry can't both queue the same message.
+const queuedTexts = new Set<string>();
 
 // Deliver an existing text message (already in the conversation) and resolve its
 // status to "sent" or "failed". Shared by sendText, manual resend, and the
 // automatic retry on reconnect. Never throws — failure is surfaced via status.
-async function deliverText(nodeId: string, message: DmTextMessage): Promise<boolean> {
-  const flightKey = message.clientId ?? `${nodeId}:${message.timestamp}`;
-  if (inFlightTexts.has(flightKey)) return false;
-  inFlightTexts.add(flightKey);
-  try {
-    const { invoke } = await import("@tauri-apps/api/core");
-    setDmTextStatus(nodeId, message, "sending");
+function deliverText(nodeId: string, message: DmTextMessage): Promise<boolean> {
+  const clientId = message.clientId;
+  if (!clientId || queuedTexts.has(clientId)) return Promise.resolve(false);
+  queuedTexts.add(clientId);
+  return enqueue(nodeId, async () => {
     try {
+      const current = findTextMsg(nodeId, clientId);
+      if (!current) return false;
+      if (STATUS_RANK[current.status] >= STATUS_RANK.sent) return true;
+      current.status = "sending";
       await invoke("send_dm", {
         peerId: nodeId,
-        message: {
-          type: "text",
-          content: message.content,
-          timestamp: message.timestamp,
-          id: message.clientId,
-        },
+        message: { type: "text", content: current.content, timestamp: current.timestamp, id: clientId },
       });
-      setDmTextStatus(nodeId, message, "sent");
+      setDmTextStatus(nodeId, clientId, "sent");
       return true;
     } catch (error) {
       console.warn("[dm] send failed:", error);
-      setDmTextStatus(nodeId, message, "failed");
+      setDmTextStatus(nodeId, clientId, "failed");
       return false;
+    } finally {
+      queuedTexts.delete(clientId);
     }
+  });
+}
+
+function failedTexts(nodeId: string): DmTextMessage[] {
+  return (conversations.value[nodeId] ?? []).filter(
+    (m): m is DmTextMessage => m.type === "text" && m.from === "self" && m.status === "failed",
+  );
+}
+
+// Re-send any text messages still marked "failed" for this peer, in their
+// original order (the per-peer queue serializes them). A message that fails
+// again is left "failed" and doesn't block the rest.
+async function retryFailedMessages(nodeId: string) {
+  await Promise.all(failedTexts(nodeId).map(m => deliverText(nodeId, m)));
+}
+
+async function dial(nodeId: string) {
+  // Already connected, or a connect is already in flight — don't double-dial.
+  if (connectedPeers.has(nodeId) || connectingPeers.has(nodeId)) return;
+  connectingPeers.add(nodeId);
+  try {
+    await invoke("connect_dm", { nodeId });
+    // Intentionally do NOT add to connectedPeers here — the "dm-connected"
+    // event is the source of truth. If Rust rejected the stream, no event
+    // fires and a later dial correctly re-dials.
+  } catch (error) {
+    console.warn("[dm] connect_dm failed:", error);
+    connectErrors.value[nodeId] = true;
   } finally {
-    inFlightTexts.delete(flightKey);
+    connectingPeers.delete(nodeId);
   }
 }
 
-// Re-send any text messages still marked "failed" for this peer — called when
-// a DM connection (re)establishes, so a message that failed during a transient
-// disconnect is delivered automatically once the peer is reachable again.
-//
-// Sequential, in the conversation's original order — firing them all
-// concurrently (as this used to) races multiple DM writes against each
-// other with no guarantee the earlier message lands first, so a reader could
-// see message 2 delivered before message 1. Each retry is awaited before the
-// next starts; a message that fails again is left "failed" (not retried
-// again in this pass) and the loop continues to the rest rather than
-// aborting, since one still-unreachable message shouldn't block delivery of
-// later ones that might succeed (e.g. after a partial network recovery).
-async function retryFailedMessages(nodeId: string) {
-  const msgs = conversations.value[nodeId];
-  if (!msgs) return;
-  const toRetry = msgs.filter(
-    m => m.type === "text" && m.from === "self" && m.status === "failed",
-  ) as DmTextMessage[];
-  for (const m of toRetry) {
-    await deliverText(nodeId, m);
-  }
+// Failed messages otherwise only retry on dm-connected, which needs someone to
+// dial. When presence sees a peer with undelivered messages come online, dial
+// it (debounced per peer, since presence can flap) so the retry happens.
+const PRESENCE_RETRY_DELAY_MS = 1500;
+const presenceRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let stopPresenceWatch: (() => void) | null = null;
+
+function schedulePresenceRetry(nodeId: string) {
+  clearTimeout(presenceRetryTimers.get(nodeId));
+  presenceRetryTimers.set(nodeId, setTimeout(() => {
+    presenceRetryTimers.delete(nodeId);
+    if (failedTexts(nodeId).length === 0) return;
+    if (connectedPeers.has(nodeId)) void retryFailedMessages(nodeId);
+    else void dial(nodeId);
+  }, PRESENCE_RETRY_DELAY_MS));
+}
+
+function watchPresenceForRetries() {
+  const { onlineStatus } = usePresence();
+  // Detached scope: the first useDM() caller is usually a component, and the
+  // watcher must outlive it.
+  const scope = effectScope(true);
+  scope.run(() => {
+    watch(onlineStatus, (now, before) => {
+      for (const [peerId, online] of Object.entries(now)) {
+        if (online && !before?.[peerId] && failedTexts(peerId).length > 0) {
+          schedulePresenceRetry(peerId);
+        }
+      }
+    });
+  });
+  stopPresenceWatch = () => scope.stop();
 }
 
 async function initDmListeners() {
   if (dmListenerInitialized) return;
   dmListenerInitialized = true;
-  const { listen } = await import("@tauri-apps/api/event");
+  watchPresenceForRetries();
+
   dmUnlisteners.push(await listen<any>("dm-file-saved", (event) => {
     const { peer_id, file_id, local_path } = event.payload;
     if (!peer_id || !file_id) return;
@@ -170,7 +205,6 @@ async function initDmListeners() {
     if (fileMsg) {
       fileMsg.localPath = local_path;
       fileMsg.failed = false;
-      conversations.value = { ...conversations.value };
     }
   }));
 
@@ -178,10 +212,7 @@ async function initDmListeners() {
     const { peer_id, file_id } = event.payload;
     if (!peer_id || !file_id) return;
     const fileMsg = findFileMsg(peer_id, file_id);
-    if (fileMsg && fileMsg.localPath === null) {
-      fileMsg.failed = true;
-      conversations.value = { ...conversations.value };
-    }
+    if (fileMsg && fileMsg.localPath === null) fileMsg.failed = true;
   }));
 
   dmUnlisteners.push(await listen<any>("dm-received", (event) => {
@@ -208,9 +239,7 @@ async function initDmListeners() {
       });
     } else if (message.type === "file_end") {
       const fileMsg = findFileMsg(peer_id, message.id);
-      if (fileMsg) {
-        fileMsg.progress = 1;
-      }
+      if (fileMsg) fileMsg.progress = 1;
     }
   }));
 
@@ -223,78 +252,40 @@ async function initDmListeners() {
     const fileMsg = findFileMsg(peer_id, file_id);
     if (fileMsg && fileMsg.size > 0) {
       fileMsg.progress = Math.min(1, received / fileMsg.size);
-      conversations.value = { ...conversations.value };
     }
   }));
 
-  dmUnlisteners.push(await listen<any>("dm-connected", (event) => {
-    const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
-    if (pid) {
-      connectedPeers.add(pid);
-      if (connectErrors.value[pid]) {
-        const { [pid]: _removed, ...rest } = connectErrors.value;
-        connectErrors.value = rest;
-      }
-      // A reconnect just landed — flush anything that failed while we were down.
-      void retryFailedMessages(pid);
-    }
+  dmUnlisteners.push(await listen<{ peer_id?: string }>("dm-connected", (event) => {
+    const pid = event.payload?.peer_id;
+    if (!pid) return;
+    connectedPeers.add(pid);
+    delete connectErrors.value[pid];
+    // A reconnect just landed — flush anything that failed while we were down.
+    void retryFailedMessages(pid);
   }));
 
-  dmUnlisteners.push(await listen<any>("dm-disconnected", (event) => {
-    const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
+  dmUnlisteners.push(await listen<{ peer_id?: string }>("dm-disconnected", (event) => {
+    const pid = event.payload?.peer_id;
     if (pid) connectedPeers.delete(pid);
   }));
 
-  // Delivery ack for a Text message we sent — resolves "sent" to "delivered".
+  // Delivery ack for a Text message we sent — resolves to "delivered".
   // Backward compatible: an older peer never sends this, so our messages to
   // it simply stay at "sent" forever (no regression from today's behavior).
   dmUnlisteners.push(await listen<any>("dm-ack-received", (event) => {
     const { peer_id, id } = event.payload;
-    if (!peer_id || !id) return;
-    const msgs = conversations.value[peer_id];
-    if (!msgs) return;
-    conversations.value = {
-      ...conversations.value,
-      [peer_id]: msgs.map(m => (
-        m.type === "text" && m.clientId === id ? { ...m, status: "delivered" as const } : m
-      )),
-    };
+    if (peer_id && id) setDmTextStatus(peer_id, id, "delivered");
   }));
 }
 
 export function useDM() {
   // Auto-initialize listeners so passive consumers (TabBar, messages page)
   // receive DM events without needing to call connect() first
-  initDmListeners();
+  void initDmListeners();
 
   async function connect(nodeId: string) {
-    activeConversation.value = nodeId;
-    // Already connected, or a connect is already in flight — don't double-dial.
-    if (connectedPeers.has(nodeId) || connectingPeers.has(nodeId)) return;
-    connectingPeers.add(nodeId);
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("connect_dm", { nodeId });
-      // Intentionally do NOT add to connectedPeers here — the "dm-connected"
-      // event is the source of truth. If Rust rejected the stream, no event
-      // fires and a later connect() correctly re-dials.
-    } catch (error) {
-      console.warn("[dm] connect_dm failed:", error);
-      connectErrors.value = { ...connectErrors.value, [nodeId]: true };
-    } finally {
-      connectingPeers.delete(nodeId);
-    }
-  }
-
-  async function disconnect(nodeId?: string) {
-    const target = nodeId || activeConversation.value;
-    if (!target) return;
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("disconnect_dm", { peerId: target }).catch(() => {});
-    connectedPeers.delete(target);
-    if (activeConversation.value === target) {
-      activeConversation.value = null;
-    }
+    activeConversation = nodeId;
+    await dial(nodeId);
   }
 
   async function sendText(nodeId: string, content: string) {
@@ -331,34 +322,31 @@ export function useDM() {
       localPath: null, from: "self", timestamp: Date.now(),
     });
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
       const result = await invoke<{ id: string; size: number }>("send_file", { peerId: nodeId, filePath });
-      updateFileMessage(nodeId, pendingId, {
-        id: result.id, size: result.size, progress: 1, localPath: filePath, failed: false,
-      });
+      const card = findFileMsg(nodeId, pendingId);
+      if (card) {
+        Object.assign(card, { id: result.id, size: result.size, progress: 1, localPath: filePath, failed: false });
+      }
     } catch (error) {
       console.warn("[dm] send_file failed:", error);
-      updateFileMessage(nodeId, pendingId, { failed: true });
+      const card = findFileMsg(nodeId, pendingId);
+      if (card) card.failed = true;
       throw error;
     }
   }
 
   function markRead(nodeId: string) {
-    unreadCounts.value = { ...unreadCounts.value, [nodeId]: 0 };
+    unreadCounts.value[nodeId] = 0;
   }
 
   function clearActiveConversation() {
-    activeConversation.value = null;
-  }
-
-  function totalUnread(): number {
-    return Object.values(unreadCounts.value).reduce((a, b) => a + b, 0);
+    activeConversation = null;
   }
 
   return {
-    conversations, activeConversation, unreadCounts, connectErrors,
-    connect, disconnect, clearActiveConversation,
-    sendText, resend, sendFile, pushMessage, markRead, totalUnread,
+    conversations, unreadCounts, totalUnread, connectErrors,
+    connect, clearActiveConversation,
+    sendText, resend, sendFile, markRead,
   };
 }
 
@@ -370,6 +358,10 @@ if (import.meta.hot) {
     for (const un of dmUnlisteners) un();
     dmUnlisteners = [];
     dmListenerInitialized = false;
+    stopPresenceWatch?.();
+    stopPresenceWatch = null;
+    for (const timer of presenceRetryTimers.values()) clearTimeout(timer);
+    presenceRetryTimers.clear();
     connectedPeers.clear();
     connectingPeers.clear();
     connectErrors.value = {};
