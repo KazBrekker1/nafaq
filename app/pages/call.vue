@@ -90,13 +90,24 @@ function onFullscreenChange() {
 }
 
 const peerVideoContainerRefs = new Map<string, (el: any) => void>();
+const observedPeerContainers = new Map<string, HTMLElement>();
 function registerPeerContainerRef(peerId: string) {
   let cached = peerVideoContainerRefs.get(peerId);
   if (!cached) {
     cached = (el: any) => {
+      // Vue calls this with null when the tile unmounts (peer left) — stop
+      // observing the old element so departed tiles don't pile up.
+      const previous = observedPeerContainers.get(peerId);
+      if (previous && previous !== el) {
+        videoVisibilityObserver?.unobserve(previous);
+        observedPeerContainers.delete(peerId);
+      }
       if (el instanceof HTMLElement) {
         el.dataset.peerId = peerId;
         videoVisibilityObserver?.observe(el);
+        observedPeerContainers.set(peerId, el);
+      } else {
+        peerVideoContainerRefs.delete(peerId);
       }
     };
     peerVideoContainerRefs.set(peerId, cached);
@@ -147,6 +158,8 @@ async function startConnectedPipeline() {
       }
     }
   }, { threshold: 0.1 });
+  // Re-attach tiles that were observed by the previous observer instance.
+  for (const el of observedPeerContainers.values()) videoVisibilityObserver.observe(el);
 
   await transport.initCodecs(media.localStream.value);
   if (cleaned) return;

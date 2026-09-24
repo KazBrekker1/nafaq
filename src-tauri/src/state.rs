@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use iroh::protocol::Router;
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
@@ -14,8 +14,8 @@ use crate::presence::PresenceManager;
 #[derive(Clone)]
 pub struct MediaBridgeRegistration {
     pub profile: MediaSessionProfile,
-    pub audio_channel: Option<Channel<Vec<u8>>>,
-    pub video_channel: Option<Channel<Vec<u8>>>,
+    pub audio_channel: Option<Channel<InvokeResponseBody>>,
+    pub video_channel: Option<Channel<InvokeResponseBody>>,
     pub webcodecs_active: bool,
 }
 

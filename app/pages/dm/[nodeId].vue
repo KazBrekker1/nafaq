@@ -90,6 +90,7 @@ async function initiateCall() {
     console.warn("[dm] Call invite delivery failed:", e);
     callError.value = "Could not deliver the call invite. Check the connection and try again.";
     callState.value = "idle";
+    invoke("leave_call_session").catch(() => {});
     return;
   }
   startWaitingForAnswer(peerId.value);

@@ -6,8 +6,10 @@ mod messages;
 mod node;
 mod presence;
 mod protocol;
+mod quality;
 mod relay;
 mod state;
+mod video_transport;
 
 #[cfg(test)]
 mod scenarios;
@@ -27,6 +29,7 @@ use messages::{AudioPacket, Contact, ControlAction, Event, RelayStatusKind, Vide
 use presence::PresenceManager;
 use protocol::{NafaqDmProtocol, NafaqProtocol};
 use state::{AppState, MediaBridgeState};
+use tauri::ipc::InvokeResponseBody;
 use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_store::StoreExt;
@@ -48,6 +51,22 @@ struct AudioEvent {
     peer_id: String,
     data: String,
     timestamp: u64,
+}
+
+/// Wrapping-aware high-water mark for a peer's audio datagrams. Returns how
+/// many packets were lost before `sequence`, or `None` if it must be dropped:
+/// a duplicate, or a late packet whose slot FEC/concealment already filled
+/// (playing it would repeat 20 ms out of order and disturb decoder state).
+fn audio_sequence_gap(previous: Option<u16>, sequence: u16) -> Option<u16> {
+    let Some(previous) = previous else {
+        return Some(0);
+    };
+    let advance = sequence.wrapping_sub(previous);
+    if advance == 0 || advance >= 0x8000 {
+        None
+    } else {
+        Some(advance - 1)
+    }
 }
 
 fn pack_audio_channel_packet(peer_id: &str, timestamp: u64, pcm: &[u8]) -> Option<Vec<u8>> {
@@ -458,32 +477,13 @@ pub fn run() {
                             }
                             last_active.insert(peer_id.clone(), now_inst);
 
-                            // Wrapping-aware high-water-mark. QUIC datagrams are
-                            // unordered, so a reordered packet (seq 5,7,6) must
-                            // still be decoded — it can fill the gap / carry Opus
-                            // FEC — rather than being dropped as "<= previous".
-                            // Only exact duplicates are discarded.
-                            let lost_count = match last_sequence.get(&peer_id).copied() {
-                                None => {
-                                    last_sequence.insert(peer_id.clone(), packet.sequence);
-                                    0u16
-                                }
-                                Some(previous) => {
-                                    let advance = packet.sequence.wrapping_sub(previous);
-                                    if advance == 0 {
-                                        // Exact duplicate.
-                                        continue;
-                                    } else if advance < 0x8000 {
-                                        // Forward progress; a gap (>1) is loss.
-                                        last_sequence.insert(peer_id.clone(), packet.sequence);
-                                        advance - 1
-                                    } else {
-                                        // Reordered/late: decode but keep the
-                                        // high-water mark and don't flag loss.
-                                        0
-                                    }
-                                }
+                            let Some(lost_count) = audio_sequence_gap(
+                                last_sequence.get(&peer_id).copied(),
+                                packet.sequence,
+                            ) else {
+                                continue;
                             };
+                            last_sequence.insert(peer_id.clone(), packet.sequence);
 
                             // Lightweight energy proxy from Opus payload size (no decode
                             // needed), smoothed with an EWMA so one large packet (e.g. a
@@ -575,7 +575,7 @@ pub fn run() {
                                     else {
                                         continue;
                                     };
-                                    let _ = channel.send(channel_payload);
+                                    let _ = channel.send(InvokeResponseBody::Raw(channel_payload));
                                 } else {
                                     let _ = app_handle_audio.emit(
                                         "audio-received",
@@ -605,15 +605,27 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async move {
                 let mut video_rx = video_media_tx_for_setup.subscribe();
+                // Peers whose frames were lost to broadcast lag: their chain is
+                // broken, so skip deltas until a keyframe comes through.
+                let mut resync: HashSet<String> = HashSet::new();
                 loop {
                     match video_rx.recv().await {
                         Ok(packet) => {
+                            let kf = codec::is_keyframe(&packet.payload);
+                            if !resync.is_empty() {
+                                if kf {
+                                    resync.remove(&packet.peer_id);
+                                } else if resync.contains(&packet.peer_id) {
+                                    continue;
+                                }
+                            }
                             // Check bridge registration first — if WebCodecs is active,
                             // forward raw NALUs and skip the decode+JPEG path entirely.
+                            // Only on the binary channel: event mode can't carry
+                            // NALUs, so it always takes the decode+JPEG path.
                             let registration = video_bridge.lock().await.clone();
                             if let Some(ref reg) = registration {
-                                if reg.webcodecs_active {
-                                    let kf = codec::is_keyframe(&packet.payload);
+                                if reg.webcodecs_active && reg.video_channel.is_some() {
                                     if let Some(channel) = &reg.video_channel {
                                         if let Some(raw_packet) = pack_video_channel_raw_nalu(
                                             &packet.peer_id,
@@ -621,7 +633,7 @@ pub fn run() {
                                             &packet.payload,
                                             kf,
                                         ) {
-                                            let _ = channel.send(raw_packet);
+                                            let _ = channel.send(InvokeResponseBody::Raw(raw_packet));
                                         }
                                     }
                                     continue; // Skip the decode+JPEG path
@@ -666,7 +678,7 @@ pub fn run() {
                                         ) else {
                                             continue;
                                         };
-                                        let _ = channel.send(channel_payload);
+                                        let _ = channel.send(InvokeResponseBody::Raw(channel_payload));
                                     } else {
                                         let _ = app_handle_video.emit(
                                             "video-received",
@@ -695,8 +707,9 @@ pub fn run() {
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("Video forwarder lagged by {n} frames");
-                            // A dropped keyframe stalls decoding until the next
-                            // IDR; ask peers for one now instead of waiting.
+                            // Unknown which peers lost frames: resync them all
+                            // and ask for keyframes now instead of waiting.
+                            resync.extend(conn_manager_video.peer_ids().await);
                             conn_manager_video.request_keyframes_from_all_peers().await;
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
@@ -730,44 +743,62 @@ pub fn run() {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // lost_packets from path stats is cumulative over the connection
-                // lifetime; degradation must be judged on the per-tick delta or a
-                // peer stays "degraded" forever after its 51st lifetime loss.
+                // lifetime; congestion must be judged on the per-tick delta.
                 let mut last_lost: HashMap<String, u64> = HashMap::new();
+                let mut controller = quality::SendQualityController::new();
+                let mut last_level: Option<u8> = None;
                 loop {
                     interval.tick().await;
                     let snapshot = conn_manager_stats.snapshot_network_stats().await;
+                    let mut dropped = conn_manager_stats.take_dropped_video_frames().await;
                     let mut seen: HashSet<String> = HashSet::with_capacity(snapshot.len());
+                    let mut signals = Vec::with_capacity(snapshot.len());
                     for stats in &snapshot {
                         seen.insert(stats.peer_id.clone());
                         let prev = last_lost
                             .insert(stats.peer_id.clone(), stats.lost_packets)
                             .unwrap_or(stats.lost_packets);
-                        let lost_delta = stats.lost_packets.saturating_sub(prev);
-                        // Per-peer quality adaptation
-                        let target = if stats.rtt_ms > 200 || lost_delta > 50 {
-                            100_000 // 100kbps for degraded peers
-                        } else {
-                            0 // Use global profile (no override)
-                        };
-                        let current = conn_manager_stats
-                            .get_peer_outbound_bitrate(&stats.peer_id)
-                            .await;
-                        // Only touch values this loop owns (0 or the degraded cap) —
-                        // a peer-requested PerPeerQualityBps override wins.
-                        let managed = current == 0 || current == 100_000;
-                        if managed && current != target {
-                            conn_manager_stats
-                                .set_peer_outbound_bitrate(&stats.peer_id, target)
-                                .await;
-                        }
+                        signals.push((
+                            stats.peer_id.clone(),
+                            quality::PeerSignal {
+                                rtt_ms: stats.rtt_ms,
+                                lost_packets: stats.lost_packets.saturating_sub(prev),
+                                dropped_video_frames: dropped
+                                    .remove(&stats.peer_id)
+                                    .unwrap_or_default(),
+                            },
+                        ));
                         let _ = app_handle_stats.emit("network-stats", &stats);
                     }
                     last_lost.retain(|peer_id, _| seen.contains(peer_id));
-                    // The encoder is shared across peers, so apply the strictest
-                    // active per-peer cap (0 = none, restores the base profile).
-                    let cap = conn_manager_stats.min_peer_outbound_bitrate().await;
+
+                    let level = controller.tick(&signals);
+                    if last_level != Some(level) {
+                        last_level = Some(level);
+                        let _ = app_handle_stats.emit(
+                            "send-quality-changed",
+                            serde_json::json!({ "level": level }),
+                        );
+                    }
+                    // The encoder is shared across peers: apply the controller
+                    // level, then any stricter peer-requested cap.
+                    let peer_cap = conn_manager_stats.min_peer_outbound_bitrate().await;
                     if let Some(encoder) = video_codec_stats.encoder.lock().await.as_mut() {
-                        encoder.apply_bitrate_override(cap);
+                        let target = quality::apply_level(
+                            quality::VideoProfile {
+                                bitrate_bps: encoder.base_bitrate_bps(),
+                                fps: encoder.base_fps().round() as u32,
+                                max_width: 0,
+                                max_height: 0,
+                            },
+                            level,
+                        );
+                        let bitrate = if peer_cap > 0 {
+                            target.bitrate_bps.min(peer_cap)
+                        } else {
+                            target.bitrate_bps
+                        };
+                        encoder.set_runtime_rate(bitrate, target.fps as f32);
                     }
                 }
             });
@@ -790,6 +821,8 @@ pub fn run() {
             commands::create_call,
             commands::join_call,
             commands::end_call,
+            commands::send_encoded_video_all,
+            commands::leave_call_session,
             commands::cancel_call,
             commands::send_call_decline,
             commands::send_chat,
@@ -822,4 +855,33 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");
+}
+
+#[cfg(test)]
+mod audio_sequence_tests {
+    use super::audio_sequence_gap;
+
+    #[test]
+    fn first_packet_and_in_order_packets_have_no_gap() {
+        assert_eq!(audio_sequence_gap(None, 42), Some(0));
+        assert_eq!(audio_sequence_gap(Some(42), 43), Some(0));
+    }
+
+    #[test]
+    fn a_jump_reports_the_missing_packets() {
+        assert_eq!(audio_sequence_gap(Some(5), 8), Some(2));
+    }
+
+    #[test]
+    fn duplicates_and_late_packets_are_dropped() {
+        assert_eq!(audio_sequence_gap(Some(7), 7), None);
+        assert_eq!(audio_sequence_gap(Some(7), 6), None);
+    }
+
+    #[test]
+    fn wraps_around_u16() {
+        assert_eq!(audio_sequence_gap(Some(u16::MAX), 0), Some(0));
+        assert_eq!(audio_sequence_gap(Some(u16::MAX - 1), 1), Some(2));
+        assert_eq!(audio_sequence_gap(Some(0), u16::MAX), None);
+    }
 }

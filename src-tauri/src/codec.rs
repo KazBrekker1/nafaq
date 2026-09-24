@@ -88,14 +88,17 @@ pub struct VideoEncoder {
     encoder: H264Encoder,
     width: u32,
     height: u32,
-    /// Bitrate the encoder was configured with (the frontend's quality profile).
+    /// Profile the encoder was configured with (the call-size profile).
     base_bitrate_bps: u32,
-    /// Bitrate the inner encoder is currently running at (base, or an override).
+    base_fps: f32,
+    /// What the inner encoder is currently running at (base, or reduced by
+    /// the send-quality controller / a peer-requested cap).
     active_bitrate_bps: u32,
-    fps: f32,
+    active_fps: f32,
 }
 
 impl VideoEncoder {
+    #[cfg(test)]
     pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
         Self::new_with_config(width, height, 400_000, 12.0)
     }
@@ -106,50 +109,75 @@ impl VideoEncoder {
         bitrate_bps: u32,
         fps: f32,
     ) -> anyhow::Result<Self> {
-        let encoder = Self::build_encoder(bitrate_bps, fps)?;
-        Ok(Self {
-            encoder,
-            width,
-            height,
-            base_bitrate_bps: bitrate_bps,
-            active_bitrate_bps: bitrate_bps,
-            fps,
-        })
-    }
-
-    fn build_encoder(bitrate_bps: u32, fps: f32) -> anyhow::Result<H264Encoder> {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .bitrate(openh264::encoder::BitRate::from_bps(bitrate_bps))
             .max_frame_rate(openh264::encoder::FrameRate::from_hz(fps))
             .rate_control_mode(openh264::encoder::RateControlMode::Bitrate);
-        H264Encoder::with_api_config(api, config)
-            .map_err(|e| anyhow::anyhow!("failed to create H264 encoder: {e}"))
+        let encoder = H264Encoder::with_api_config(api, config)
+            .map_err(|e| anyhow::anyhow!("failed to create H264 encoder: {e}"))?;
+        Ok(Self {
+            encoder,
+            width,
+            height,
+            base_bitrate_bps: bitrate_bps,
+            base_fps: fps,
+            active_bitrate_bps: bitrate_bps,
+            active_fps: fps,
+        })
     }
 
-    /// Apply a temporary bitrate cap (0 clears it, restoring the base bitrate).
-    /// openh264 has no safe runtime bitrate setter, so this rebuilds the inner
-    /// encoder; the next encoded frame starts a fresh IDR/SPS sequence, which
-    /// receivers handle the same way as any keyframe.
-    pub fn apply_bitrate_override(&mut self, override_bps: u32) {
-        let target = if override_bps == 0 {
-            self.base_bitrate_bps
-        } else {
-            override_bps.min(self.base_bitrate_bps)
-        };
-        if target == self.active_bitrate_bps {
-            return;
-        }
-        match Self::build_encoder(target, self.fps) {
-            Ok(encoder) => {
+    pub fn base_bitrate_bps(&self) -> u32 {
+        self.base_bitrate_bps
+    }
+
+    pub fn base_fps(&self) -> f32 {
+        self.base_fps
+    }
+
+    /// Retarget bitrate/frame rate in place. Unlike rebuilding the encoder
+    /// this keeps the reference chain, so no forced keyframe is needed.
+    /// Values are clamped to the base profile.
+    pub fn set_runtime_rate(&mut self, bitrate_bps: u32, fps: f32) {
+        let bitrate_bps = bitrate_bps.clamp(1, self.base_bitrate_bps);
+        let fps = fps.clamp(1.0, self.base_fps);
+        if bitrate_bps != self.active_bitrate_bps {
+            let mut info = openh264_sys2::SBitrateInfo {
+                iLayer: openh264_sys2::SPATIAL_LAYER_ALL,
+                iBitrate: bitrate_bps as i32,
+            };
+            // SAFETY: ENCODER_OPTION_BITRATE takes a pointer to SBitrateInfo,
+            // which lives for the duration of the call.
+            let rc = unsafe {
+                self.encoder.raw_api().set_option(
+                    openh264_sys2::ENCODER_OPTION_BITRATE,
+                    (&mut info as *mut openh264_sys2::SBitrateInfo).cast(),
+                )
+            };
+            if rc == 0 {
                 tracing::info!(
-                    "Video encoder bitrate {} -> {target} bps",
+                    "Video encoder bitrate {} -> {bitrate_bps} bps",
                     self.active_bitrate_bps
                 );
-                self.encoder = encoder;
-                self.active_bitrate_bps = target;
+                self.active_bitrate_bps = bitrate_bps;
+            } else {
+                tracing::warn!("Failed to set encoder bitrate (rc={rc})");
             }
-            Err(e) => tracing::warn!("Failed to apply bitrate override: {e}"),
+        }
+        if (fps - self.active_fps).abs() > f32::EPSILON {
+            let mut value = fps;
+            // SAFETY: ENCODER_OPTION_FRAME_RATE takes a pointer to a float.
+            let rc = unsafe {
+                self.encoder.raw_api().set_option(
+                    openh264_sys2::ENCODER_OPTION_FRAME_RATE,
+                    (&mut value as *mut f32).cast(),
+                )
+            };
+            if rc == 0 {
+                self.active_fps = fps;
+            } else {
+                tracing::warn!("Failed to set encoder frame rate (rc={rc})");
+            }
         }
     }
 
@@ -399,6 +427,28 @@ mod tests {
         let jpeg = encode_jpeg(&decoded_rgba, width, height, 80).expect("jpeg encode failed");
         assert!(jpeg.starts_with(&[0xFF, 0xD8]));
         assert!(jpeg.len() > 256);
+    }
+
+    #[test]
+    fn test_runtime_rate_change_keeps_encoding() {
+        let mut enc = VideoEncoder::new_with_config(320, 240, 400_000, 12.0).expect("encoder init");
+        let rgba = vec![128u8; (320 * 240 * 4) as usize];
+        assert!(enc.encode(&rgba, 320, 240, true).is_some());
+        enc.set_runtime_rate(120_000, 6.0);
+        assert_eq!(enc.active_bitrate_bps, 120_000);
+        assert_eq!(enc.active_fps, 6.0);
+        // Clamped to the base profile.
+        enc.set_runtime_rate(900_000, 30.0);
+        assert_eq!(enc.active_bitrate_bps, 400_000);
+        assert_eq!(enc.active_fps, 12.0);
+        // Deltas still encode after retargeting (no rebuild, no forced IDR).
+        let mut produced_delta = false;
+        for _ in 0..4 {
+            if let Some(frame) = enc.encode(&rgba, 320, 240, false) {
+                produced_delta |= !is_keyframe(&frame);
+            }
+        }
+        assert!(produced_delta);
     }
 
     #[test]

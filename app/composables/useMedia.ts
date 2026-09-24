@@ -16,7 +16,7 @@ const audioMuted = ref(false);
 const videoMuted = ref(false);
 const error = ref<string | null>(null);
 
-let micLevelRafId: number | null = null;
+let micLevelTimer: ReturnType<typeof setInterval> | null = null;
 let audioContext: AudioContext | null = null;
 
 // Invalidates in-flight getUserMedia attempts: a startPreview that resolves
@@ -67,12 +67,23 @@ export function useMedia() {
 
     const generation = ++previewGeneration;
 
-    const videoConstraint = selectedCamera.value
-      ? { deviceId: { exact: selectedCamera.value } }
-      : true;
-    const audioConstraint = selectedMic.value
-      ? { deviceId: { exact: selectedMic.value } }
-      : true;
+    // Capture is downscaled to at most 640x360 @ 12 fps before encoding;
+    // asking for more only burns camera/CPU (notably on Android).
+    const videoConstraint: MediaTrackConstraints = {
+      width: { ideal: 640 },
+      height: { ideal: 360 },
+      frameRate: { ideal: 15, max: 30 },
+      ...(selectedCamera.value ? { deviceId: { exact: selectedCamera.value } } : {}),
+    };
+    // Remote audio plays through Web Audio, so ask for the platform's voice
+    // processing explicitly rather than relying on per-WebView defaults.
+    const audioConstraint: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+      ...(selectedMic.value ? { deviceId: { exact: selectedMic.value } } : {}),
+    };
 
     // Android WebView holds the camera HAL for ~500ms after release;
     // retry with backoff to avoid "NotReadableError" during handoff.
@@ -126,23 +137,26 @@ export function useMedia() {
       analyser.fftSize = 256;
       source.connect(analyser);
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      // ~15 Hz is plenty for a level meter; rAF drove a reactive update
+      // (and re-render) every display frame for the whole call.
       function update() {
         analyser.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) sum += dataArray[i]!;
-        micLevel.value = sum / (dataArray.length * 255);
-        micLevelRafId = requestAnimationFrame(update);
+        const level = Math.round((sum / (dataArray.length * 255)) * 50) / 50;
+        if (level !== micLevel.value) micLevel.value = level;
       }
       update();
+      micLevelTimer = setInterval(update, 66);
     } catch (e) {
       console.warn("[media] Mic level monitor failed:", e);
     }
   }
 
   function stopMicLevelMonitor() {
-    if (micLevelRafId !== null) {
-      cancelAnimationFrame(micLevelRafId);
-      micLevelRafId = null;
+    if (micLevelTimer !== null) {
+      clearInterval(micLevelTimer);
+      micLevelTimer = null;
     }
     micLevel.value = 0;
   }

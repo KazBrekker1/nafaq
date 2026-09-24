@@ -133,6 +133,11 @@ async function terminateCall({ navigate = true }: { navigate?: boolean } = {}) {
         console.warn(`[call] end_call failed for ${p}:`, e);
       });
     }
+    // Close the inbound call gate even when no end_call ran (remote hung up
+    // first, or nobody ever joined).
+    await invoke("leave_call_session").catch((e) => {
+      console.warn("[call] leave_call_session failed:", e);
+    });
   } catch (e) {
     console.warn("[call] end_call cleanup failed:", e);
   }
@@ -237,7 +242,9 @@ export function useCall() {
 
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const t = shareTicket.value ?? await invoke<string>("create_call");
+      // Always go through create_call even when a ticket is already cached:
+      // it's what opens the backend's inbound call gate for this session.
+      const t = await invoke<string>("create_call");
       if (!t) {
         throw new Error("ticket unavailable");
       }

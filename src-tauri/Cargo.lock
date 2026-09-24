@@ -3049,6 +3049,7 @@ dependencies = [
  "iroh-tickets",
  "noq-proto",
  "openh264",
+ "openh264-sys2",
  "opus",
  "rand",
  "serde",

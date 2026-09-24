@@ -7,7 +7,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 /// Creates and configures an Iroh endpoint for the nafaq protocol.
-pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/1";
+/// v2: one QUIC uni-stream per video frame (see video_transport.rs). Not
+/// wire-compatible with v1 video, hence the bump.
+pub const NAFAQ_ALPN: &[u8] = b"nafaq/call/2";
 pub const NAFAQ_DM_ALPN: &[u8] = b"nafaq/dm/1";
 pub const RELAY_URL: &str = "https://iroh-relay.sanad.ink";
 pub static RELAY_URL_PARSED: LazyLock<RelayUrl> =
@@ -25,8 +27,11 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndp
 
     let transport_config = iroh::endpoint::QuicTransportConfig::builder()
         .congestion_controller_factory(Arc::new(Bbr3Config::default()))
-        .keep_alive_interval(Duration::from_secs(5))
-        .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
+        // A dead path is noticed after 15 s (was 30 s) and handed to the
+        // reconnect ladder; 3 s keep-alives keep a quiet-but-healthy
+        // connection (muted, camera off) comfortably inside that window.
+        .keep_alive_interval(Duration::from_secs(3))
+        .max_idle_timeout(Some(Duration::from_secs(15).try_into()?))
         // Bound concurrent uni-streams at the QUIC layer. A peer's stream-open
         // blocks once it hits the cap, which in turn bounds how many
         // accept_uni/tokio::spawn reader tasks we can be pushed into — a peer
@@ -38,8 +43,11 @@ pub async fn create_endpoint_with_key(secret_key: SecretKey) -> Result<NafaqEndp
         .stream_receive_window((2 * 1024 * 1024_u32).into())
         .receive_window((8 * 1024 * 1024_u32).into())
         .send_window(8 * 1024 * 1024)
-        .datagram_receive_buffer_size(Some(2 * 1024 * 1024))
-        .datagram_send_buffer_size(2 * 1024 * 1024)
+        // Audio is the only datagram traffic (~100 B every 20 ms). Keep the
+        // queues to well under a second so a stall drops stale audio (oldest
+        // first) instead of flushing minutes of it afterwards.
+        .datagram_receive_buffer_size(Some(16 * 1024))
+        .datagram_send_buffer_size(8 * 1024)
         .build();
 
     let relay_url = RELAY_URL_PARSED.clone();

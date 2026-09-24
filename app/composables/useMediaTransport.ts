@@ -1,4 +1,6 @@
 import { Channel } from "@tauri-apps/api/core";
+import { PLAYBACK_PROCESSOR_NAME, playbackWorkletSource } from "~/utils/jitterBuffer";
+import { applySendLevel, sendQualityForLevel, type VideoProfile } from "~/utils/sendQuality";
 
 const encoding = ref(false);
 const connectionQuality = ref<"good" | "degraded" | "poor">("good");
@@ -40,15 +42,6 @@ interface TransportStatus {
   lastFailure: string | null;
 }
 
-interface PeerNetworkStats {
-  peer_id: string;
-  rtt_ms: number;
-  lost_packets: number;
-  lost_bytes: number;
-  datagram_send_buffer_space: number;
-  latest_video_age_ms: number;
-}
-
 interface PendingVideoFrame {
   jpegBytes: Uint8Array;
   width: number;
@@ -72,16 +65,18 @@ interface LegacyVideoEvent {
 
 interface PeerMediaState {
   canvas: HTMLCanvasElement | null;
+  /** Playback worklet holding this peer's jitter buffer. */
+  audioNode: AudioWorkletNode | null;
   audioGainNode: GainNode | null;
-  nextPlayTime: number;
-  baseDelay: number | null;
-  jitterEstimate: number;
   speaking: boolean;
   lastAudioRms: number;
   speakingSince: number;
   lastSpeakingTime: number;
   lastKeyframeRequestAt: number;
   pendingVideoFrame: PendingVideoFrame | null;
+  /** A JPEG frame is being decoded/drawn; newer ones wait in pendingVideoFrame. */
+  jpegRendering: boolean;
+  lastDrawnTimestamp: number;
   videoPaused: boolean;
 }
 
@@ -95,6 +90,8 @@ interface MediaUploader {
     keyframe: boolean,
     timestamp: number,
   ) => Promise<void>;
+  /** Returns whether the next frame must be a keyframe. */
+  sendEncodedVideo: (h264: Uint8Array, timestamp: number) => Promise<boolean>;
   close: () => void;
 }
 
@@ -135,13 +132,29 @@ let captureSinkNode: GainNode | null = null;
 let unlistenAudio: (() => void) | null = null;
 let unlistenVideo: (() => void) | null = null;
 let unlistenDisconnect: (() => void) | null = null;
-let unlistenStats: (() => void) | null = null;
 let unlistenQuality: (() => void) | null = null;
-let stopQualityWatch: (() => void) | null = null;
 let activeSpeakerInterval: ReturnType<typeof setInterval> | null = null;
+const isAndroidUa = /android/i.test(navigator.userAgent);
+const DEFAULT_PROFILE: VideoProfile = {
+  bitrateBps: 400_000,
+  fps: isAndroidUa ? 8 : 12,
+  maxWidth: 640,
+  maxHeight: 360,
+};
+// Call-size profile (quality-profile-changed) and the backend controller's
+// congestion level (send-quality-changed); capture follows their combination.
+let baseProfile: VideoProfile = { ...DEFAULT_PROFILE };
+let sendLevel = 0;
 let currentWidth = 640;
 let currentHeight = 360;
-let targetFps = 12;
+let targetFps = DEFAULT_PROFILE.fps;
+let unlistenSendQuality: (() => void) | null = null;
+let playbackWorkletLoaded: Promise<boolean> | null = null;
+let videoSendInFlight = false;
+let audioSendChain: Promise<void> = Promise.resolve();
+let audioSendsPending = 0;
+const MAX_PENDING_AUDIO_SENDS = 5;
+const AUDIO_CONTEXT_RESUME_TIMEOUT_MS = 1500;
 let peerIdsProvider: (() => string[]) | null = null;
 let audioChannel: Channel<ArrayBuffer> | null = null;
 let videoChannel: Channel<ArrayBuffer> | null = null;
@@ -150,7 +163,7 @@ let bridgeProbeResolver: (() => void) | null = null;
 let bridgeProbeReceived = false;
 let bridgeFallbackUsed = false;
 
-const isAndroid = /android/i.test(navigator.userAgent);
+const isAndroid = isAndroidUa;
 const hasWebCodecs = typeof VideoDecoder !== "undefined";
 const sharedTextDecoder = new TextDecoder();
 let preferJsonAudioInvoke = isAndroid;
@@ -159,7 +172,6 @@ let loggedAudioInvokeFallback = false;
 let loggedVideoInvokeFallback = false;
 
 const peerMediaStates = new Map<string, PeerMediaState>();
-const peerNetworkStats = new Map<string, PeerNetworkStats>();
 const initialKeyframeRequests = new Set<string>();
 
 const peerVideoDecoders = new Map<string, VideoDecoder>();
@@ -232,8 +244,9 @@ function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): Vid
   const ctx = canvas.getContext("2d")!;
   decoder = new VideoDecoder({
     output(frame: VideoFrame) {
-      canvas.width = frame.displayWidth;
-      canvas.height = frame.displayHeight;
+      // Assigning width/height reallocates the canvas even when unchanged.
+      if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+      if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
       ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
       frame.close();
     },
@@ -357,10 +370,13 @@ function packVideoPayloadAll(
   return payload;
 }
 
+function effectiveProfile() {
+  return applySendLevel(baseProfile, sendLevel);
+}
+
 function currentCaptureBounds() {
-  return connectionQuality.value === "good"
-    ? { maxWidth: 640, maxHeight: 360 }
-    : { maxWidth: 320, maxHeight: 180 };
+  const { maxWidth, maxHeight } = effectiveProfile();
+  return { maxWidth, maxHeight };
 }
 
 function evenDimension(value: number, fallback: number) {
@@ -447,16 +463,16 @@ function getOrCreatePeerState(peerId: string): PeerMediaState {
   if (!state) {
     state = {
       canvas: null,
+      audioNode: null,
       audioGainNode: null,
-      nextPlayTime: 0,
-      baseDelay: null,
-      jitterEstimate: 0,
       speaking: false,
       lastAudioRms: 0,
       speakingSince: 0,
       lastSpeakingTime: 0,
       lastKeyframeRequestAt: 0,
       pendingVideoFrame: null,
+      jpegRendering: false,
+      lastDrawnTimestamp: 0,
       videoPaused: false,
     };
     peerMediaStates.set(peerId, state);
@@ -465,45 +481,30 @@ function getOrCreatePeerState(peerId: string): PeerMediaState {
 }
 
 function ensurePeerAudioNode(peerState: PeerMediaState) {
-  if (!playbackCtx || peerState.audioGainNode) return;
+  if (!playbackCtx || peerState.audioNode) return;
+  const node = new AudioWorkletNode(playbackCtx, PLAYBACK_PROCESSOR_NAME, {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+  });
   const gain = playbackCtx.createGain();
   gain.gain.value = 1;
+  node.connect(gain);
   gain.connect(playbackCtx.destination);
+  peerState.audioNode = node;
   peerState.audioGainNode = gain;
-  peerState.nextPlayTime = playbackCtx.currentTime;
 }
 
-function scheduleAudioBuffer(peerState: PeerMediaState, buffer: AudioBuffer, captureTimestamp: number) {
-  if (!playbackCtx || !peerState.audioGainNode) return;
-
-  const now = Date.now();
-  const oneWayDelay = now - captureTimestamp;
-  if (peerState.baseDelay === null) peerState.baseDelay = oneWayDelay;
-  peerState.baseDelay = Math.min(peerState.baseDelay, oneWayDelay);
-
-  const jitter = Math.abs(oneWayDelay - peerState.baseDelay);
-  peerState.jitterEstimate = 0.9 * peerState.jitterEstimate + 0.1 * jitter;
-  const jitterBufferSec = Math.max(40, Math.min(120, peerState.jitterEstimate * 2)) / 1000;
-
-  const source = playbackCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(peerState.audioGainNode);
-
-  const ctxNow = playbackCtx.currentTime;
-  // Resync the playback cursor if it has fallen behind (a gap) OR drifted too
-  // far ahead. A burst of packets arriving faster than real time pushes
-  // nextPlayTime past the clock; without an upper clamp that lead is permanent
-  // and shows up as growing audio latency / A/V skew until the next gap.
-  const maxLeadSec = jitterBufferSec + 0.2;
-  if (
-    peerState.nextPlayTime < ctxNow - jitterBufferSec
-    || peerState.nextPlayTime > ctxNow + maxLeadSec
-  ) {
-    peerState.nextPlayTime = ctxNow + jitterBufferSec;
+function releasePeerAudio(peerState: PeerMediaState) {
+  if (peerState.audioNode) {
+    try { peerState.audioNode.disconnect(); } catch {}
+    peerState.audioNode.port.close();
+    peerState.audioNode = null;
   }
-  const scheduledAt = Math.max(peerState.nextPlayTime, ctxNow + jitterBufferSec);
-  source.start(scheduledAt);
-  peerState.nextPlayTime = scheduledAt + buffer.duration;
+  if (peerState.audioGainNode) {
+    try { peerState.audioGainNode.disconnect(); } catch {}
+    peerState.audioGainNode = null;
+  }
 }
 
 function unpackAudioChannelPacket(packet: ArrayBuffer) {
@@ -622,28 +623,69 @@ function waitForBridgeProbe(timeoutMs = BRIDGE_PROBE_TIMEOUT_MS) {
   });
 }
 
+// AudioContext.resume() can stay pending forever without a user gesture
+// (WebKit, Android WebView) — never let it block call setup.
+async function resumeWithTimeout(ctx: AudioContext) {
+  if (ctx.state === "running") return true;
+  const resumed = await Promise.race([
+    ctx.resume().then(() => true, () => false),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), AUDIO_CONTEXT_RESUME_TIMEOUT_MS)),
+  ]);
+  // Re-read state: TS narrowed it above, but resume() changed it.
+  return resumed && (ctx.state as AudioContextState) === "running";
+}
+
+// Keep a context running across interruptions (incoming phone call, sleep,
+// Bluetooth route change): resume on statechange, and on the next user
+// gesture when the platform refuses to resume without one.
+function keepContextRunning(ctx: AudioContext, label: string) {
+  const resumeOnGesture = () => {
+    const handler = () => {
+      document.removeEventListener("touchstart", handler);
+      document.removeEventListener("click", handler);
+      if (ctx.state !== "closed" && ctx.state !== "running") ctx.resume().catch(() => {});
+    };
+    document.addEventListener("touchstart", handler, { once: true });
+    document.addEventListener("click", handler, { once: true });
+  };
+  ctx.addEventListener("statechange", () => {
+    // "interrupted" is WebKit's state for OS-level interruptions.
+    if (ctx.state === "suspended" || (ctx.state as string) === "interrupted") {
+      console.warn(`[transport] ${label} AudioContext ${ctx.state}; resuming`);
+      resumeWithTimeout(ctx).then((ok) => { if (!ok) resumeOnGesture(); });
+    }
+  });
+  return resumeOnGesture;
+}
+
 async function ensurePlaybackContext() {
   if (!playbackCtx) {
     playbackCtx = new AudioContext({ sampleRate: 48000 });
+    const resumeOnGesture = keepContextRunning(playbackCtx, "playback");
+    if (!(await resumeWithTimeout(playbackCtx))) {
+      console.warn("[transport] Playback AudioContext resume deferred until user interaction");
+      resumeOnGesture();
+    }
+  } else if (playbackCtx.state !== "running") {
+    await resumeWithTimeout(playbackCtx);
   }
 
-  if (playbackCtx.state !== "running") {
-    try {
-      await playbackCtx.resume();
-    } catch {
-      // On mobile WebViews, AudioContext.resume() may require a user gesture.
-      // Queue a retry on next interaction instead of blocking the pipeline.
-      console.warn("[transport] AudioContext resume deferred until user interaction");
-      const handler = async () => {
-        document.removeEventListener("touchstart", handler);
-        document.removeEventListener("click", handler);
-        if (playbackCtx && playbackCtx.state !== "running") {
-          await playbackCtx.resume().catch(() => {});
-        }
-      };
-      document.addEventListener("touchstart", handler, { once: true });
-      document.addEventListener("click", handler, { once: true });
-    }
+  if (!playbackWorkletLoaded) {
+    const ctx = playbackCtx;
+    const blobUrl = URL.createObjectURL(
+      new Blob([playbackWorkletSource()], { type: "application/javascript" }),
+    );
+    playbackWorkletLoaded = ctx.audioWorklet.addModule(blobUrl)
+      .then(() => true)
+      .catch((error) => {
+        console.warn("[transport] Playback worklet failed to load", error);
+        return false;
+      })
+      .finally(() => URL.revokeObjectURL(blobUrl));
+  }
+  if (!(await playbackWorkletLoaded)) {
+    playbackWorkletLoaded = null;
+    throw new Error("Audio playback worklet unavailable");
   }
 }
 
@@ -682,31 +724,30 @@ function updateSpeakingMap() {
   peerSpeakingMap.value = newMap;
 }
 
-function handleIncomingPcm(peerId: string, timestamp: number, pcmBytes: Uint8Array) {
+function handleIncomingPcm(peerId: string, _timestamp: number, pcmBytes: Uint8Array) {
   if (handleBridgeProbe(peerId)) return;
   if (!playbackCtx) return;
-  if (pcmBytes.byteLength === 0) return;
+  if (pcmBytes.byteLength < 2) return;
 
-  const int16 = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength / 2);
-  const buffer = playbackCtx.createBuffer(1, int16.length, 48000);
-  const channel = buffer.getChannelData(0);
+  // Copy out of the IPC buffer (it may be unaligned for Int16Array).
+  const int16 = new Int16Array(pcmBytes.slice(0, pcmBytes.byteLength & ~1).buffer);
+  const samples = new Float32Array(int16.length);
   let sum = 0;
   for (let i = 0; i < int16.length; i++) {
     const sample = int16[i]! / 32768;
-    channel[i] = sample;
+    samples[i] = sample;
     sum += sample * sample;
   }
 
   const peerState = getOrCreatePeerState(peerId);
   ensurePeerAudioNode(peerState);
-  if (peerState.audioGainNode) {
-    scheduleAudioBuffer(peerState, buffer, timestamp);
-  }
+  peerState.audioNode?.port.postMessage({ pcm: samples }, [samples.buffer]);
 
   const rms = Math.sqrt(sum / int16.length);
   const now = Date.now();
   peerState.lastAudioRms = 0.7 * peerState.lastAudioRms + 0.3 * rms;
 
+  const wasSpeaking = peerState.speaking;
   if (rms > SPEAKING_RMS_THRESHOLD) {
     if (!peerState.speaking) {
       peerState.speaking = true;
@@ -717,7 +758,8 @@ function handleIncomingPcm(peerId: string, timestamp: number, pcmBytes: Uint8Arr
     peerState.speaking = false;
   }
 
-  updateSpeakingMap();
+  // Only touch reactive state on an actual change — this runs 50x/s per peer.
+  if (peerState.speaking !== wasSpeaking) updateSpeakingMap();
   markAudioReady();
 }
 
@@ -769,19 +811,33 @@ async function handleIncomingVideoFrame(
 ) {
   const peerState = getOrCreatePeerState(peerId);
   const frame: PendingVideoFrame = { jpegBytes, width, height, timestamp };
-  if (!peerState.canvas) {
+  // Image decoding is async, so frames could finish out of order. Keep one
+  // render in flight per peer; anything arriving meanwhile replaces the
+  // waiting frame (latest wins) and is drawn when the current one is done.
+  if (!peerState.canvas || peerState.jpegRendering) {
     peerState.pendingVideoFrame = frame;
     return;
   }
 
+  peerState.jpegRendering = true;
+  let next: PendingVideoFrame | null = frame;
   try {
-    await drawJpegToCanvas(peerState.canvas, jpegBytes, width, height);
-    peerState.pendingVideoFrame = null;
-    markVideoReady();
+    while (next && peerState.canvas) {
+      const current: PendingVideoFrame = next;
+      peerState.pendingVideoFrame = null;
+      if (current.timestamp >= peerState.lastDrawnTimestamp) {
+        await drawJpegToCanvas(peerState.canvas, current.jpegBytes, current.width, current.height);
+        peerState.lastDrawnTimestamp = current.timestamp;
+        markVideoReady();
+      }
+      next = peerState.pendingVideoFrame;
+    }
   } catch (error) {
     const message = `Video frame render failed: ${error instanceof Error ? error.message : String(error)}`;
     setTransportFailure(message);
     await reportPlaybackStatus();
+  } finally {
+    peerState.jpegRendering = false;
   }
 }
 
@@ -801,7 +857,9 @@ async function setupReceiveBridge(forceEventMode = false) {
     sessionId,
     preferredBridgeModes,
     playbackReady: playbackCtx?.state === "running",
-    webcodecs_active: hasWebCodecs,
+    // Raw NALUs only travel over the binary channel; in event mode the
+    // backend has to decode to JPEG, or no video would arrive at all.
+    webcodecs_active: hasWebCodecs && !forceEventMode,
   };
 
   const profile = await invoke<MediaSessionProfile>("register_media_bridge", {
@@ -842,7 +900,7 @@ async function setupReceiveBridge(forceEventMode = false) {
     videoChannel.onmessage = (raw) => {
       const packet = toArrayBuffer(raw);
       if (packet.byteLength === 0) return;
-      if (hasWebCodecs) {
+      if (profile.receiveVideoMode === "raw_h264_nalu") {
         const { peerId, timestamp, isKeyframe, h264Data } = parseRawNaluPacket(packet);
         const peerState = peerMediaStates.get(peerId);
         if (!peerState || peerState.videoPaused) return;
@@ -929,12 +987,10 @@ async function setupReceiveBridge(forceEventMode = false) {
 function disposeReceiveListeners() {
   unlistenDisconnect?.();
   unlistenDisconnect = null;
-  unlistenStats?.();
-  unlistenStats = null;
   unlistenQuality?.();
   unlistenQuality = null;
-  stopQualityWatch?.();
-  stopQualityWatch = null;
+  unlistenSendQuality?.();
+  unlistenSendQuality = null;
 }
 
 async function teardownReceiveBridge(clearBackend = true) {
@@ -953,31 +1009,6 @@ async function teardownReceiveBridge(clearBackend = true) {
     const invoke = await invokePromise;
     await invoke("clear_media_bridge", { sessionId }).catch(() => {});
   }
-}
-
-function updateConnectionQualityFromStats() {
-  const stats = Array.from(peerNetworkStats.values());
-  let next: "good" | "degraded" | "poor" = "good";
-
-  if (
-    stats.some((stat) =>
-      stat.latest_video_age_ms > 300 ||
-      stat.rtt_ms > 180 ||
-      stat.datagram_send_buffer_space < 4096,
-    )
-  ) {
-    next = "poor";
-  } else if (
-    stats.some((stat) =>
-      stat.latest_video_age_ms > 160 ||
-      stat.rtt_ms > 110 ||
-      stat.datagram_send_buffer_space < 16384,
-    )
-  ) {
-    next = "degraded";
-  }
-
-  connectionQuality.value = next;
 }
 
 function createMediaUploader(
@@ -1033,8 +1064,106 @@ function createMediaUploader(
         });
       });
     },
+    sendEncodedVideo: async (h264, timestamp) => {
+      if (preferJsonVideoInvoke) {
+        return await invoke<boolean>("send_encoded_video_all", { data: toBase64(h264), timestamp });
+      }
+      const payload = new Uint8Array(8 + h264.length);
+      new DataView(payload.buffer).setBigUint64(0, BigInt(timestamp), true);
+      payload.set(h264, 8);
+      return await invoke<boolean>("send_encoded_video_all", payload, {
+        headers: { "Content-Type": "application/octet-stream" },
+      });
+    },
     close: () => {},
   };
+}
+
+// ── In-webview H.264 encoding (Android) ─────────────────────────────
+// Android's IPC bridge can only carry JSON, so the RGBA path ships ~1.2 MB of
+// base64 per frame. Where the WebView can encode H.264 itself, only the
+// encoded frame (a few KB) crosses IPC and the capture canvas is never read
+// back. Falls back to the RGBA path if unsupported or the encoder fails.
+
+const WEB_ENCODER_CODEC = "avc1.42001f"; // Constrained Baseline 3.1: decodable by openh264 too
+let webEncoder: VideoEncoder | null = null;
+let webEncoderFailed = false;
+let webEncoderForceKeyframe = false;
+let webEncoderSendInFlight = false;
+let webEncoderConfigKey = "";
+
+function webEncoderConfig(): VideoEncoderConfig {
+  return {
+    codec: WEB_ENCODER_CODEC,
+    width: currentWidth,
+    height: currentHeight,
+    bitrate: effectiveProfile().bitrateBps,
+    framerate: targetFps,
+    latencyMode: "realtime",
+    avc: { format: "annexb" },
+  };
+}
+
+async function setupWebEncoder(): Promise<boolean> {
+  if (!isAndroid || webEncoderFailed || typeof VideoEncoder === "undefined") return false;
+  if (webEncoder) return true;
+  try {
+    const config = webEncoderConfig();
+    const support = await VideoEncoder.isConfigSupported(config);
+    if (!support.supported) {
+      webEncoderFailed = true;
+      return false;
+    }
+    const encoder = new VideoEncoder({
+      output(chunk) {
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        if (!mediaUploader) return;
+        webEncoderSendInFlight = true;
+        mediaUploader.sendEncodedVideo(data, Date.now())
+          .then((forceKeyframe) => { if (forceKeyframe) webEncoderForceKeyframe = true; })
+          .catch(() => {})
+          .finally(() => { webEncoderSendInFlight = false; });
+      },
+      error(e) {
+        console.warn("[transport] WebCodecs encoder failed; falling back to RGBA uploads", e);
+        webEncoderFailed = true;
+        closeWebEncoder();
+      },
+    });
+    encoder.configure(config);
+    webEncoderConfigKey = JSON.stringify(config);
+    webEncoder = encoder;
+    webEncoderForceKeyframe = true;
+    return true;
+  } catch (e) {
+    console.warn("[transport] WebCodecs encoder unavailable", e);
+    webEncoderFailed = true;
+    return false;
+  }
+}
+
+function reconfigureWebEncoder() {
+  if (!webEncoder || webEncoder.state !== "configured") return;
+  const config = webEncoderConfig();
+  const key = JSON.stringify(config);
+  if (key === webEncoderConfigKey) return;
+  try {
+    webEncoder.configure(config);
+    webEncoderConfigKey = key;
+    webEncoderForceKeyframe = true;
+  } catch (e) {
+    console.warn("[transport] WebCodecs encoder reconfigure failed", e);
+  }
+}
+
+function closeWebEncoder() {
+  if (webEncoder && webEncoder.state !== "closed") {
+    try { webEncoder.close(); } catch {}
+  }
+  webEncoder = null;
+  webEncoderConfigKey = "";
+  webEncoderSendInFlight = false;
 }
 
 export function useMediaTransport() {
@@ -1043,10 +1172,17 @@ export function useMediaTransport() {
     const { width, height } = resolveCaptureDimensions(stream);
     currentWidth = width;
     currentHeight = height;
-    targetFps = connectionQuality.value === "good" ? (isAndroid ? 8 : 12) : 8;
+    targetFps = effectiveProfile().fps;
     audioBufferPool = new BufferPool(8, () => new Int16Array(OPUS_FRAME_SAMPLES));
     videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
-    await invoke("init_codecs", { width, height });
+    // Encoder runs at the call-size profile; the backend's quality controller
+    // lowers bitrate/fps from there at runtime.
+    await invoke("init_codecs", {
+      width,
+      height,
+      bitrateBps: baseProfile.bitrateBps,
+      fps: baseProfile.fps,
+    });
   }
 
   async function syncSubscriptions(peerIds = peerIdsProvider?.() ?? []) {
@@ -1109,15 +1245,11 @@ export function useMediaTransport() {
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack) {
       captureCtx = new AudioContext({ sampleRate: 48000 });
-      if (captureCtx.state !== "running") {
-        try {
-          await captureCtx.resume();
-        } catch (error) {
-          const message = `Audio capture resume failed: ${error instanceof Error ? error.message : String(error)}`;
-          setTransportFailure(message);
-          await reportPlaybackStatus();
-          throw new Error(message);
-        }
+      const resumeCaptureOnGesture = keepContextRunning(captureCtx, "capture");
+      if (!(await resumeWithTimeout(captureCtx))) {
+        // Don't fail (or hang) the call: capture starts on the next gesture.
+        setTransportFailure("Microphone capture is waiting for user interaction");
+        resumeCaptureOnGesture();
       }
       const WORKLET_CODE = `
         class CaptureProcessor extends AudioWorkletProcessor {
@@ -1164,11 +1296,22 @@ export function useMediaTransport() {
             for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
               pcm[i] = Math.max(-32768, Math.min(32767, Math.round(sampleBuffer[i]! * 32767)));
             }
-            const sendPromise = mediaUploader?.sendAudio(new Uint8Array(pcm.buffer), Date.now());
-            if (sendPromise) {
-              sendPromise.catch(() => {}).finally(() => { audioBufferPool?.release(pcm); });
-            } else {
+            // Uploads are chained so frames reach the encoder in capture
+            // order; if IPC falls behind, shed the newest instead of queueing
+            // unbounded latency.
+            const uploader = mediaUploader;
+            if (!uploader || audioSendsPending >= MAX_PENDING_AUDIO_SENDS) {
               audioBufferPool?.release(pcm);
+            } else {
+              const timestamp = Date.now();
+              audioSendsPending++;
+              audioSendChain = audioSendChain
+                .then(() => uploader.sendAudio(new Uint8Array(pcm.buffer), timestamp))
+                .catch(() => {})
+                .finally(() => {
+                  audioSendsPending--;
+                  audioBufferPool?.release(pcm);
+                });
             }
             bufferOffset = 0;
           }
@@ -1211,35 +1354,54 @@ export function useMediaTransport() {
 
         const now = performance.now();
         const elapsed = now - lastCaptureTime;
-        if (elapsed >= 1000 / targetFps) {
+        // One frame in flight: while the previous upload/encode is still
+        // running, skip capture instead of queueing frames (and memory)
+        // behind a slow encoder or IPC bridge.
+        const busy = webEncoder
+          ? webEncoderSendInFlight || webEncoder.encodeQueueSize > 0
+          : videoSendInFlight;
+        if (elapsed >= 1000 / targetFps && !busy) {
           lastCaptureTime = now;
           const ctx = ensureCaptureSurface(currentWidth, currentHeight);
-          if (ctx && drawContainedVideoFrame(ctx, currentWidth, currentHeight)) {
-            const imageData = ctx.getImageData(0, 0, currentWidth, currentHeight);
+          if (ctx && captureCanvas && drawContainedVideoFrame(ctx, currentWidth, currentHeight)) {
             const keyframe = frameCount === 0 || frameCount % 48 === 0;
             frameCount += 1;
-            if (!videoFrameBufferPool) {
-              videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
-            }
-            const rgba = videoFrameBufferPool.acquire();
-            rgba.set(new Uint8Array(imageData.data.buffer));
-            const sendPromise = mediaUploader?.sendVideo(
-              rgba,
-              currentWidth,
-              currentHeight,
-              keyframe,
-              Date.now(),
-            );
-            if (sendPromise) {
-              sendPromise.catch(() => {}).finally(() => { videoFrameBufferPool?.release(rgba); });
-            } else {
-              videoFrameBufferPool?.release(rgba);
+            if (webEncoder && webEncoder.state === "configured") {
+              reconfigureWebEncoder();
+              const frame = new VideoFrame(captureCanvas, { timestamp: Math.round(now * 1000) });
+              try {
+                webEncoder.encode(frame, { keyFrame: keyframe || webEncoderForceKeyframe });
+                webEncoderForceKeyframe = false;
+              } finally {
+                frame.close();
+              }
+            } else if (mediaUploader) {
+              const imageData = ctx.getImageData(0, 0, currentWidth, currentHeight);
+              if (!videoFrameBufferPool) {
+                videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
+              }
+              const rgba = videoFrameBufferPool.acquire();
+              if (rgba.length !== imageData.data.length) {
+                videoFrameBufferPool = null;
+              } else {
+                rgba.set(imageData.data);
+                videoSendInFlight = true;
+                mediaUploader
+                  .sendVideo(rgba, currentWidth, currentHeight, keyframe, Date.now())
+                  .catch(() => {})
+                  .finally(() => {
+                    videoSendInFlight = false;
+                    videoFrameBufferPool?.release(rgba);
+                  });
+              }
             }
           }
         }
 
         captureRafId = requestAnimationFrame(rafCaptureLoop);
       };
+
+      await setupWebEncoder();
 
       const startCaptureLoop = () => {
         if (captureLoopStarted || !captureVideoEl) return;
@@ -1305,22 +1467,16 @@ export function useMediaTransport() {
       const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
       if (!pid) return;
       const state = peerMediaStates.get(pid);
-      if (state?.audioGainNode) {
-        try { state.audioGainNode.disconnect(); } catch {}
-      }
+      if (state) releasePeerAudio(state);
       forgetPeerVideoDecoderState(pid);
       peerMediaStates.delete(pid);
-      peerNetworkStats.delete(pid);
       initialKeyframeRequests.delete(pid);
       if (activeSpeaker.value === pid) activeSpeaker.value = null;
       updateSpeakingMap();
     });
 
-    unlistenStats = await listen<PeerNetworkStats>("network-stats", (event) => {
-      peerNetworkStats.set(event.payload.peer_id, event.payload);
-      updateConnectionQualityFromStats();
-    });
-
+    // Call-size profile: rebuild the encoder at the new base; the backend
+    // controller applies its congestion level on top.
     unlistenQuality = await listen<{
       peer_count: number;
       bitrate_bps: number;
@@ -1329,28 +1485,21 @@ export function useMediaTransport() {
       max_height: number;
     }>("quality-profile-changed", async (event) => {
       const { bitrate_bps, fps, max_width, max_height } = event.payload;
-      targetFps = fps;
-      const { width, height } = resolveCaptureDimensions(activeCaptureStream, {
+      baseProfile = {
+        bitrateBps: bitrate_bps,
+        fps: isAndroid ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
         maxWidth: max_width,
         maxHeight: max_height,
-      });
-      currentWidth = width;
-      currentHeight = height;
-      videoFrameBufferPool = null; // Will be lazily recreated with correct dimensions
-      clearCaptureSurface();
-      const invoke = await invokePromise;
-      await invoke("reinit_video_encoder_with_config", {
-        width,
-        height,
-        bitrateBps: bitrate_bps,
-        fps: fps as number,
-      });
+      };
+      await applyCaptureProfile({ rebuildEncoder: true });
     });
 
-    stopQualityWatch = watch(connectionQuality, async (quality) => {
-      targetFps = quality === "poor" ? 6 : quality === "degraded" ? 8 : (isAndroid ? 8 : 12);
-      const { width, height } = resolveCaptureDimensions(activeCaptureStream);
-      await updateCaptureDimensions(width, height);
+    // Single source of truth for outbound quality: the backend's controller
+    // (driven by skipped frames, loss and queueing delay — not raw RTT).
+    unlistenSendQuality = await listen<{ level: number }>("send-quality-changed", async (event) => {
+      sendLevel = event.payload.level;
+      connectionQuality.value = sendQualityForLevel(sendLevel);
+      await applyCaptureProfile({ rebuildEncoder: false });
     });
 
     startActiveSpeakerDetection();
@@ -1410,12 +1559,45 @@ export function useMediaTransport() {
     currentHeight = height;
     videoFrameBufferPool = null; // Will be lazily recreated with correct dimensions
     clearCaptureSurface();
+    if (webEncoder) return; // reconfigured on the next captured frame
     const invoke = await invokePromise;
-    await invoke("reinit_video_encoder", { width, height });
+    // Keeps the encoder's bitrate/fps profile; only the resolution changes.
+    await invoke("reinit_video_encoder", { width, height }).catch((e) => {
+      console.warn("[transport] reinit_video_encoder failed:", e);
+    });
+  }
+
+  // Point capture (and the encoder, when the base profile changed) at
+  // base profile + controller level.
+  async function applyCaptureProfile({ rebuildEncoder }: { rebuildEncoder: boolean }) {
+    const profile = effectiveProfile();
+    targetFps = profile.fps;
+    const { width, height } = resolveCaptureDimensions(activeCaptureStream, profile);
+    if (!rebuildEncoder || webEncoder) {
+      await updateCaptureDimensions(width, height);
+      return;
+    }
+    currentWidth = width;
+    currentHeight = height;
+    videoFrameBufferPool = null;
+    clearCaptureSurface();
+    const invoke = await invokePromise;
+    await invoke("reinit_video_encoder_with_config", {
+      width,
+      height,
+      bitrateBps: baseProfile.bitrateBps,
+      fps: baseProfile.fps,
+    }).catch((e) => {
+      console.warn("[transport] reinit_video_encoder_with_config failed:", e);
+    });
   }
 
   function teardownCapture() {
     encoding.value = false;
+    closeWebEncoder();
+    videoSendInFlight = false;
+    audioSendsPending = 0;
+    audioSendChain = Promise.resolve();
     if (captureRafId !== null) {
       cancelAnimationFrame(captureRafId);
       captureRafId = null;
@@ -1464,21 +1646,18 @@ export function useMediaTransport() {
     teardownCapture();
     await teardownReceiveBridge(true);
 
+    for (const [, state] of peerMediaStates) releasePeerAudio(state);
     if (playbackCtx) {
-      await playbackCtx.close();
+      await playbackCtx.close().catch(() => {});
       playbackCtx = null;
+      // The worklet module belongs to the closed context.
+      playbackWorkletLoaded = null;
     }
     if (activeSpeakerInterval) {
       clearInterval(activeSpeakerInterval);
       activeSpeakerInterval = null;
     }
     disposeReceiveListeners();
-
-    for (const [, state] of peerMediaStates) {
-      if (state.audioGainNode) {
-        try { state.audioGainNode.disconnect(); } catch {}
-      }
-    }
 
     for (const peerId of peerVideoDecoders.keys()) {
       destroyVideoDecoder(peerId);
@@ -1497,13 +1676,16 @@ export function useMediaTransport() {
     }
 
     peerMediaStates.clear();
-    peerNetworkStats.clear();
     initialKeyframeRequests.clear();
     activeSpeaker.value = null;
     peerSpeakingMap.value = {};
     peerIdsProvider = null;
 
     connectionQuality.value = "good";
+    baseProfile = { ...DEFAULT_PROFILE };
+    sendLevel = 0;
+    targetFps = DEFAULT_PROFILE.fps;
+    webEncoderFailed = false;
     audioBufferPool = null;
     videoFrameBufferPool = null;
 

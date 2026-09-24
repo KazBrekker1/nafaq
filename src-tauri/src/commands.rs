@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use base64::Engine;
-use tauri::{ipc::Channel, Emitter, State};
+use tauri::{
+    ipc::{Channel, InvokeResponseBody},
+    Emitter, State,
+};
 use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
@@ -122,6 +125,17 @@ pub async fn join_call(
     Ok(peer_id)
 }
 
+/// The local user left the call screen: stop accepting inbound call dials
+/// for our ticket. Covers the paths where no `end_call` runs because the
+/// remote side already hung up (or nobody ever joined).
+#[tauri::command]
+pub async fn leave_call_session(state: State<'_, AppState>) -> Result<(), String> {
+    if state.conn_manager.peer_count().await == 0 {
+        state.conn_manager.set_call_session_active(false);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn end_call(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
     validate_peer_id(&peer_id)?;
@@ -224,8 +238,8 @@ pub async fn send_control(
 #[tauri::command]
 pub async fn register_media_bridge(
     registration: MediaBridgeRegistrationRequest,
-    audio: Channel<Vec<u8>>,
-    video: Channel<Vec<u8>>,
+    audio: Channel<InvokeResponseBody>,
+    video: Channel<InvokeResponseBody>,
     bridge: State<'_, MediaBridgeState>,
 ) -> Result<MediaSessionProfile, String> {
     if registration.session_id.is_empty() {
@@ -360,7 +374,7 @@ pub async fn probe_media_bridge(
     match current.profile.receive_bridge_mode {
         MediaBridgeMode::ChannelBinary => {
             if let Some(channel) = current.audio_channel {
-                let _ = channel.send(pack_audio_probe_packet());
+                let _ = channel.send(InvokeResponseBody::Raw(pack_audio_probe_packet()));
             } else {
                 return Err("Missing audio probe channel".into());
             }
@@ -381,19 +395,36 @@ pub async fn probe_media_bridge(
     Ok(())
 }
 
+/// `bitrate_bps`/`fps` are the current call-size profile; omitted means the
+/// default 1:1 profile.
 #[tauri::command]
 pub async fn init_codecs(
     width: u32,
     height: u32,
+    bitrate_bps: Option<u32>,
+    fps: Option<f32>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
+    let (bitrate_bps, fps) = validate_rate(bitrate_bps.unwrap_or(400_000), fps.unwrap_or(12.0))?;
     *state.audio_codec.encoder.lock().await = Some(AudioEncoder::new().map_err(|e| e.to_string())?);
     // Audio decoders are created per-peer on demand — no init needed
-    *state.video_codec.encoder.lock().await =
-        Some(VideoEncoder::new(width, height).map_err(|e| e.to_string())?);
-    tracing::info!("Codecs initialized: {width}x{height}");
+    *state.video_codec.encoder.lock().await = Some(
+        VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
+            .map_err(|e| e.to_string())?,
+    );
+    tracing::info!("Codecs initialized: {width}x{height} @ {bitrate_bps}bps {fps}fps");
     Ok(())
+}
+
+fn validate_rate(bitrate_bps: u32, fps: f32) -> Result<(u32, f32), String> {
+    if !(50_000..=4_000_000).contains(&bitrate_bps) {
+        return Err(format!("Invalid bitrate {bitrate_bps}"));
+    }
+    if !(1.0..=60.0).contains(&fps) {
+        return Err(format!("Invalid fps {fps}"));
+    }
+    Ok((bitrate_bps, fps))
 }
 
 #[tauri::command]
@@ -406,6 +437,7 @@ pub async fn destroy_codecs(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolution change only: keeps the encoder's current bitrate/fps profile.
 #[tauri::command]
 pub async fn reinit_video_encoder(
     width: u32,
@@ -413,8 +445,15 @@ pub async fn reinit_video_encoder(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
-    *state.video_codec.encoder.lock().await =
-        Some(VideoEncoder::new(width, height).map_err(|e| e.to_string())?);
+    let mut guard = state.video_codec.encoder.lock().await;
+    let (bitrate_bps, fps) = guard
+        .as_ref()
+        .map(|e| (e.base_bitrate_bps(), e.base_fps()))
+        .unwrap_or((400_000, 12.0));
+    *guard = Some(
+        VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
+            .map_err(|e| e.to_string())?,
+    );
     tracing::info!("Video encoder reinitialized: {width}x{height}");
     Ok(())
 }
@@ -428,6 +467,7 @@ pub async fn reinit_video_encoder_with_config(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
+    let (bitrate_bps, fps) = validate_rate(bitrate_bps, fps)?;
     *state.video_codec.encoder.lock().await = Some(
         VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
             .map_err(|e| e.to_string())?,
@@ -904,6 +944,49 @@ pub async fn send_video_all(
     }
 }
 
+/// Forward a frame the webview already encoded (WebCodecs `VideoEncoder`,
+/// Annex B H.264). Used on Android, where shipping raw RGBA over the JSON IPC
+/// bridge costs ~1.2 MB of base64 per frame. Returns whether the next frame
+/// must be a keyframe (a peer asked for one, or a writer lost its chain).
+#[tauri::command]
+pub async fn send_encoded_video_all(
+    request: tauri::ipc::Request<'_>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let (timestamp, payload) = match request.body() {
+        // [ts:u64LE][annex-b...]
+        tauri::ipc::InvokeBody::Raw(data) => {
+            if data.len() <= 8 {
+                return Err("Payload too short".into());
+            }
+            let timestamp = u64::from_le_bytes(data[..8].try_into().unwrap());
+            (timestamp, data[8..].to_vec())
+        }
+        tauri::ipc::InvokeBody::Json(value) => {
+            let data_b64 = value
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or("Missing data")?;
+            let timestamp = value.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0);
+            let payload = B64
+                .decode(data_b64)
+                .map_err(|e| format!("base64 decode error: {e}"))?;
+            (timestamp, payload)
+        }
+    };
+    if payload.len() > crate::video_transport::MAX_VIDEO_FRAME_BYTES {
+        return Err("Encoded frame too large".into());
+    }
+    if state.conn_manager.has_peers().await {
+        state
+            .conn_manager
+            .send_video_frame_all(&payload, timestamp)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(state.conn_manager.consume_pending_keyframe_requests().await)
+}
+
 async fn encode_and_send_video_all(
     state: &AppState,
     rgba: &[u8],
@@ -914,14 +997,18 @@ async fn encode_and_send_video_all(
 ) -> Result<(), String> {
     let force_keyframe = state.conn_manager.consume_pending_keyframe_requests().await;
 
-    let encoded = {
-        let mut video = state.video_codec.encoder.lock().await;
-        let encoder = match video.as_mut() {
-            Some(encoder) => encoder,
-            None => return Ok(()),
-        };
-        encoder.encode(rgba, width, height, keyframe || force_keyframe)
-    };
+    // RGBA→YUV + H.264 encode is tens of ms of CPU: keep it off the async
+    // worker threads so it can't stall networking tasks.
+    let codec = state.video_codec.clone();
+    let rgba = rgba.to_vec();
+    let encoded = tokio::task::spawn_blocking(move || {
+        let mut video = codec.encoder.blocking_lock();
+        video
+            .as_mut()
+            .and_then(|encoder| encoder.encode(&rgba, width, height, keyframe || force_keyframe))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
 
     if let Some(encoded) = encoded {
         state
