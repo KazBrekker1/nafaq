@@ -85,7 +85,7 @@ pub async fn monitor_relay(
             // Jitter up to +25% so clients that lost the relay together (e.g.
             // a relay restart) don't all retry on the same deterministic ticks.
             let jitter_ms = if current.as_millis() > 0 {
-                use rand::Rng;
+                use rand::RngExt;
                 rand::rng().random_range(0..=(current.as_millis() as u64 / 4))
             } else {
                 0

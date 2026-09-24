@@ -45,7 +45,7 @@ Audio is captured via Web Audio worklets, video via canvas frame capture. Both a
 | **Frontend**  | Nuxt 4 · Vue 3 · Nuxt UI |
 | **Desktop**   | Tauri 2                  |
 | **Mobile**    | Tauri 2 (Android)        |
-| **Transport** | Iroh 0.97 (QUIC)         |
+| **Transport** | Iroh 1.2 (QUIC)          |
 | **Audio**     | Opus                     |
 | **Video**     | H.264 (OpenH264)         |
 
