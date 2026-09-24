@@ -366,31 +366,6 @@ function fromBase64(b64: string): Uint8Array {
   return bytes;
 }
 
-class BufferPool<T extends Int16Array | Uint8Array> {
-  private pool: T[] = [];
-  private factory: () => T;
-
-  constructor(size: number, factory: () => T) {
-    this.factory = factory;
-    for (let i = 0; i < size; i++) {
-      this.pool.push(factory());
-    }
-  }
-
-  acquire(): T {
-    return this.pool.pop() ?? this.factory();
-  }
-
-  release(buf: T) {
-    if (this.pool.length < 16) {
-      this.pool.push(buf);
-    }
-  }
-}
-
-let audioBufferPool: BufferPool<Int16Array> | null = null;
-let videoFrameBufferPool: BufferPool<Uint8Array> | null = null;
-
 // Tauri Channel<Vec<u8>> serializes as JSON array, not ArrayBuffer.
 function toArrayBuffer(data: unknown): ArrayBuffer {
   if (data instanceof ArrayBuffer) return data;
@@ -1199,8 +1174,6 @@ export function useMediaTransport() {
     currentWidth = width;
     currentHeight = height;
     targetFps = effectiveProfile().fps;
-    audioBufferPool = new BufferPool(8, () => new Int16Array(OPUS_FRAME_SAMPLES));
-    videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
     // Encoder runs at the (user-capped) call-size profile; the backend's
     // quality controller lowers bitrate/fps from there at runtime.
     await invoke("init_codecs", {
@@ -1333,17 +1306,15 @@ export function useMediaTransport() {
           srcOffset += toCopy;
 
           if (bufferOffset === OPUS_FRAME_SAMPLES) {
-            const pcm = audioBufferPool?.acquire() ?? new Int16Array(OPUS_FRAME_SAMPLES);
-            for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
-              pcm[i] = Math.max(-32768, Math.min(32767, Math.round(sampleBuffer[i]! * 32767)));
-            }
             // Uploads are chained so frames reach the encoder in capture
             // order; if IPC falls behind, shed the newest instead of queueing
             // unbounded latency.
             const uploader = mediaUploader;
-            if (!uploader || audioSendsPending >= MAX_PENDING_AUDIO_SENDS) {
-              audioBufferPool?.release(pcm);
-            } else {
+            if (uploader && audioSendsPending < MAX_PENDING_AUDIO_SENDS) {
+              const pcm = new Int16Array(OPUS_FRAME_SAMPLES);
+              for (let i = 0; i < OPUS_FRAME_SAMPLES; i++) {
+                pcm[i] = Math.max(-32768, Math.min(32767, Math.round(sampleBuffer[i]! * 32767)));
+              }
               const timestamp = Date.now();
               audioSendsPending++;
               audioSendChain = audioSendChain
@@ -1351,7 +1322,6 @@ export function useMediaTransport() {
                 .catch(() => {})
                 .finally(() => {
                   audioSendsPending--;
-                  audioBufferPool?.release(pcm);
                 });
             }
             bufferOffset = 0;
@@ -1420,24 +1390,16 @@ export function useMediaTransport() {
                 frame.close();
               }
             } else if (mediaUploader) {
-              const imageData = ctx.getImageData(0, 0, currentWidth, currentHeight);
-              if (!videoFrameBufferPool) {
-                videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
-              }
-              const rgba = videoFrameBufferPool.acquire();
-              if (rgba.length !== imageData.data.length) {
-                videoFrameBufferPool = null;
-              } else {
-                rgba.set(imageData.data);
-                videoSendInFlight = true;
-                mediaUploader
-                  .sendVideo(rgba, currentWidth, currentHeight, keyframe, Date.now())
-                  .catch(() => {})
-                  .finally(() => {
-                    videoSendInFlight = false;
-                    videoFrameBufferPool?.release(rgba);
-                  });
-              }
+              // getImageData returns a fresh buffer each call — send it as is.
+              const { data } = ctx.getImageData(0, 0, currentWidth, currentHeight);
+              const rgba = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              videoSendInFlight = true;
+              mediaUploader
+                .sendVideo(rgba, currentWidth, currentHeight, keyframe, Date.now())
+                .catch(() => {})
+                .finally(() => {
+                  videoSendInFlight = false;
+                });
             }
           }
         }
@@ -1621,7 +1583,6 @@ export function useMediaTransport() {
     if (width === currentWidth && height === currentHeight) return;
     currentWidth = width;
     currentHeight = height;
-    videoFrameBufferPool = null; // Will be lazily recreated with correct dimensions
     clearCaptureSurface();
     if (webEncoder) return; // reconfigured on the next captured frame
     const invoke = await invokePromise;
@@ -1643,7 +1604,6 @@ export function useMediaTransport() {
     }
     currentWidth = width;
     currentHeight = height;
-    videoFrameBufferPool = null;
     clearCaptureSurface();
     const invoke = await invokePromise;
     await invoke("reinit_video_encoder_with_config", {
@@ -1751,8 +1711,6 @@ export function useMediaTransport() {
     sendLevel = 0;
     targetFps = DEFAULT_PROFILE.fps;
     webEncoderFailed = false;
-    audioBufferPool = null;
-    videoFrameBufferPool = null;
     receiveState = "idle";
   }
 
