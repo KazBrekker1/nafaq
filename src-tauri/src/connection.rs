@@ -748,10 +748,11 @@ impl Drop for ConnectingReservation {
     }
 }
 
-/// Per-peer inbound video state. Scoped to one connection: sequence numbers
-/// restart on every new connection, so a reconnect gets a fresh buffer.
+/// Inbound video state of one call connection. Owned by that connection's
+/// receiver tasks: sequence numbers restart on every new connection, so a
+/// reconnect naturally gets a fresh buffer and nothing needs cleaning up.
+#[derive(Default)]
 struct VideoReceiveState {
-    connection_id: usize,
     reorder: VideoReorderBuffer,
     last_keyframe_request: Option<std::time::Instant>,
 }
@@ -787,7 +788,6 @@ pub struct ConnectionManager {
     endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
     latest_ticket: Arc<Mutex<Option<String>>>,
     peer_tickets: Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-    video_receive_state: Arc<Mutex<HashMap<String, VideoReceiveState>>>,
     event_tx: broadcast::Sender<Event>,
     audio_media_tx: broadcast::Sender<AudioPacket>,
     video_media_tx: broadcast::Sender<VideoPacket>,
@@ -884,7 +884,6 @@ impl ConnectionManager {
             endpoint: Arc::new(Mutex::new(None)),
             latest_ticket,
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
-            video_receive_state: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audio_media_tx,
             video_media_tx,
@@ -1115,7 +1114,6 @@ impl ConnectionManager {
             &self.peers,
             &self.dm_peers,
             &self.peer_tickets,
-            &self.video_receive_state,
             &self.event_tx,
             Some(reason),
             Some(expected_connection_id),
@@ -2015,7 +2013,6 @@ impl ConnectionManager {
         peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
         dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
         peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-        video_receive_state: &Arc<Mutex<HashMap<String, VideoReceiveState>>>,
         event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
         expected_connection_id: Option<usize>,
@@ -2026,7 +2023,6 @@ impl ConnectionManager {
             peers,
             dm_peers,
             peer_tickets,
-            video_receive_state,
             event_tx,
             close_reason,
             expected_connection_id,
@@ -2044,7 +2040,6 @@ impl ConnectionManager {
         peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
         dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
         peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-        video_receive_state: &Arc<Mutex<HashMap<String, VideoReceiveState>>>,
         event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
         expected_connection_id: Option<usize>,
@@ -2085,7 +2080,6 @@ impl ConnectionManager {
             peer.connection.close(0u32.into(), reason);
         }
 
-        video_receive_state.lock().await.remove(peer_id);
 
         // A SharedCall DM rides the QUIC connection we just tore down; no DM
         // cleanup path observes call teardowns, so evict it here or the entry
@@ -2208,8 +2202,8 @@ impl ConnectionManager {
         let video_media_tx = self.video_media_tx.clone();
         let peers_ref = self.peers.clone();
         let peer_tickets_ref = self.peer_tickets.clone();
-        let video_state_ref = self.video_receive_state.clone();
-        let video_state_ref_uni = video_state_ref.clone();
+        // Per-connection: dies with this connection's receiver tasks.
+        let video_state_uni = Arc::new(StdMutex::new(VideoReceiveState::default()));
         let event_tx_cleanup = self.event_tx.clone();
         let peer_id_uni = peer_id.clone();
         let connection_uni = connection.clone();
@@ -2224,7 +2218,7 @@ impl ConnectionManager {
                         let peer_id = peer_id_uni.clone();
                         let audio_tx = audio_media_tx.clone();
                         let video_tx = video_media_tx.clone();
-                        let video_state_ref = video_state_ref_uni.clone();
+                        let video_state = video_state_uni.clone();
                         let peers_ref = peers_ref_uni.clone();
                         let manager = manager_uni.clone();
                         tokio::spawn(async move {
@@ -2289,21 +2283,9 @@ impl ConnectionManager {
                                     };
                                     let now = std::time::Instant::now();
                                     let (ready, request_keyframe) = {
-                                        let mut states = video_state_ref.lock().await;
-                                        let state = states
-                                            .entry(peer_id.clone())
-                                            .or_insert_with(|| VideoReceiveState {
-                                                connection_id,
-                                                reorder: VideoReorderBuffer::new(),
-                                                last_keyframe_request: None,
-                                            });
-                                        if state.connection_id != connection_id {
-                                            *state = VideoReceiveState {
-                                                connection_id,
-                                                reorder: VideoReorderBuffer::new(),
-                                                last_keyframe_request: None,
-                                            };
-                                        }
+                                        let mut state = video_state
+                                            .lock()
+                                            .unwrap_or_else(|poison| poison.into_inner());
                                         let out = state.reorder.push(frame, now);
                                         let request = out.need_keyframe
                                             && state.last_keyframe_request.is_none_or(|at| {
@@ -2378,7 +2360,6 @@ impl ConnectionManager {
         let peers_ref_closed = peers_ref.clone();
         let dm_peers_ref_closed = self.dm_peers.clone();
         let peer_tickets_ref = peer_tickets_ref.clone();
-        let video_state_ref = video_state_ref.clone();
         let event_tx_cleanup_closed = event_tx_cleanup.clone();
         let peer_id_closed = peer_id.clone();
         let connection_closed = connection.clone();
@@ -2410,7 +2391,6 @@ impl ConnectionManager {
                 &peers_ref_closed,
                 &dm_peers_ref_closed,
                 &peer_tickets_ref,
-                &video_state_ref,
                 &event_tx_cleanup_closed,
                 None,
                 Some(connection_closed_id),
@@ -2995,8 +2975,7 @@ impl ConnectionManager {
                 &self.peers,
                 &self.dm_peers,
                 &self.peer_tickets,
-                &self.video_receive_state,
-                &self.event_tx,
+                    &self.event_tx,
                 Some(b"peer timeout"),
                 None,
                 false, // reconnect attempts exhausted — forget the ticket
@@ -3401,7 +3380,6 @@ impl ConnectionManager {
             &self.peers,
             &self.dm_peers,
             &self.peer_tickets,
-            &self.video_receive_state,
             &self.event_tx,
             Some(b"call ended"),
             None,
@@ -4192,7 +4170,6 @@ mod tests {
             &manager.peers,
             &manager.dm_peers,
             &manager.peer_tickets,
-            &manager.video_receive_state,
             &manager.event_tx,
             None,
             Some(12345),
