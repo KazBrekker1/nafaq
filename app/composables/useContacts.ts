@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { truncateNodeId } from "~/utils/format";
 
 export interface Contact {
@@ -9,40 +10,48 @@ export interface Contact {
 }
 
 const contacts = ref<Contact[]>([]);
-const loaded = ref(false);
-let loadPromise: Promise<void> | null = null;
+// Startup load, shared by the many useContacts() callers. Reset on failure so
+// the next caller retries.
+let initialLoad: Promise<void> | null = null;
+// Bumped by every write to `contacts`, so a slower, older get_contacts
+// response can never overwrite a newer list.
+let revision = 0;
+
+async function fetchContacts(): Promise<boolean> {
+  const token = ++revision;
+  try {
+    const list = await invoke<Contact[]>("get_contacts");
+    if (token === revision) contacts.value = list;
+    return true;
+  } catch (e) {
+    console.warn("[contacts] get_contacts failed:", e);
+    return false;
+  }
+}
+
+// add_contact/remove_contact return the updated list; fall back to a fresh
+// fetch (never a possibly-stale in-flight one) if a backend doesn't.
+async function applyMutationResult(result: unknown) {
+  if (Array.isArray(result)) {
+    revision += 1;
+    contacts.value = result as Contact[];
+  } else {
+    await fetchContacts();
+  }
+}
 
 export function useContacts() {
-  function load(): Promise<void> {
-    // Cache the in-flight promise: several composables call useContacts() at
-    // startup and would otherwise each fire their own get_contacts invoke.
-    if (!loadPromise) {
-      loadPromise = (async () => {
-        const { invoke } = await import("@tauri-apps/api/core");
-        contacts.value = await invoke<Contact[]>("get_contacts").catch(() => []);
-        loaded.value = true;
-      })().finally(() => {
-        loadPromise = null;
-      });
-    }
-    return loadPromise;
-  }
-
   async function add(contact: Contact) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("add_contact", { contact });
-    await load(); // Refresh from store
+    await applyMutationResult(await invoke<Contact[] | null>("add_contact", { contact }));
   }
 
   async function remove(nodeId: string) {
-    const { invoke } = await import("@tauri-apps/api/core");
     try {
-      await invoke("remove_contact", { nodeId });
-      contacts.value = contacts.value.filter(c => c.node_id !== nodeId);
+      await applyMutationResult(await invoke<Contact[] | null>("remove_contact", { nodeId }));
     } catch (e) {
       // Backend still has the contact; reload instead of showing a ghost removal.
       console.warn("[contacts] remove failed:", e);
-      await load();
+      await fetchContacts();
     }
   }
 
@@ -62,7 +71,9 @@ export function useContacts() {
     return truncateNodeId(nodeId);
   }
 
-  if (!loaded.value) void load();
+  initialLoad ??= fetchContacts().then((ok) => {
+    if (!ok) initialLoad = null;
+  });
 
-  return { contacts, loaded, add, remove, starFromCall, displayName };
+  return { contacts, add, remove, starFromCall, displayName };
 }
