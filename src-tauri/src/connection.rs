@@ -134,17 +134,47 @@ fn is_valid_transfer_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Reduce a peer-supplied file name to a safe basename. `Path::join` with an
-/// absolute path replaces the base entirely, so the raw name must never reach
-/// a join — strip directories, control chars, and leading dots.
+/// Reduce a peer-supplied file name to a safe basename that is valid on every
+/// platform we run on. `Path::join` with an absolute path replaces the base
+/// entirely, so the raw name must never reach a join — strip directories,
+/// control chars and leading dots. Windows additionally forbids `<>:"|?*`
+/// (`:` also selects an NTFS alternate data stream), silently drops trailing
+/// dots/spaces, and maps reserved device names (`CON`, `COM1`, … — with any
+/// extension) to devices rather than files.
 fn sanitize_file_name(name: &str) -> String {
+    const FALLBACK: &str = "download";
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let cleaned: String = base.chars().filter(|c| !c.is_control()).take(200).collect();
-    let trimmed = cleaned.trim_start_matches(['.', ' ']).trim_end();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .take(200)
+        .collect();
+    let trimmed = cleaned
+        .trim_start_matches(['.', ' '])
+        .trim_end_matches(['.', ' ']);
     if trimmed.is_empty() {
-        "download".to_string()
-    } else {
-        trimmed.to_string()
+        return FALLBACK.to_string();
+    }
+    if is_windows_reserved_name(trimmed) {
+        return format!("_{trimmed}");
+    }
+    trimmed.to_string()
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, case-insensitive,
+/// with or without an extension (`nul.txt` is still the NUL device).
+fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    match upper.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let bytes = upper.as_bytes();
+            bytes.len() == 4
+                && (upper.starts_with("COM") || upper.starts_with("LPT"))
+                && (b'1'..=b'9').contains(&bytes[3])
+        }
     }
 }
 
@@ -290,6 +320,17 @@ async fn handle_dm_file_message(
                 let _ = tokio::fs::create_dir_all(&downloads_dir).await;
 
                 let final_path = unique_file_path(&downloads_dir, &recv.final_name);
+                // Belt and braces on top of sanitize_file_name: the file must
+                // land directly in the downloads directory, nowhere else.
+                if final_path.parent() != Some(downloads_dir.as_path()) {
+                    tracing::warn!(
+                        "Refusing to save transfer {id}: {} escapes {}",
+                        final_path.display(),
+                        downloads_dir.display()
+                    );
+                    let _ = tokio::fs::remove_file(&recv.temp_path).await;
+                    return false;
+                }
 
                 match tokio::fs::rename(&recv.temp_path, &final_path).await {
                     Ok(()) => {
@@ -3353,6 +3394,53 @@ mod tests {
         let peer_id = mgr_b.connect_to_peer(&endpoint_b, addr_a).await.unwrap();
 
         (mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id)
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_directories_and_leading_dots() {
+        assert_eq!(sanitize_file_name("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name("..\\..\\evil.exe"), "evil.exe");
+        assert_eq!(sanitize_file_name("../.bashrc"), "bashrc");
+        assert_eq!(sanitize_file_name("C:\\Windows\\win.ini"), "win.ini");
+        assert_eq!(sanitize_file_name("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn sanitize_file_name_replaces_windows_forbidden_and_control_chars() {
+        assert_eq!(sanitize_file_name("a<b>c:d\"e|f?g*h.txt"), "a_b_c_d_e_f_g_h.txt");
+        assert_eq!(sanitize_file_name("file.txt:stream"), "file.txt_stream");
+        assert_eq!(sanitize_file_name("tab\there\u{7}.txt"), "tabhere.txt");
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_file_name("name.txt. . "), "name.txt");
+        assert_eq!(sanitize_file_name("  spaced  "), "spaced");
+    }
+
+    #[test]
+    fn sanitize_file_name_rejects_empty_names() {
+        for name in ["", "   ", "...", ". .", "/", "dir/", "\\", "\u{1}\u{2}"] {
+            assert_eq!(sanitize_file_name(name), "download", "input {name:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_file_name_rejects_windows_reserved_device_names() {
+        for name in [
+            "CON", "con", "Prn", "AUX", "nul", "COM1", "com9", "LPT1", "lpt9", "nul.txt",
+            "CON.tar.gz", "aux .log", "com3.",
+        ] {
+            let sanitized = sanitize_file_name(name);
+            assert!(
+                !is_windows_reserved_name(&sanitized),
+                "{name:?} sanitized to reserved {sanitized:?}"
+            );
+            assert!(sanitized.starts_with('_'), "{name:?} -> {sanitized:?}");
+        }
+        for name in ["COM0", "COM10", "LPT", "console.txt", "nullable", "auxiliary.md"] {
+            assert_eq!(sanitize_file_name(name), name);
+        }
     }
 
     #[test]
