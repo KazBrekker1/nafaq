@@ -1,48 +1,44 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
 export type RelayStatus = "starting" | "connecting" | "online" | "degraded" | "offline";
 export type PeerConnectionStatus = "idle" | "connecting" | "connected" | "suspect" | "reconnecting" | "disconnected" | "failed";
 
+// get_node_info returns a camelCase struct (commands.rs NodeInfo); the events
+// below are messages.rs `Event` variants, whose fields stay snake_case.
 interface NodeInfoResponse {
   id: string;
   ticket: string | null;
   relayStatus?: RelayStatus;
-  relay_status?: RelayStatus;
 }
 
 interface RelayStatusChangedPayload {
-  type?: string;
   status?: RelayStatus;
-  relayStatus?: RelayStatus;
-  relay_status?: RelayStatus;
-  nodeId?: string;
   node_id?: string;
-  ticketAvailable?: boolean;
   ticket_available?: boolean;
   message?: string | null;
 }
 
 interface TicketRefreshedPayload {
-  type?: string;
   ticket?: string | null;
 }
 
 interface PeerConnectionStatusChangedPayload {
-  type?: string;
-  peerId?: string;
   peer_id?: string;
   status?: PeerConnectionStatus;
-  reason?: string | null;
 }
 
 const nodeId = ref<string | null>(null);
 const relayStatus = ref<RelayStatus>("starting");
 const ticket = ref<string | null>(null);
-const shareTicket = ticket;
 const nodeError = ref<string | null>(null);
 const peerConnectionStatuses = ref<Record<string, PeerConnectionStatus>>({});
 
-let initialized = false;
 let initPromise: Promise<void> | null = null;
-let runtimeEventRevision = 0;
+// Per-field event counters: the get_node_info snapshot only overwrites a
+// field no event has touched since the snapshot was requested.
+let ticketRev = 0;
+let statusRev = 0;
 let unlisteners: Array<() => void> = [];
 
 function normalizeRelayStatus(value: unknown): RelayStatus | null {
@@ -74,77 +70,72 @@ function normalizePeerStatus(value: unknown): PeerConnectionStatus | null {
 }
 
 function applyRelayStatus(payload: RelayStatusChangedPayload) {
-  const status = normalizeRelayStatus(payload.status ?? payload.relayStatus ?? payload.relay_status);
-  if (status) relayStatus.value = status;
-
-  const nextNodeId = payload.nodeId ?? payload.node_id;
-  if (typeof nextNodeId === "string" && nextNodeId.length > 0) {
-    nodeId.value = nextNodeId;
+  const status = normalizeRelayStatus(payload.status);
+  if (status) {
+    statusRev += 1;
+    relayStatus.value = status;
+    // "connecting" is transient, not an error; only degraded/offline carry one.
+    nodeError.value = status === "degraded" || status === "offline" ? payload.message ?? null : null;
   }
 
-  const ticketAvailable = payload.ticketAvailable ?? payload.ticket_available;
-  if (ticketAvailable === false || (status !== null && status !== "online")) {
+  if (typeof payload.node_id === "string" && payload.node_id.length > 0) {
+    nodeId.value = payload.node_id;
+  }
+
+  if (payload.ticket_available === false || (status !== null && status !== "online")) {
+    ticketRev += 1;
     ticket.value = null;
   }
-
-  nodeError.value = payload.message ?? null;
 }
 
 function applyTicket(payload: TicketRefreshedPayload) {
   if (typeof payload.ticket === "string" && payload.ticket.length > 0) {
+    ticketRev += 1;
     ticket.value = payload.ticket;
     nodeError.value = null;
   }
 }
 
 async function init(): Promise<void> {
-  if (initPromise) return initPromise;
-
-  initPromise = (async () => {
-    if (!import.meta.client || initialized) return;
-    initialized = true;
-
+  initPromise ??= (async () => {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const { listen } = await import("@tauri-apps/api/event");
+      // All listeners are live before the snapshot is requested, so anything
+      // emitted meanwhile is either in the snapshot or seen as an event.
+      unlisteners.push(...await Promise.all([
+        listen<RelayStatusChangedPayload>("relay-status-changed", (event) => {
+          applyRelayStatus(event.payload ?? {});
+        }),
+        listen<TicketRefreshedPayload>("ticket-refreshed", (event) => {
+          applyTicket(event.payload ?? {});
+        }),
+        listen<PeerConnectionStatusChangedPayload>("peer-connection-status-changed", (event) => {
+          const peerId = event.payload?.peer_id;
+          const status = normalizePeerStatus(event.payload?.status);
+          if (peerId && status) {
+            peerConnectionStatuses.value = { ...peerConnectionStatuses.value, [peerId]: status };
+          }
+        }),
+      ]));
 
-      unlisteners.push(await listen<RelayStatusChangedPayload>("relay-status-changed", (event) => {
-        runtimeEventRevision += 1;
-        applyRelayStatus(event.payload ?? {});
-      }));
-
-      unlisteners.push(await listen<TicketRefreshedPayload>("ticket-refreshed", (event) => {
-        runtimeEventRevision += 1;
-        applyTicket(event.payload ?? {});
-      }));
-
-      unlisteners.push(await listen<PeerConnectionStatusChangedPayload>("peer-connection-status-changed", (event) => {
-        const payload = event.payload ?? {};
-        const peerId = payload.peerId ?? payload.peer_id;
-        const status = normalizePeerStatus(payload.status);
-        if (peerId && status) {
-          peerConnectionStatuses.value = { ...peerConnectionStatuses.value, [peerId]: status };
-        }
-      }));
-
-      const snapshotRevision = runtimeEventRevision;
+      const snapshotTicketRev = ticketRev;
+      const snapshotStatusRev = statusRev;
       const info = await invoke<NodeInfoResponse>("get_node_info");
 
       if (typeof info.id === "string" && info.id.length > 0) {
         nodeId.value = info.id;
       }
-
-      if (runtimeEventRevision === snapshotRevision) {
-        relayStatus.value = normalizeRelayStatus(info.relayStatus ?? info.relay_status) ?? relayStatus.value;
-        ticket.value = info.ticket;
+      if (statusRev === snapshotStatusRev) {
+        relayStatus.value = normalizeRelayStatus(info.relayStatus) ?? relayStatus.value;
         nodeError.value = null;
+      }
+      if (ticketRev === snapshotTicketRev) {
+        ticket.value = info.ticket;
       }
     } catch (error) {
       nodeError.value = `Could not load node runtime: ${error}`;
       relayStatus.value = "offline";
       // Allow a later call to retry instead of permanently caching the failure.
       for (const unlisten of unlisteners.splice(0)) unlisten();
-      initialized = false;
       initPromise = null;
     }
   })();
@@ -155,21 +146,19 @@ async function init(): Promise<void> {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     for (const unlisten of unlisteners.splice(0)) unlisten();
-    initialized = false;
     initPromise = null;
   });
 }
 
 export function useNodeRuntime() {
-  if (import.meta.client && !initialized) {
-    void init();
-  }
+  if (import.meta.client) void init();
 
   return {
     nodeId,
     relayStatus,
     ticket,
-    shareTicket,
+    // Alias kept for useCall/settings, which expose it as the share ticket.
+    shareTicket: ticket,
     nodeError,
     peerConnectionStatuses,
     init,
