@@ -23,6 +23,10 @@ vi.mock("@tauri-apps/plugin-updater", () => ({
   check: tauriMocks.check,
 }));
 
+function fakeUpdate(version: string, downloadAndInstall = vi.fn()) {
+  return { version, body: null, downloadAndInstall, close: vi.fn(async () => {}) };
+}
+
 async function freshUpdater() {
   vi.resetModules();
   return await import("./useAppUpdate");
@@ -52,6 +56,7 @@ describe("useAppUpdate", () => {
       version: "0.9.0",
       body: "Bug fixes",
       downloadAndInstall: vi.fn(),
+      close: vi.fn(async () => {}),
     });
     const { useAppUpdate } = await freshUpdater();
     const updater = useAppUpdate();
@@ -72,11 +77,7 @@ describe("useAppUpdate", () => {
       onEvent({ event: "Progress", data: { chunkLength: 60 } });
       onEvent({ event: "Finished" });
     });
-    tauriMocks.check.mockResolvedValue({
-      version: "0.9.0",
-      body: null,
-      downloadAndInstall,
-    });
+    tauriMocks.check.mockResolvedValue(fakeUpdate("0.9.0", downloadAndInstall));
     const { useAppUpdate } = await freshUpdater();
     const updater = useAppUpdate();
 
@@ -113,5 +114,97 @@ describe("useAppUpdate", () => {
 
     expect(updater.status.value).toBe("error");
     expect(updater.errorMessage.value).toBe("manifest missing");
+  });
+
+  it("keeps automatic check failures silent", async () => {
+    tauriMocks.check.mockRejectedValue(new Error("offline"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdateOnce();
+
+    expect(updater.status.value).toBe("idle");
+    expect(updater.errorMessage.value).toBeNull();
+    warn.mockRestore();
+  });
+
+  it("remembers the dismissed version", async () => {
+    tauriMocks.check.mockResolvedValue(fakeUpdate("0.9.0"));
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdate();
+    updater.dismissUpdate();
+
+    expect(updater.dismissedVersion.value).toBe("0.9.0");
+  });
+
+  it("releases the previous update resource when a new check replaces it", async () => {
+    const first = fakeUpdate("0.9.0");
+    const second = fakeUpdate("0.9.1");
+    tauriMocks.check.mockResolvedValueOnce(first).mockResolvedValueOnce(second);
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdate();
+    await updater.checkForUpdate();
+
+    expect(first.close).toHaveBeenCalledOnce();
+    expect(second.close).not.toHaveBeenCalled();
+    expect(updater.latestVersion.value).toBe("0.9.1");
+  });
+
+  it("waits for an in-flight check before installing", async () => {
+    vi.useFakeTimers();
+    let resolveCheck!: (update: unknown) => void;
+    const update = fakeUpdate("0.9.0");
+    tauriMocks.check.mockReturnValue(new Promise((resolve) => { resolveCheck = resolve; }));
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    const checking = updater.checkForUpdateOnce();
+    const install = updater.downloadAndInstall();
+    resolveCheck(update);
+    await checking;
+    await vi.runAllTimersAsync();
+    await install;
+
+    expect(tauriMocks.check).toHaveBeenCalledOnce();
+    expect(update.downloadAndInstall).toHaveBeenCalledOnce();
+    expect(tauriMocks.relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("ignores a second install click while one is running", async () => {
+    vi.useFakeTimers();
+    const update = fakeUpdate("0.9.0");
+    tauriMocks.check.mockResolvedValue(update);
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdate();
+    const first = updater.downloadAndInstall();
+    const second = updater.downloadAndInstall();
+    await vi.runAllTimersAsync();
+    await Promise.all([first, second]);
+
+    expect(update.downloadAndInstall).toHaveBeenCalledOnce();
+    expect(tauriMocks.relaunch).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces download failures without relaunching", async () => {
+    const update = fakeUpdate("0.9.0", vi.fn(async () => {
+      throw new Error("signature rejected");
+    }));
+    tauriMocks.check.mockResolvedValue(update);
+    const { useAppUpdate } = await freshUpdater();
+    const updater = useAppUpdate();
+
+    await updater.checkForUpdate();
+    await updater.downloadAndInstall();
+
+    expect(updater.status.value).toBe("error");
+    expect(updater.errorMessage.value).toBe("signature rejected");
+    expect(tauriMocks.relaunch).not.toHaveBeenCalled();
   });
 });

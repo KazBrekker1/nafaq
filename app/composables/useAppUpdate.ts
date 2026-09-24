@@ -20,8 +20,13 @@ const releaseNotes = ref<string | null>(null);
 const downloadProgress = ref(0);
 const progressKnown = ref(false);
 const errorMessage = ref<string | null>(null);
+// The version the user closed the modal on, so an automatic check doesn't
+// pop the same update at them again this session.
+const dismissedVersion = ref<string | null>(null);
 
 let pendingUpdate: Update | null = null;
+let inFlightCheck: Promise<void> | null = null;
+let inFlightInstall: Promise<void> | null = null;
 let sessionCheck: Promise<void> | null = null;
 
 const isUpdateAvailable = computed(() => status.value === "available");
@@ -32,11 +37,22 @@ function updatesSupported(): boolean {
   return os !== "android" && os !== "ios";
 }
 
-async function checkForUpdate(): Promise<void> {
-  if (status.value === "checking" || status.value === "downloading" || status.value === "installing") {
-    return;
-  }
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
+// Swap the held Update resource, releasing the previous one on the Rust side.
+function replacePendingUpdate(next: Update | null) {
+  const previous = pendingUpdate;
+  pendingUpdate = next;
+  if (previous && previous !== next) {
+    previous.close().catch((error) => console.warn("[update] failed to release update resource:", error));
+  }
+}
+
+// `silent` checks (the automatic one) never surface an error: a failed
+// background check leaves the status idle instead of flagging the UI.
+async function runCheck(silent: boolean): Promise<void> {
   if (!updatesSupported()) {
     status.value = "unsupported";
     return;
@@ -47,40 +63,56 @@ async function checkForUpdate(): Promise<void> {
 
   try {
     const update = await check();
-    if (!update) {
-      pendingUpdate = null;
-      latestVersion.value = null;
-      releaseNotes.value = null;
-      status.value = "uptodate";
+    replacePendingUpdate(update);
+    latestVersion.value = update?.version ?? null;
+    releaseNotes.value = update?.body ?? null;
+    status.value = update ? "available" : "uptodate";
+  } catch (error) {
+    if (silent) {
+      console.warn("[update] automatic update check failed:", error);
+      status.value = "idle";
       return;
     }
-
-    pendingUpdate = update;
-    latestVersion.value = update.version;
-    releaseNotes.value = update.body ?? null;
-    status.value = "available";
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : String(error);
+    errorMessage.value = errorText(error);
     status.value = "error";
   }
+}
+
+function startCheck(silent: boolean): Promise<void> {
+  if (inFlightCheck) return inFlightCheck;
+  if (status.value === "downloading" || status.value === "installing") return Promise.resolve();
+  inFlightCheck = runCheck(silent).finally(() => {
+    inFlightCheck = null;
+  });
+  return inFlightCheck;
+}
+
+function checkForUpdate(): Promise<void> {
+  return startCheck(false);
 }
 
 // Automatic check: runs at most once per app session, however many times the
 // caller (e.g. the home page) remounts. Manual retries use checkForUpdate.
 function checkForUpdateOnce(): Promise<void> {
-  sessionCheck ??= checkForUpdate();
+  sessionCheck ??= startCheck(true);
   return sessionCheck;
 }
 
-async function downloadAndInstall(): Promise<void> {
+function dismissUpdate() {
+  dismissedVersion.value = latestVersion.value;
+}
+
+async function runInstall(): Promise<void> {
   if (!updatesSupported()) {
     status.value = "unsupported";
     return;
   }
-  if (!pendingUpdate) {
-    await checkForUpdate();
-    if (!pendingUpdate) return;
-  }
+  // Wait for a check that's already running (e.g. the automatic one) rather
+  // than bailing out, then fall back to a fresh check if nothing is pending.
+  if (inFlightCheck) await inFlightCheck;
+  if (!pendingUpdate) await checkForUpdate();
+  const update = pendingUpdate;
+  if (!update) return;
 
   status.value = "downloading";
   downloadProgress.value = 0;
@@ -90,7 +122,7 @@ async function downloadAndInstall(): Promise<void> {
   try {
     let downloaded = 0;
     let contentLength = 0;
-    await pendingUpdate.downloadAndInstall((event) => {
+    await update.downloadAndInstall((event) => {
       switch (event.event) {
         case "Started":
           contentLength = event.data.contentLength ?? 0;
@@ -114,9 +146,17 @@ async function downloadAndInstall(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 700));
     await relaunch();
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : String(error);
+    errorMessage.value = errorText(error);
     status.value = "error";
   }
+}
+
+// De-duplicated: a second click while an install runs joins the first.
+function downloadAndInstall(): Promise<void> {
+  inFlightInstall ??= runInstall().finally(() => {
+    inFlightInstall = null;
+  });
+  return inFlightInstall;
 }
 
 export function useAppUpdate() {
@@ -127,9 +167,11 @@ export function useAppUpdate() {
     downloadProgress: readonly(downloadProgress),
     progressKnown: readonly(progressKnown),
     errorMessage: readonly(errorMessage),
+    dismissedVersion: readonly(dismissedVersion),
     isUpdateAvailable,
     checkForUpdate,
     checkForUpdateOnce,
+    dismissUpdate,
     downloadAndInstall,
   };
 }

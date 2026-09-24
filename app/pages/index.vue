@@ -6,7 +6,9 @@ const { contacts, displayName: contactDisplayName } = useContacts();
 const { isOnline } = usePresence();
 const { conversations, unreadCounts } = useDM();
 const appVersion = useRuntimeConfig().public.appVersion;
-const { status: updateStatus, isUpdateAvailable, latestVersion, checkForUpdateOnce } = useAppUpdate();
+const {
+  status: updateStatus, isUpdateAvailable, latestVersion, dismissedVersion, checkForUpdateOnce, dismissUpdate,
+} = useAppUpdate();
 const showUpdateModal = ref(false);
 const now = useNow({ interval: 60_000 });
 
@@ -21,15 +23,19 @@ const onlineContacts = computed(() =>
 );
 
 // ── Updates ──────────────────────────────────────────────
-// One automatic check per app session; only an available update opens the
-// modal on its own — a failed check just shows the footer link.
+// One silent automatic check per app session; only an available update the
+// user hasn't already dismissed opens the modal on its own.
 
 onMounted(() => {
   void checkForUpdateOnce();
 });
 
 watch(isUpdateAvailable, (available) => {
-  if (available) openUpdateModal();
+  if (available && latestVersion.value !== dismissedVersion.value) openUpdateModal();
+}, { immediate: true });
+
+watch(showUpdateModal, (open) => {
+  if (!open && isUpdateAvailable.value) dismissUpdate();
 });
 
 // ── Recent activity ──────────────────────────────────────
