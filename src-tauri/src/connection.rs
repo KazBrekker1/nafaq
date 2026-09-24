@@ -97,6 +97,20 @@ fn relay_targets_for_announce<'a>(
         .collect()
 }
 
+/// Tickets to announce to a newly connected call peer: every cached ticket of
+/// another peer that is currently connected to us.
+fn tickets_to_announce(
+    tickets: &HashMap<String, PeerTicketRecord>,
+    current_peer_ids: &HashSet<String>,
+    new_peer_id: &str,
+) -> Vec<(String, String)> {
+    tickets
+        .iter()
+        .filter(|(id, _)| id.as_str() != new_peer_id && current_peer_ids.contains(id.as_str()))
+        .map(|(id, record)| (id.clone(), record.ticket.clone()))
+        .collect()
+}
+
 struct ActiveFileReceive {
     file: tokio::fs::File,
     temp_path: std::path::PathBuf,
@@ -1830,13 +1844,13 @@ impl ConnectionManager {
             let _ = self.send_control(&peer_id, &announce_self).await;
         }
 
+        // Only relay tickets of peers that are in the call right now — the
+        // cache also holds tickets of peers from earlier calls (kept for
+        // redial), which must not leak into this one.
+        let current_peer_ids: HashSet<String> = self.peers.lock().await.keys().cloned().collect();
         let stored_tickets: Vec<(String, String)> = {
             let tickets = self.peer_tickets.lock().await;
-            tickets
-                .iter()
-                .filter(|(id, _)| **id != peer_id)
-                .map(|(id, record)| (id.clone(), record.ticket.clone()))
-                .collect()
+            tickets_to_announce(&tickets, &current_peer_ids, &peer_id)
         };
         for (stored_id, stored_ticket) in stored_tickets {
             let announce = ControlAction::PeerAnnounce {
@@ -1905,6 +1919,18 @@ impl ConnectionManager {
             (removed, old, peers.len())
         };
 
+        // Keep the cached ticket when the connection merely dropped (QUIC idle
+        // timeout) so the liveness/reconnect path can still re-dial the peer.
+        // Forget it on a deliberate teardown (user ended the call, or the peer
+        // was given up on after exhausting reconnect attempts) — even when the
+        // entry is already gone (the close watcher may have removed it first),
+        // or a stale ticket would be announced to every future call peer. A
+        // connection-scoped cleanup that lost the race to a newer connection
+        // must leave the ticket alone: it belongs to the live entry.
+        if !preserve_ticket && (removed.is_some() || expected_connection_id.is_none()) {
+            peer_tickets.lock().await.remove(peer_id);
+        }
+
         let Some(peer) = removed else {
             return false;
         };
@@ -1913,13 +1939,6 @@ impl ConnectionManager {
             peer.connection.close(0u32.into(), reason);
         }
 
-        // Keep the cached ticket when the connection merely dropped (e.g. QUIC
-        // idle timeout) so the liveness/reconnect path can still re-dial the
-        // peer. Only forget it on a deliberate teardown (user ended the call,
-        // or the peer was given up on after exhausting reconnect attempts).
-        if !preserve_ticket {
-            peer_tickets.lock().await.remove(peer_id);
-        }
         video_receive_state.lock().await.remove(peer_id);
 
         // A SharedCall DM rides the QUIC connection we just tore down; no DM
@@ -2211,6 +2230,10 @@ impl ConnectionManager {
                 return;
             }
 
+            // Only a silent drop keeps the ticket for a later redial; an
+            // explicit close (either side hung up) forgets it, so it isn't
+            // re-announced to the peers of a future call.
+            let preserve_ticket = matches!(close_reason, ConnectionError::TimedOut);
             Self::cleanup_peer_internal(
                 &peer_id_closed,
                 &peers_ref_closed,
@@ -2220,7 +2243,7 @@ impl ConnectionManager {
                 &event_tx_cleanup_closed,
                 None,
                 Some(connection_closed_id),
-                true, // preserve ticket so the peer can be re-dialed after a drop
+                preserve_ticket,
             )
             .await;
         });
@@ -3724,6 +3747,69 @@ mod tests {
                 .map(|record| record.ticket.as_str()),
             Some(direct_ticket.as_str())
         );
+    }
+
+    #[test]
+    fn only_tickets_of_currently_connected_peers_are_announced() {
+        let record = |ticket: &str| PeerTicketRecord {
+            ticket: ticket.to_string(),
+            last_updated_ms: 0,
+            last_dial_failed_ms: None,
+            dial_failures: 0,
+        };
+        let tickets = HashMap::from([
+            ("in-call".to_string(), record("t-in-call")),
+            ("past-call".to_string(), record("t-past-call")),
+            ("newcomer".to_string(), record("t-newcomer")),
+        ]);
+        let connected = HashSet::from(["in-call".to_string(), "newcomer".to_string()]);
+
+        let announced = tickets_to_announce(&tickets, &connected, "newcomer");
+
+        assert_eq!(
+            announced,
+            vec![("in-call".to_string(), "t-in-call".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn deliberate_disconnect_forgets_ticket_even_without_peer_entry() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        // The close watcher already removed the entry (e.g. the remote hung up
+        // first); the user's end_call must still forget the ticket.
+        assert!(manager.upsert_peer_ticket("peer-a", "ticket-1").await);
+        manager.disconnect_peer("peer-a").await.unwrap();
+        assert!(!manager.peer_tickets.lock().await.contains_key("peer-a"));
+    }
+
+    #[tokio::test]
+    async fn connection_scoped_cleanup_without_entry_keeps_ticket() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        // A stale connection's watcher that finds no matching entry must not
+        // touch the ticket owned by whatever replaced it.
+        assert!(manager.upsert_peer_ticket("peer-a", "ticket-1").await);
+        let removed = ConnectionManager::cleanup_peer_internal(
+            "peer-a",
+            &manager.peers,
+            &manager.dm_peers,
+            &manager.peer_tickets,
+            &manager.video_receive_state,
+            &manager.event_tx,
+            None,
+            Some(12345),
+            false,
+        )
+        .await;
+        assert!(!removed);
+        assert!(manager.peer_tickets.lock().await.contains_key("peer-a"));
     }
 
     #[test]
