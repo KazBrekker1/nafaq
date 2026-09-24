@@ -1,6 +1,6 @@
 import { Channel } from "@tauri-apps/api/core";
 import { PLAYBACK_PROCESSOR_NAME, playbackWorkletSource } from "~/utils/jitterBuffer";
-import { applySendLevel, sendQualityForLevel, type VideoProfile } from "~/utils/sendQuality";
+import { applySendLevel, capProfileForPreference, sendQualityForLevel, type VideoProfile } from "~/utils/sendQuality";
 
 const encoding = ref(false);
 const connectionQuality = ref<"good" | "degraded" | "poor">("good");
@@ -143,10 +143,13 @@ const DEFAULT_PROFILE: VideoProfile = {
   maxWidth: 640,
   maxHeight: 360,
 };
-// Call-size profile (quality-profile-changed) and the backend controller's
-// congestion level (send-quality-changed); capture follows their combination.
+// Call-size profile (quality-profile-changed), capped by the user's video
+// quality / data saver settings, and the backend controller's congestion
+// level (send-quality-changed); capture follows their combination.
+let callSizeProfile: VideoProfile = { ...DEFAULT_PROFILE };
 let baseProfile: VideoProfile = { ...DEFAULT_PROFILE };
 let sendLevel = 0;
+let stopSettingsWatch: (() => void) | null = null;
 // Counts quality-profile-changed events so the start-up profile fetch can't
 // overwrite a newer event that raced it.
 let qualityProfileEvents = 0;
@@ -160,12 +163,30 @@ interface QualityProfilePayload {
 }
 
 function setBaseProfileFromBackend({ bitrate_bps, fps, max_width, max_height }: QualityProfilePayload) {
-  baseProfile = {
+  callSizeProfile = {
     bitrateBps: bitrate_bps,
     fps: isAndroidUa ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
     maxWidth: max_width,
     maxHeight: max_height,
   };
+  refreshBaseProfile();
+}
+
+function refreshBaseProfile() {
+  const { videoQuality, dataSaver } = useSettings().settings.value;
+  baseProfile = capProfileForPreference(callSizeProfile, videoQuality, dataSaver);
+}
+
+// Route remote audio to Settings → speaker where the WebView supports it
+// (AudioContext.setSinkId); elsewhere the system default output is used.
+function applyPreferredSpeaker({ onlyIfSet = false } = {}) {
+  const ctx = playbackCtx as (AudioContext & { setSinkId?: (sinkId: string) => Promise<void> }) | null;
+  if (!ctx || typeof ctx.setSinkId !== "function") return;
+  const sinkId = useSettings().settings.value.preferredSpeaker ?? "";
+  if (onlyIfSet && !sinkId) return;
+  ctx.setSinkId(sinkId).catch((e) => {
+    console.warn("[transport] setSinkId failed:", e);
+  });
 }
 let currentWidth = 640;
 let currentHeight = 360;
@@ -741,6 +762,7 @@ function keepContextRunning(ctx: AudioContext, label: string) {
 async function ensurePlaybackContext(token: number) {
   if (!playbackCtx) {
     playbackCtx = new AudioContext({ sampleRate: 48000 });
+    applyPreferredSpeaker({ onlyIfSet: true });
     const resumeOnGesture = keepContextRunning(playbackCtx, "playback");
     const resumed = await resumeWithTimeout(playbackCtx);
     ensureReceiveRun(token);
@@ -1087,6 +1109,8 @@ function disposeReceiveListeners() {
   unlistenQuality = null;
   unlistenSendQuality?.();
   unlistenSendQuality = null;
+  stopSettingsWatch?.();
+  stopSettingsWatch = null;
 }
 
 async function teardownReceiveBridge(clearBackend = true) {
@@ -1267,14 +1291,15 @@ function closeWebEncoder() {
 export function useMediaTransport() {
   async function initCodecs(stream?: MediaStream | null) {
     const invoke = await invokePromise;
+    refreshBaseProfile(); // settings may have changed since the last call
     const { width, height } = resolveCaptureDimensions(stream);
     currentWidth = width;
     currentHeight = height;
     targetFps = effectiveProfile().fps;
     audioBufferPool = new BufferPool(8, () => new Int16Array(OPUS_FRAME_SAMPLES));
     videoFrameBufferPool = new BufferPool(4, () => new Uint8Array(currentWidth * currentHeight * 4));
-    // Encoder runs at the call-size profile; the backend's quality controller
-    // lowers bitrate/fps from there at runtime.
+    // Encoder runs at the (user-capped) call-size profile; the backend's
+    // quality controller lowers bitrate/fps from there at runtime.
     await invoke("init_codecs", {
       width,
       height,
@@ -1604,6 +1629,22 @@ export function useMediaTransport() {
     ensureReceiveRun(token);
     if (current && qualityProfileEvents === eventsBeforeFetch) setBaseProfileFromBackend(current);
 
+    // Settings can change mid-call: quality caps rebuild the encoder, the
+    // speaker choice re-routes playback.
+    const { settings } = useSettings();
+    const stopQualityWatch = watch(
+      () => [settings.value.videoQuality, settings.value.dataSaver] as const,
+      async () => {
+        refreshBaseProfile();
+        if (encoding.value) await applyCaptureProfile({ rebuildEncoder: true });
+      },
+    );
+    const stopSpeakerWatch = watch(() => settings.value.preferredSpeaker, () => applyPreferredSpeaker());
+    stopSettingsWatch = () => {
+      stopQualityWatch();
+      stopSpeakerWatch();
+    };
+
     await ensurePlaybackContext(token);
     bridgeFallbackUsed = false;
     await teardownReceiveBridge(false);
@@ -1813,6 +1854,7 @@ export function useMediaTransport() {
     peerIdsProvider = null;
 
     connectionQuality.value = "good";
+    callSizeProfile = { ...DEFAULT_PROFILE };
     baseProfile = { ...DEFAULT_PROFILE };
     sendLevel = 0;
     targetFps = DEFAULT_PROFILE.fps;

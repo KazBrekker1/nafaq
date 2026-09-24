@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applySendLevel, sendQualityForLevel } from "./sendQuality";
+import { applySendLevel, capProfileForPreference, sendQualityForLevel } from "./sendQuality";
 
 const base = { bitrateBps: 400_000, fps: 12, maxWidth: 640, maxHeight: 360 };
 
@@ -21,5 +21,29 @@ describe("applySendLevel", () => {
 
   it("maps levels to the UI quality indicator", () => {
     expect([0, 1, 2, 3].map(sendQualityForLevel)).toEqual(["good", "degraded", "poor", "poor"]);
+  });
+});
+
+describe("capProfileForPreference", () => {
+  it("leaves the profile alone for auto and high", () => {
+    expect(capProfileForPreference(base, "auto", false)).toEqual(base);
+    expect(capProfileForPreference(base, "high", false)).toEqual(base);
+  });
+
+  it("caps low and medium", () => {
+    expect(capProfileForPreference(base, "low", false)).toEqual({ bitrateBps: 150_000, fps: 8, maxWidth: 320, maxHeight: 180 });
+    expect(capProfileForPreference(base, "medium", false)).toEqual({ bitrateBps: 250_000, fps: 10, maxWidth: 480, maxHeight: 270 });
+  });
+
+  it("never raises a profile that is already below the cap", () => {
+    const crowded = { bitrateBps: 150_000, fps: 8, maxWidth: 320, maxHeight: 180 };
+    expect(capProfileForPreference(crowded, "medium", false)).toEqual(crowded);
+  });
+
+  it("data saver means at most low", () => {
+    const low = capProfileForPreference(base, "low", false);
+    expect(capProfileForPreference(base, "high", true)).toEqual(low);
+    expect(capProfileForPreference(base, "auto", true)).toEqual(low);
+    expect(capProfileForPreference(base, "medium", true)).toEqual(low);
   });
 });
