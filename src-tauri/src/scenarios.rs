@@ -1251,6 +1251,8 @@ async fn three_node_mesh() -> (TestNode, TestNode, TestNode, String, String, Str
     let mut rx_b = b.event_tx.subscribe();
     let mut rx_c = c.event_tx.subscribe();
 
+    // Mirrors commands::join_call, which arms the call session before dialing.
+    c.mgr.set_call_session_active(true);
     c.mgr
         .connect_to_peer_with_ticket(&c.endpoint, &a_ticket)
         .await
@@ -1423,6 +1425,8 @@ async fn late_joiner_connects_to_both_without_disrupting_existing_pair() {
     let c_id = c.node_id_str();
     let mut rx_c = c.event_tx.subscribe();
 
+    // Mirrors commands::join_call, which arms the call session before dialing.
+    c.mgr.set_call_session_active(true);
     c.mgr
         .connect_to_peer_with_ticket(&c.endpoint, &a_ticket)
         .await

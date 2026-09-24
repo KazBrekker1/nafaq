@@ -1738,16 +1738,17 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
     ) -> Result<()> {
-        // Ghost-call protocol fix: an inbound call dial with no locally active
+        // Ghost-call protocol fix: a call connection with no locally active
         // call session (never created/joined one, or it was cancelled/ended)
         // is rejected outright — regardless of any per-peer duplicate/replace
-        // logic below. Outbound dials are never gated here: they only happen
-        // because we ourselves just called create_call/join_call, which sets
-        // the flag before dialing. DM/presence/file streams don't go through
-        // this path at all.
-        if direction == ConnectionDirection::Inbound && !self.is_call_session_active() {
+        // logic below. This applies to outbound connections too: a mesh
+        // auto-dial or reconnect that was in flight when the call ended must
+        // not resurrect it. Re-checked under the peers lock right before
+        // insertion (below), since stream setup awaits in between.
+        // DM/presence/file streams don't go through this path at all.
+        if !self.is_call_session_active() {
             tracing::info!(
-                "Rejecting inbound call connection from {peer_id}: no active call session"
+                "Rejecting {direction:?} call connection with {peer_id}: no active call session"
             );
             connection.close(0u32.into(), b"call_not_active");
             return Ok(());
@@ -1796,6 +1797,16 @@ impl ConnectionManager {
         let (old_connection, old_count, new_count) = {
             let local_node_id = self.local_node_id().await;
             let mut peers = self.peers.lock().await;
+            // Last-moment gate, under the lock that end_call's teardown also
+            // takes: the call may have ended while streams were being opened.
+            if !self.is_call_session_active() {
+                drop(peers);
+                tracing::info!(
+                    "Rejecting {direction:?} call connection with {peer_id}: call ended during setup"
+                );
+                peer_conn.connection.close(0u32.into(), b"call_not_active");
+                return Ok(());
+            }
             let old = peers.len();
             let should_insert = match peers.get(&peer_id) {
                 None => true,
@@ -3329,10 +3340,11 @@ mod tests {
             .spawn();
 
         // Mirrors production's create_call/join_call, which mark a call
-        // session active before anyone can dial in — without this, the
-        // protocol-level ghost-call gate (setup_connection) rejects the
-        // inbound test connection below.
+        // session active before anyone can dial in (or out) — without this,
+        // the protocol-level ghost-call gate (setup_connection) rejects the
+        // test connection below on both sides.
         mgr_a.set_call_session_active(true);
+        mgr_b.set_call_session_active(true);
 
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -4623,6 +4635,7 @@ mod tests {
             .spawn();
 
         mgr_a.set_call_session_active(true);
+        mgr_b.set_call_session_active(true);
         let mut rx_a = event_tx_a.subscribe();
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -4880,6 +4893,7 @@ mod tests {
             .spawn();
 
         mgr_a.set_call_session_active(true);
+        mgr_b.set_call_session_active(true);
         let mut rx_a = event_tx_a.subscribe();
         let addr_a = node::parse_ticket(&node::generate_ticket(&endpoint_a))
             .unwrap()
@@ -5096,6 +5110,50 @@ mod tests {
     }
 
     // ── Ghost-call protocol gate (wave 2) ───────────────────────────────
+
+    #[tokio::test]
+    async fn outbound_call_connection_rejected_without_active_call_session() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(16);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a, audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(16);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b, audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone()).await;
+        mgr_b.set_endpoint(endpoint_b.clone()).await;
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
+            .spawn();
+        mgr_a.set_call_session_active(true);
+
+        // mgr_b's call already ended (flag cleared) while this dial — e.g. a
+        // late mesh auto-dial or reconnect — was in flight.
+        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
+            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let connection = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
+        mgr_b
+            .setup_connection(
+                endpoint_a.id().to_string(),
+                connection.clone(),
+                ConnectionDirection::Outbound,
+            )
+            .await
+            .unwrap();
+
+        assert!(mgr_b.peers.lock().await.is_empty());
+        assert!(connection.close_reason().is_some());
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
 
     #[tokio::test]
     async fn inbound_call_dial_rejected_without_active_call_session() {
