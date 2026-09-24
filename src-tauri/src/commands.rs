@@ -476,6 +476,32 @@ pub async fn reinit_video_encoder_with_config(
     Ok(())
 }
 
+/// Same shape as the `quality-profile-changed` event payload.
+#[derive(serde::Serialize)]
+pub struct QualityProfile {
+    peer_count: usize,
+    bitrate_bps: u32,
+    fps: u32,
+    max_width: u32,
+    max_height: u32,
+}
+
+/// Current call-size profile, so a transport starting after the last
+/// `quality-profile-changed` event doesn't encode at the 1:1 default.
+#[tauri::command]
+pub async fn get_quality_profile(state: State<'_, AppState>) -> Result<QualityProfile, String> {
+    let peer_count = state.conn_manager.peer_count().await;
+    let (bitrate_bps, fps, max_width, max_height) =
+        crate::connection::ConnectionManager::quality_profile_for_peers(peer_count);
+    Ok(QualityProfile {
+        peer_count,
+        bitrate_bps,
+        fps,
+        max_width,
+        max_height,
+    })
+}
+
 // ── Presence (gossip-driven) ────────────────────────────────────────
 
 #[tauri::command]

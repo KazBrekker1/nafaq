@@ -161,9 +161,11 @@ async function startConnectedPipeline() {
   // Re-attach tiles that were observed by the previous observer instance.
   for (const el of observedPeerContainers.values()) videoVisibilityObserver.observe(el);
 
-  await transport.initCodecs(media.localStream.value);
-  if (cleaned) return;
+  // Receiving first: it picks up the current call-size profile, which the
+  // encoder created by initCodecs must start with.
   await transport.startReceiving(() => call.peers.value);
+  if (cleaned) return;
+  await transport.initCodecs(media.localStream.value);
   if (cleaned) return;
 
   if (media.localStream.value && call.peers.value.length > 0) {

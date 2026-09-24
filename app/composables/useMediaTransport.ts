@@ -145,6 +145,26 @@ const DEFAULT_PROFILE: VideoProfile = {
 // congestion level (send-quality-changed); capture follows their combination.
 let baseProfile: VideoProfile = { ...DEFAULT_PROFILE };
 let sendLevel = 0;
+// Counts quality-profile-changed events so the start-up profile fetch can't
+// overwrite a newer event that raced it.
+let qualityProfileEvents = 0;
+
+interface QualityProfilePayload {
+  peer_count: number;
+  bitrate_bps: number;
+  fps: number;
+  max_width: number;
+  max_height: number;
+}
+
+function setBaseProfileFromBackend({ bitrate_bps, fps, max_width, max_height }: QualityProfilePayload) {
+  baseProfile = {
+    bitrateBps: bitrate_bps,
+    fps: isAndroidUa ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
+    maxWidth: max_width,
+    maxHeight: max_height,
+  };
+}
 let currentWidth = 640;
 let currentHeight = 360;
 let targetFps = DEFAULT_PROFILE.fps;
@@ -1536,6 +1556,35 @@ export function useMediaTransport() {
   }
 
   async function startReceivingInner(getPeerIds: () => string[], token: number) {
+    // Quality listeners go first: a profile change emitted while the playback
+    // context and bridge probe are still settling must not be missed.
+    // Call-size profile: rebuild the encoder at the new base; the backend
+    // controller applies its congestion level on top.
+    unlistenQuality = await listenForRun<QualityProfilePayload>(token, "quality-profile-changed", async (event) => {
+      qualityProfileEvents++;
+      setBaseProfileFromBackend(event.payload);
+      await applyCaptureProfile({ rebuildEncoder: true });
+    });
+
+    // Single source of truth for outbound quality: the backend's controller
+    // (driven by skipped frames, loss and queueing delay — not raw RTT).
+    unlistenSendQuality = await listenForRun<{ level: number }>(token, "send-quality-changed", async (event) => {
+      sendLevel = event.payload.level;
+      connectionQuality.value = sendQualityForLevel(sendLevel);
+      await applyCaptureProfile({ rebuildEncoder: false });
+    });
+
+    // Events only report changes; pick up the profile already in effect
+    // (e.g. joining a call that already has 3+ peers) before codecs init.
+    const eventsBeforeFetch = qualityProfileEvents;
+    const invoke = await invokePromise;
+    const current = await invoke<QualityProfilePayload>("get_quality_profile").catch((e) => {
+      console.warn("[transport] get_quality_profile failed:", e);
+      return null;
+    });
+    ensureReceiveRun(token);
+    if (current && qualityProfileEvents === eventsBeforeFetch) setBaseProfileFromBackend(current);
+
     await ensurePlaybackContext(token);
     bridgeFallbackUsed = false;
     await teardownReceiveBridge(false);
@@ -1552,33 +1601,6 @@ export function useMediaTransport() {
       initialKeyframeRequests.delete(pid);
       if (activeSpeaker.value === pid) activeSpeaker.value = null;
       updateSpeakingMap();
-    });
-
-    // Call-size profile: rebuild the encoder at the new base; the backend
-    // controller applies its congestion level on top.
-    unlistenQuality = await listenForRun<{
-      peer_count: number;
-      bitrate_bps: number;
-      fps: number;
-      max_width: number;
-      max_height: number;
-    }>(token, "quality-profile-changed", async (event) => {
-      const { bitrate_bps, fps, max_width, max_height } = event.payload;
-      baseProfile = {
-        bitrateBps: bitrate_bps,
-        fps: isAndroid ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
-        maxWidth: max_width,
-        maxHeight: max_height,
-      };
-      await applyCaptureProfile({ rebuildEncoder: true });
-    });
-
-    // Single source of truth for outbound quality: the backend's controller
-    // (driven by skipped frames, loss and queueing delay — not raw RTT).
-    unlistenSendQuality = await listenForRun<{ level: number }>(token, "send-quality-changed", async (event) => {
-      sendLevel = event.payload.level;
-      connectionQuality.value = sendQualityForLevel(sendLevel);
-      await applyCaptureProfile({ rebuildEncoder: false });
     });
 
     startActiveSpeakerDetection();

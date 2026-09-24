@@ -835,6 +835,7 @@ pub fn run() {
             commands::destroy_codecs,
             commands::reinit_video_encoder,
             commands::reinit_video_encoder_with_config,
+            commands::get_quality_profile,
             commands::get_pinned_name,
             commands::set_pinned_name,
             commands::toggle_persistent_identity,
