@@ -22,7 +22,7 @@ interface MediaBridgeRegistration {
   sessionId: string;
   preferredBridgeModes: MediaBridgeMode[];
   playbackReady: boolean;
-  webcodecs_active: boolean;
+  webcodecsActive: boolean;
 }
 
 interface MediaPlaybackStatus {
@@ -164,7 +164,19 @@ let bridgeProbeReceived = false;
 let bridgeFallbackUsed = false;
 
 const isAndroid = isAndroidUa;
-const hasWebCodecs = typeof VideoDecoder !== "undefined";
+const DECODER_CODEC = "avc1.42001E"; // H.264 Constrained Baseline Level 3.0
+// A VideoDecoder global doesn't guarantee H.264 support (e.g. Linux WebKitGTK
+// without the codec plugins); probe once and reuse the answer.
+let webCodecsDecodeSupport: Promise<boolean> | null = null;
+function supportsWebCodecsDecode(): Promise<boolean> {
+  if (!webCodecsDecodeSupport) {
+    webCodecsDecodeSupport = typeof VideoDecoder === "undefined"
+      ? Promise.resolve(false)
+      : VideoDecoder.isConfigSupported({ codec: DECODER_CODEC })
+        .then((support) => support.supported === true, () => false);
+  }
+  return webCodecsDecodeSupport;
+}
 const sharedTextDecoder = new TextDecoder();
 let preferJsonAudioInvoke = isAndroid;
 let preferJsonVideoInvoke = isAndroid;
@@ -255,7 +267,7 @@ function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): Vid
     },
   });
   decoder.configure({
-    codec: "avc1.42001E", // H.264 Constrained Baseline Level 3.0
+    codec: DECODER_CODEC,
     optimizeForLatency: true,
   });
   peerVideoDecoders.set(peerId, decoder);
@@ -859,7 +871,7 @@ async function setupReceiveBridge(forceEventMode = false) {
     playbackReady: playbackCtx?.state === "running",
     // Raw NALUs only travel over the binary channel; in event mode the
     // backend has to decode to JPEG, or no video would arrive at all.
-    webcodecs_active: hasWebCodecs && !forceEventMode,
+    webcodecsActive: !forceEventMode && await supportsWebCodecsDecode(),
   };
 
   const profile = await invoke<MediaSessionProfile>("register_media_bridge", {
