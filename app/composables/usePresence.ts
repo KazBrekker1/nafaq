@@ -1,4 +1,4 @@
-import { ref, type Ref } from "vue";
+import { ref } from "vue";
 import { useNodeRuntime, type PeerConnectionStatus } from "./useNodeRuntime";
 
 const onlineStatus = ref<Record<string, boolean>>({});
@@ -65,21 +65,11 @@ async function ensureBootstrap() {
 export function usePresence() {
   void ensureBootstrap();
 
-  // Kept for backwards compatibility with existing callers; gossip pushes
-  // updates automatically, so these are no-ops.
-  function startProbing(_nodeIds: Ref<string[]>) {
-    void ensureBootstrap();
-  }
-
-  function stopProbing() {
-    // intentionally empty — presence is managed by gossip backend
-  }
-
   function isOnline(nodeId: string): boolean {
     return knownPresence(nodeId) ?? onlineStatus.value[nodeId] ?? false;
   }
 
-  return { onlineStatus, startProbing, stopProbing, isOnline };
+  return { onlineStatus, isOnline };
 }
 
 // HMR-safe cleanup

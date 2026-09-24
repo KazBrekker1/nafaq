@@ -1,6 +1,5 @@
 <script setup lang="ts">
 const open = defineModel<boolean>('open', { required: true });
-const emit = defineEmits<{ added: [] }>();
 
 const { add } = useContacts();
 
@@ -29,6 +28,9 @@ function handleScan(scanned: string) {
 }
 
 async function handleSave() {
+  // Enter in either field and the Save button all land here — ignore repeats
+  // while a save is in flight.
+  if (saving.value) return;
   error.value = null;
   const nodeId = nodeIdInput.value.trim();
   const displayName = nameInput.value.trim();
@@ -47,7 +49,6 @@ async function handleSave() {
       last_seen: 0,
       source: "manual",
     });
-    emit("added");
     close();
   } catch (e) {
     error.value = `Failed to save contact: ${e}`;

@@ -3,14 +3,16 @@ import type { DmMessageItem } from "~/composables/useDM";
 import { formatTime } from "~/utils/format";
 
 const route = useRoute();
+const router = useRouter();
+const toast = useToast();
 const peerId = computed(() => route.params.nodeId as string);
 
 const {
   conversations, connect, connectErrors, clearActiveConversation, sendText, resend, sendFile, markRead,
 } = useDM();
 const { contacts, add: addContact, displayName: resolveDisplayName } = useContacts();
-const { isOnline, startProbing, stopProbing } = usePresence();
-const { createCall, error: callError, state: callState, startWaitingForAnswer } = useCall();
+const { isOnline } = usePresence();
+const { createCall, error: callError, state: callState, startWaitingForAnswer, terminateCall } = useCall();
 
 const isContact = computed(() => contacts.value.some(c => c.node_id === peerId.value));
 const contactName = computed(() => resolveDisplayName(peerId.value));
@@ -52,9 +54,8 @@ async function send() {
   const text = inputText.value.trim();
   if (!text) return;
   inputText.value = "";
-  await sendText(peerId.value, text).catch((error) => {
-    console.warn("[dm] Send failed:", error);
-  });
+  // Failures are recorded on the message itself (FAILED · TAP TO RESEND).
+  await sendText(peerId.value, text);
 }
 
 // ── File attach ───────────────────────────────────────────
@@ -71,12 +72,19 @@ async function openFilePicker() {
 
 // ── Call escalation ───────────────────────────────────────
 
+const callBusy = computed(() => callState.value !== "idle");
+
+function callFailed(description: string) {
+  toast.add({ title: "Call failed", description, color: "error" });
+}
+
 async function initiateCall() {
+  if (callBusy.value) return;
   const { invoke } = await import("@tauri-apps/api/core");
   // Create a call first, then send the ticket via DM.
   const t = await createCall();
   if (!t) {
-    console.warn("[dm] Call invite not sent:", callError.value || "ticket unavailable");
+    callFailed(callError.value || "Call ticket unavailable.");
     return;
   }
   try {
@@ -86,11 +94,12 @@ async function initiateCall() {
     });
   } catch (e) {
     // The callee never received the invite — navigating to /call would just
-    // wait forever. Reset the half-created call and surface the failure.
+    // wait forever. Tear down the half-created call (terminateCall also
+    // closes the backend call session) and surface the failure.
     console.warn("[dm] Call invite delivery failed:", e);
     callError.value = "Could not deliver the call invite. Check the connection and try again.";
-    callState.value = "idle";
-    invoke("leave_call_session").catch(() => {});
+    callFailed(callError.value);
+    await terminateCall({ navigate: false });
     return;
   }
   startWaitingForAnswer(peerId.value);
@@ -99,30 +108,25 @@ async function initiateCall() {
 
 // ── Keyboard-aware viewport ──────────────────────────────
 
-const viewportHeight = ref("100%");
-
-function onViewportResize() {
-  if (window.visualViewport) {
-    viewportHeight.value = `${window.visualViewport.height}px`;
-    scrollToBottom();
-  }
-}
+const viewportHeight = useVisualViewportHeight("100%", scrollToBottom);
 
 // ── Lifecycle ─────────────────────────────────────────────
 
-const peerIds = computed(() => [peerId.value]);
-
-onMounted(async () => {
-  await connect(peerId.value);
+onMounted(() => {
+  // Sync work first: connect() may take a while to dial, and the user can
+  // leave before it resolves.
+  void connect(peerId.value);
   markRead(peerId.value);
-  await scrollToBottom();
-  startProbing(peerIds);
-  window.visualViewport?.addEventListener("resize", onViewportResize);
+  void scrollToBottom();
+  // "Call" buttons elsewhere link here with ?call=1 — start the call once and
+  // drop the query so a reload/back doesn't dial again.
+  if (route.query.call) {
+    void router.replace({ query: {} });
+    void initiateCall();
+  }
 });
 
 onUnmounted(() => {
-  stopProbing();
-  window.visualViewport?.removeEventListener("resize", onViewportResize);
   clearActiveConversation();
 });
 </script>
@@ -172,6 +176,8 @@ onUnmounted(() => {
         color="neutral"
         size="xs"
         class="shrink-0"
+        :loading="callState === 'creating'"
+        :disabled="callBusy"
         @click="initiateCall"
       />
     </div>
@@ -215,7 +221,7 @@ onUnmounted(() => {
         <!-- Text message -->
         <div
           v-if="msg.type === 'text'"
-          class="select-text max-w-[75%] border-2 px-3 py-2 text-xs"
+          class="select-text break-words max-w-[75%] border-2 px-3 py-2 text-xs"
           :class="msg.from === 'self'
             ? 'border-(--ui-border-accented) bg-primary text-inverted'
             : 'border-(--ui-border-accented) bg-elevated text-highlighted'"

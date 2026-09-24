@@ -1,45 +1,18 @@
 <script setup lang="ts">
-import { truncateNodeId, formatTime, avatarLetter } from "~/utils/format";
+import { formatRelativeTime, avatarLetter, relayStatusColor } from "~/utils/format";
 
-const { nodeId, displayName, connectionProgress, relayStatus, nodeError } = useCall();
+const { connectionProgress, relayStatus, nodeError } = useCall();
 const { contacts, displayName: contactDisplayName } = useContacts();
-const { isOnline, startProbing, stopProbing } = usePresence();
+const { isOnline } = usePresence();
 const { conversations, unreadCounts } = useDM();
-const { settings } = useSettings();
 const appVersion = useRuntimeConfig().public.appVersion;
-const { status: updateStatus, isUpdateAvailable, latestVersion, checkForUpdate } = useAppUpdate();
+const { status: updateStatus, isUpdateAvailable, latestVersion, checkForUpdateOnce } = useAppUpdate();
 const showUpdateModal = ref(false);
+const now = useNow({ interval: 60_000 });
 
 function openUpdateModal() {
   showUpdateModal.value = true;
 }
-
-// ── Identity ─────────────────────────────────────────────
-
-const truncatedNodeId = computed(() => {
-  if (!nodeId.value) return "—";
-  return truncateNodeId(nodeId.value);
-});
-
-const { copy, copied: nodeCopied } = useClipboard();
-function copyNodeId() {
-  if (nodeId.value) copy(nodeId.value);
-}
-
-const qrModalOpen = ref(false);
-
-const relayStatusLabel = computed(() => relayStatus.value.replace("_", " ").toUpperCase());
-const relayStatusClass = computed(() => {
-  switch (relayStatus.value) {
-    case "online":
-      return "text-primary";
-    case "degraded":
-    case "offline":
-      return "text-error";
-    default:
-      return "text-muted";
-  }
-});
 
 // ── Online contacts ──────────────────────────────────────
 
@@ -47,23 +20,16 @@ const onlineContacts = computed(() =>
   contacts.value.filter(c => isOnline(c.node_id))
 );
 
-const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
+// ── Updates ──────────────────────────────────────────────
+// One automatic check per app session; only an available update opens the
+// modal on its own — a failed check just shows the footer link.
 
 onMounted(() => {
-  startProbing(contactNodeIds);
-  checkForUpdate();
-});
-
-onUnmounted(() => {
-  stopProbing();
+  void checkForUpdateOnce();
 });
 
 watch(isUpdateAvailable, (available) => {
   if (available) openUpdateModal();
-});
-
-watch(updateStatus, (status) => {
-  if (status === "error") openUpdateModal();
 });
 
 // ── Recent activity ──────────────────────────────────────
@@ -112,37 +78,13 @@ const recentItems = computed<RecentItem[]>(() => {
 
       <!-- ── IDENTITY CARD ── -->
       <UCard>
-        <div class="flex items-center justify-between gap-3">
-          <div class="min-w-0">
-            <p class="truncate text-sm font-bold text-highlighted">
-              {{ displayName || "—" }}
-            </p>
-            <div class="mt-1 flex items-center gap-2">
-              <p class="truncate text-[10px] text-muted">
-                {{ truncatedNodeId }}
-              </p>
-              <UBadge v-if="settings.persistentIdentity" color="primary" class="shrink-0">
-                Persistent
-              </UBadge>
-            </div>
-          </div>
-          <UFieldGroup class="shrink-0">
-            <UButton variant="subtle" color="neutral" @click="() => { qrModalOpen = true }">QR</UButton>
-            <UButton
-              :variant="nodeCopied ? 'solid' : 'subtle'"
-              :color="nodeCopied ? 'primary' : 'neutral'"
-              @click="copyNodeId"
-            >
-              {{ nodeCopied ? "Copied" : "Copy" }}
-            </UButton>
-          </UFieldGroup>
-        </div>
+        <IdentityCard />
 
         <div class="mt-4 space-y-2">
           <ConnectionProgress :step="connectionProgress" />
           <div class="flex items-center justify-between gap-3 text-[10px] tracking-wider">
             <span class="text-muted">RELAY</span>
-            <span class="font-bold" :class="relayStatusClass">{{ relayStatusLabel }}</span>
+            <UBadge :color="relayStatusColor(relayStatus)" variant="subtle">{{ relayStatus.toUpperCase() }}</UBadge>
           </div>
           <p v-if="nodeError" class="text-[10px] text-error">
             {{ nodeError }}
@@ -180,40 +122,39 @@ const recentItems = computed<RecentItem[]>(() => {
           <div
             v-for="contact in onlineContacts"
             :key="contact.node_id"
-            class="w-28 shrink-0 cursor-pointer border-2 border-(--ui-border-accented) p-3 transition-colors hover:bg-elevated"
-            @click="navigateTo('/dm/' + contact.node_id)"
+            class="w-28 shrink-0 border-2 border-(--ui-border-accented) p-3 transition-colors hover:bg-elevated"
           >
-            <UAvatar
-              :text="avatarLetter(contact.display_name)"
-              color="primary"
-              size="md"
-              class="mx-auto mb-2"
-            />
-            <p class="mb-2 truncate text-center text-[10px] font-bold text-highlighted">
-              {{ contact.display_name }}
-            </p>
+            <NuxtLink :to="`/dm/${contact.node_id}`" class="block">
+              <UAvatar
+                :text="avatarLetter(contact.display_name)"
+                color="primary"
+                size="md"
+                class="mx-auto mb-2"
+              />
+              <p class="mb-2 truncate text-center text-[10px] font-bold text-highlighted">
+                {{ contact.display_name }}
+              </p>
+            </NuxtLink>
             <div class="flex justify-center gap-1">
               <UTooltip text="Message">
                 <UButton
+                  icon="i-heroicons-envelope"
                   variant="ghost"
                   color="neutral"
                   square
                   aria-label="Message"
-                  @click.stop="() => { navigateTo('/dm/' + contact.node_id) }"
-                >
-                  ✉
-                </UButton>
+                  :to="`/dm/${contact.node_id}`"
+                />
               </UTooltip>
               <UTooltip text="Call">
                 <UButton
+                  icon="i-heroicons-phone"
                   variant="ghost"
                   color="neutral"
                   square
                   aria-label="Call"
-                  @click.stop="() => { navigateTo('/dm/' + contact.node_id) }"
-                >
-                  ☎
-                </UButton>
+                  :to="`/dm/${contact.node_id}?call=1`"
+                />
               </UTooltip>
             </div>
           </div>
@@ -233,11 +174,11 @@ const recentItems = computed<RecentItem[]>(() => {
         />
 
         <div v-else class="-mx-4 -my-4 divide-y divide-default sm:-mx-6 sm:-my-6">
-          <div
+          <NuxtLink
             v-for="item in recentItems"
             :key="item.nodeId"
-            class="flex cursor-pointer items-center gap-3 px-4 py-3 transition-colors hover:bg-elevated sm:px-6"
-            @click="navigateTo('/dm/' + item.nodeId)"
+            :to="`/dm/${item.nodeId}`"
+            class="flex items-center gap-3 px-4 py-3 transition-colors hover:bg-elevated sm:px-6"
           >
             <div
               class="h-2 w-2 shrink-0 rounded-full"
@@ -249,7 +190,7 @@ const recentItems = computed<RecentItem[]>(() => {
                   {{ item.name }}
                 </span>
                 <span class="shrink-0 text-[10px] text-muted">
-                  {{ formatTime(item.timestamp) }}
+                  {{ formatRelativeTime(item.timestamp, now.getTime()) }}
                 </span>
               </div>
               <div class="mt-0.5 flex items-center justify-between gap-2">
@@ -260,7 +201,7 @@ const recentItems = computed<RecentItem[]>(() => {
               </div>
             </div>
             <UIcon name="i-heroicons-chevron-right" class="shrink-0 text-base text-muted" />
-          </div>
+          </NuxtLink>
         </div>
       </UCard>
 
@@ -290,7 +231,6 @@ const recentItems = computed<RecentItem[]>(() => {
       </UButton>
     </footer>
 
-    <NodeIdQrModal v-model:open="qrModalOpen" />
     <AppUpdateModal v-model:open="showUpdateModal" />
 
   </div>

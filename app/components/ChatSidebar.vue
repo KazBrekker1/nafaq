@@ -4,7 +4,6 @@ import { formatTime } from "~/utils/format";
 
 const { messages, displayName = "", peerNames = {} } = defineProps<{
   messages: ChatMessage[];
-  peerId: string;
   displayName?: string;
   peerNames?: Record<string, string>;
 }>();
@@ -20,25 +19,13 @@ function submit() {
   input.value = "";
 }
 
-watch(() => messages.length, async () => {
-  await nextTick();
+// Also watches the element so opening the sidebar lands on the latest
+// message; flush 'post' so new rows are in the DOM before measuring.
+watch([() => messages.length, messagesEl], () => {
   if (messagesEl.value) messagesEl.value.scrollTop = messagesEl.value.scrollHeight;
-});
+}, { immediate: true, flush: "post" });
 
-onMounted(() => {
-  if (window.visualViewport) {
-    const handler = () => {
-      const vh = window.visualViewport!.height;
-      document.documentElement.style.setProperty("--vh", `${vh}px`);
-    };
-    window.visualViewport.addEventListener("resize", handler);
-    handler(); // Initial set
-    onUnmounted(() => {
-      window.visualViewport?.removeEventListener("resize", handler);
-      document.documentElement.style.removeProperty("--vh");
-    });
-  }
-});
+const viewportHeight = useVisualViewportHeight("100dvh");
 </script>
 
 <template>
@@ -50,7 +37,7 @@ onMounted(() => {
   -->
   <div
     class="fixed inset-0 z-30 flex w-full flex-col border-l-0 border-neutral-800 bg-neutral-950 safe-area-inset sm:static sm:inset-auto sm:w-[260px] sm:border-l-2"
-    :style="{ height: 'var(--vh, 100dvh)' }"
+    :style="{ height: viewportHeight }"
   >
     <div class="flex items-center justify-between border-b-2 border-neutral-800 px-4 py-4">
       <span class="label">MESSAGES</span>
@@ -72,7 +59,7 @@ onMounted(() => {
         <span class="text-[9px] tracking-widest" :class="msg.sender === 'you' ? 'text-primary' : 'text-neutral-500'">
           {{ msg.sender === "you" ? (displayName || "You") : (peerNames[msg.peerId || ""] || "Peer") }} · {{ formatTime(msg.timestamp) }}
         </span><br />
-        <span class="mt-1 block text-xs text-neutral-200">{{ msg.text }}</span>
+        <span class="mt-1 block select-text break-words text-xs text-neutral-200">{{ msg.text }}</span>
       </div>
       <div v-if="messages.length === 0" class="p-6 text-center text-xs text-neutral-500">No messages yet</div>
     </div>

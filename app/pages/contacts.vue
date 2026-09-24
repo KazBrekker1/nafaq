@@ -1,33 +1,28 @@
 <script setup lang="ts">
 import { truncateNodeId, avatarLetter } from "~/utils/format";
 
-const { nodeId, displayName } = useCall();
 const { contacts, remove } = useContacts();
-const { isOnline, startProbing, stopProbing } = usePresence();
-const { settings } = useSettings();
+const { isOnline } = usePresence();
 
-const truncatedNodeId = computed(() => {
-  if (!nodeId.value) return "—";
-  return truncateNodeId(nodeId.value);
-});
-
-const { copy, copied: nodeCopied } = useClipboard();
-function copyNodeId() {
-  if (nodeId.value) copy(nodeId.value);
-}
-
-const qrModalOpen = ref(false);
 const addModalOpen = ref(false);
 
-const contactNodeIds = computed(() => contacts.value.map(c => c.node_id));
+// Two-step remove: the first click arms the button, a second click within a
+// few seconds removes the contact.
+const confirmingRemove = ref<string | null>(null);
+const { start: startDisarm, stop: stopDisarm } = useTimeoutFn(() => {
+  confirmingRemove.value = null;
+}, 3000, { immediate: false });
 
-onMounted(() => {
-  startProbing(contactNodeIds);
-});
-
-onUnmounted(() => {
-  stopProbing();
-});
+function onRemove(nodeId: string) {
+  if (confirmingRemove.value === nodeId) {
+    stopDisarm();
+    confirmingRemove.value = null;
+    void remove(nodeId);
+    return;
+  }
+  confirmingRemove.value = nodeId;
+  startDisarm();
+}
 </script>
 
 <template>
@@ -49,23 +44,7 @@ onUnmounted(() => {
 
       <!-- Identity card -->
       <section class="border-b-2 border-default">
-        <div class="px-4 py-4 sm:px-6">
-          <p class="text-sm font-bold text-highlighted">{{ displayName || "—" }}</p>
-          <div class="mt-1 flex items-center justify-between gap-2">
-            <p class="text-xs text-muted">
-              {{ truncatedNodeId }}
-              <span v-if="settings.persistentIdentity" class="ml-1 text-primary">· persistent</span>
-            </p>
-            <UFieldGroup class="shrink-0">
-              <UButton label="QR" @click="() => { qrModalOpen = true }" />
-              <UButton
-                :label="nodeCopied ? 'Copied' : 'Copy'"
-                :color="nodeCopied ? 'primary' : 'neutral'"
-                @click="copyNodeId"
-              />
-            </UFieldGroup>
-          </div>
-        </div>
+        <IdentityCard class="px-4 py-4 sm:px-6" />
       </section>
 
       <!-- Contact list -->
@@ -109,18 +88,18 @@ onUnmounted(() => {
                  demand and succeeds even when presence lags. -->
             <UFieldGroup class="shrink-0">
               <UTooltip text="Message">
-                <UButton icon="i-heroicons-envelope" aria-label="Message" @click="() => { navigateTo('/dm/' + contact.node_id) }" />
+                <UButton icon="i-heroicons-envelope" aria-label="Message" :to="`/dm/${contact.node_id}`" />
               </UTooltip>
               <UTooltip text="Call">
-                <UButton icon="i-heroicons-phone" aria-label="Call" @click="() => { navigateTo('/dm/' + contact.node_id) }" />
+                <UButton icon="i-heroicons-phone" aria-label="Call" :to="`/dm/${contact.node_id}?call=1`" />
               </UTooltip>
-              <UTooltip text="Remove">
+              <UTooltip :text="confirmingRemove === contact.node_id ? 'Tap again to remove' : 'Remove'">
                 <UButton
-                  icon="i-heroicons-x-mark"
+                  :icon="confirmingRemove === contact.node_id ? 'i-heroicons-trash' : 'i-heroicons-x-mark'"
                   color="error"
-                  variant="ghost"
-                  aria-label="Remove"
-                  @click="remove(contact.node_id)"
+                  :variant="confirmingRemove === contact.node_id ? 'solid' : 'ghost'"
+                  :aria-label="confirmingRemove === contact.node_id ? 'Confirm remove' : 'Remove'"
+                  @click="onRemove(contact.node_id)"
                 />
               </UTooltip>
             </UFieldGroup>
@@ -130,13 +109,7 @@ onUnmounted(() => {
 
     </div>
 
-    <NodeIdQrModal v-model:open="qrModalOpen" />
-
-    <!-- Add Contact Modal -->
-    <AddContactModal
-      v-model:open="addModalOpen"
-      @added="addModalOpen = false"
-    />
+    <AddContactModal v-model:open="addModalOpen" />
 
   </div>
 </template>
