@@ -60,7 +60,6 @@ interface PeerMediaState {
 }
 
 interface MediaUploader {
-  mode: "invoke";
   sendAudio: (pcmBytes: Uint8Array, timestamp: number) => Promise<void>;
   sendVideo: (
     rgba: Uint8Array,
@@ -71,7 +70,6 @@ interface MediaUploader {
   ) => Promise<void>;
   /** Returns whether the next frame must be a keyframe. */
   sendEncodedVideo: (h264: Uint8Array, timestamp: number) => Promise<boolean>;
-  close: () => void;
 }
 
 // Receive side lifecycle (startReceiving is idempotent while a session is
@@ -108,10 +106,10 @@ let unlistenVideo: (() => void) | null = null;
 let unlistenDisconnect: (() => void) | null = null;
 let unlistenQuality: (() => void) | null = null;
 let activeSpeakerInterval: ReturnType<typeof setInterval> | null = null;
-const isAndroidUa = /android/i.test(navigator.userAgent);
+const isAndroid = /android/i.test(navigator.userAgent);
 const DEFAULT_PROFILE: VideoProfile = {
   bitrateBps: 400_000,
-  fps: isAndroidUa ? 8 : 12,
+  fps: isAndroid ? 8 : 12,
   maxWidth: 640,
   maxHeight: 360,
 };
@@ -137,7 +135,7 @@ interface QualityProfilePayload {
 function setBaseProfileFromBackend({ bitrate_bps, fps, max_width, max_height }: QualityProfilePayload) {
   callSizeProfile = {
     bitrateBps: bitrate_bps,
-    fps: isAndroidUa ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
+    fps: isAndroid ? Math.min(fps, DEFAULT_PROFILE.fps) : fps,
     maxWidth: max_width,
     maxHeight: max_height,
   };
@@ -212,7 +210,6 @@ async function listenForRun<T>(token: number, event: string, handler: (event: { 
   return unlisten;
 }
 
-const isAndroid = isAndroidUa;
 const DECODER_CODEC = "avc1.42001E"; // H.264 Constrained Baseline Level 3.0
 // A VideoDecoder global doesn't guarantee H.264 support (e.g. Linux WebKitGTK
 // without the codec plugins); probe once and reuse the answer.
@@ -409,17 +406,15 @@ function effectiveProfile() {
   return applySendLevel(baseProfile, sendLevel);
 }
 
-function currentCaptureBounds() {
-  const { maxWidth, maxHeight } = effectiveProfile();
-  return { maxWidth, maxHeight };
-}
-
 function evenDimension(value: number, fallback: number) {
   const normalized = Number.isFinite(value) ? Math.max(2, Math.round(value)) : fallback;
   return normalized % 2 === 0 ? normalized : normalized - 1;
 }
 
-function resolveCaptureDimensions(stream?: MediaStream | null, bounds = currentCaptureBounds()) {
+function resolveCaptureDimensions(
+  stream?: MediaStream | null,
+  bounds: Pick<VideoProfile, "maxWidth" | "maxHeight"> = effectiveProfile(),
+) {
   const track = stream?.getVideoTracks()[0];
   const settings = track?.getSettings();
   const sourceWidth = Number(settings?.width || 0);
@@ -1012,7 +1007,6 @@ function createMediaUploader(
   invoke: typeof import("@tauri-apps/api/core").invoke,
 ): MediaUploader {
   return {
-    mode: "invoke",
     sendAudio: async (pcmBytes, timestamp) => {
       if (preferJsonAudioInvoke) {
         await invoke("send_audio_all", { data: toBase64(pcmBytes), timestamp });
@@ -1072,7 +1066,6 @@ function createMediaUploader(
         headers: { "Content-Type": "application/octet-stream" },
       });
     },
-    close: () => {},
   };
 }
 
@@ -1363,7 +1356,7 @@ export function useMediaTransport() {
           lastCaptureTime = now;
           const ctx = ensureCaptureSurface(currentWidth, currentHeight);
           if (ctx && captureCanvas && drawContainedVideoFrame(ctx, currentWidth, currentHeight)) {
-            const keyframe = frameCount === 0 || frameCount % 48 === 0;
+            const keyframe = frameCount % 48 === 0;
             frameCount += 1;
             if (webEncoder && webEncoder.state === "configured") {
               reconfigureWebEncoder();
@@ -1608,7 +1601,6 @@ export function useMediaTransport() {
       captureRafId = null;
     }
     activeCaptureStream = null;
-    mediaUploader?.close();
     mediaUploader = null;
     if (workletNode) {
       workletNode.port.onmessage = null;
@@ -1718,7 +1710,6 @@ export function useMediaTransport() {
     restartSending,
     startReceiving,
     stop,
-    updateCaptureDimensions,
     setPeerVideoPaused,
   };
 }
