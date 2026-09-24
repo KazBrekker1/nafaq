@@ -233,13 +233,12 @@ let loggedAudioInvokeFallback = false;
 let loggedVideoInvokeFallback = false;
 
 const peerMediaStates = new Map<string, PeerMediaState>();
-const initialKeyframeRequests = new Set<string>();
 
 const peerVideoDecoders = new Map<string, VideoDecoder>();
 // Peers whose decoder hasn't yet seen its first keyframe. Feeding a fresh H.264
 // decoder a delta frame before an IDR produces a decode error and a black
-// canvas, so we drop deltas until the keyframe (which syncSubscriptions
-// requests on join) arrives.
+// canvas, so we drop deltas until the keyframe (requested when the peer's
+// canvas mounts) arrives.
 const peersAwaitingKeyframe = new Set<string>();
 
 // Per-peer decode error tracking so a persistently broken stream (e.g. a
@@ -1184,21 +1183,6 @@ export function useMediaTransport() {
     });
   }
 
-  async function syncSubscriptions(peerIds = peerIdsProvider?.() ?? []) {
-    for (const peerId of Array.from(initialKeyframeRequests)) {
-      if (!peerIds.includes(peerId)) {
-        initialKeyframeRequests.delete(peerId);
-      }
-    }
-
-    for (const peerId of peerIds) {
-      if (!initialKeyframeRequests.has(peerId)) {
-        initialKeyframeRequests.add(peerId);
-        requestKeyframe(peerId).catch(() => {});
-      }
-    }
-  }
-
   function registerPeerCanvas(peerId: string, canvas: HTMLCanvasElement | null) {
     // Function refs fire on every re-render of the tile, not just on mount —
     // only a real change may cost a decoder reset and a keyframe request.
@@ -1219,10 +1203,11 @@ export function useMediaTransport() {
       handleIncomingVideoFrame(peerId, frame.timestamp, frame.width, frame.height, frame.jpegBytes)
         .catch(() => {});
     } else {
-      // Bypass the debounce: syncSubscriptions may have already requested a
-      // keyframe for this peer moments ago (e.g. on join), which would
-      // otherwise suppress this request and leave the canvas black until the
-      // next periodic IDR.
+      // A new call connection already starts with a keyframe (the sender's
+      // writer and our reorder buffer both wait for one), but a canvas that
+      // mounts later, or is replaced, needs a fresh one. Bypass the debounce:
+      // a request moments ago (e.g. decoder recovery) would otherwise
+      // suppress this one and leave the canvas black until the next IDR.
       peersAwaitingKeyframe.add(peerId);
       requestKeyframe(peerId, true).catch(() => {});
     }
@@ -1430,10 +1415,7 @@ export function useMediaTransport() {
 
   async function startReceiving(getPeerIds: () => string[]) {
     peerIdsProvider = getPeerIds;
-    if (receiveState !== "idle") {
-      await syncSubscriptions(getPeerIds());
-      return;
-    }
+    if (receiveState !== "idle") return;
 
     const token = receiveRunToken;
     receiveState = "starting";
@@ -1444,7 +1426,7 @@ export function useMediaTransport() {
     disposeReceiveListeners();
 
     try {
-      await startReceivingInner(getPeerIds, token);
+      await startReceivingInner(token);
       receiveState = "running";
     } catch (error) {
       // stop() landed mid-setup and already tore everything down.
@@ -1457,7 +1439,7 @@ export function useMediaTransport() {
     }
   }
 
-  async function startReceivingInner(getPeerIds: () => string[], token: number) {
+  async function startReceivingInner(token: number) {
     // Quality listeners go first: a profile change emitted while the playback
     // context and bridge probe are still settling must not be missed.
     // Call-size profile: rebuild the encoder at the new base; the backend
@@ -1516,13 +1498,11 @@ export function useMediaTransport() {
       if (state) releasePeerAudio(state);
       forgetPeerVideoDecoderState(pid);
       peerMediaStates.delete(pid);
-      initialKeyframeRequests.delete(pid);
       if (activeSpeaker.value === pid) activeSpeaker.value = null;
       updateSpeakingMap();
     });
 
     startActiveSpeakerDetection();
-    await syncSubscriptions(getPeerIds());
   }
 
   function startActiveSpeakerDetection() {
@@ -1700,7 +1680,6 @@ export function useMediaTransport() {
     }
 
     peerMediaStates.clear();
-    initialKeyframeRequests.clear();
     activeSpeaker.value = null;
     peerSpeakingMap.value = {};
     peerIdsProvider = null;
@@ -1739,7 +1718,6 @@ export function useMediaTransport() {
     restartSending,
     startReceiving,
     stop,
-    syncSubscriptions,
     updateCaptureDimensions,
     setPeerVideoPaused,
   };

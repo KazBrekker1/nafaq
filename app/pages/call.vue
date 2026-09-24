@@ -262,8 +262,6 @@ watch(() => [...call.peers.value], async (peerIds, oldPeerIds) => {
   // Notification sounds
   if (oldPeerIds && peerIds.length > oldPeerIds.length) playPeerConnected();
   if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
-  await transport.syncSubscriptions(peerIds);
-  if (cleaned) return;
   if (media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
     await transport.startSending(media.localStream.value);
   }
