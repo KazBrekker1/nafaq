@@ -412,6 +412,17 @@ async function initCallListeners() {
         // Already busy — record as missed call
         const callerName = peerNames.value[pid] || pid.slice(0, 12);
         showMissedCall(callerName);
+        // Tell the second caller we're busy instead of letting them ring
+        // out. Skip peers already part of this call (a duplicate invite
+        // from the caller we're ringing for, or someone we're talking to).
+        const partOfThisCall = incomingInvite.value?.peerId === pid
+          || invitedPeerId.value === pid
+          || peers.value.includes(pid);
+        if (!partOfThisCall) {
+          invoke("send_call_decline", { peerId: pid }).catch((e) => {
+            console.warn(`[call] failed to send busy decline to ${pid}:`, e);
+          });
+        }
       }
     }));
 
