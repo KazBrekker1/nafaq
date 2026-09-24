@@ -219,12 +219,13 @@ onMounted(async () => {
 // ── Leaving /call always means leaving the call — no confirmation prompt,
 // the decision is unambiguous. Torn down before navigation resolves so the
 // backend session and call state are already reset by the time onUnmounted
-// (or a fresh mount of /call) runs. ──────────────────────────────────────
+// (or a fresh mount of /call) runs. endCall (not terminateCall) so leaving
+// while still ringing the callee cancels the invite on their side too. ──
 onBeforeRouteLeave(async () => {
   if (!isCallActive()) return;
   await cleanup();
   chat.clearMessages();
-  await call.terminateCall({ navigate: false });
+  await call.endCall({ navigate: false });
 });
 
 // ── Transition: lobby → active call when state becomes connected ─────
@@ -308,10 +309,10 @@ onUnmounted(async () => {
   // Fallback teardown: guarantees the Rust-side session and call state don't
   // outlive this page even if a leave path bypassed the route guard above.
   // No-op when handleEndCall or the route guard already tore down the call,
-  // since terminateCall() always leaves state at "idle".
+  // since endCall() always leaves state at "idle".
   if (isCallActive()) {
     chat.clearMessages();
-    await call.terminateCall({ navigate: false });
+    await call.endCall({ navigate: false });
   }
 });
 

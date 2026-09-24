@@ -104,7 +104,11 @@ function startWaitingForAnswer(targetPeerId: string) {
 // not the notification lands. `notifyPeer: false` skips the CallCancel send
 // for the decline-received path, where the callee already knows the call is
 // over (they're the one who declined) — there's nothing to notify them of.
-async function cancelPendingCall({ notifyPeer = true }: { notifyPeer?: boolean } = {}) {
+// `navigate: false` is for callers already leaving /call (route guard).
+async function cancelPendingCall({
+  notifyPeer = true,
+  navigate = true,
+}: { notifyPeer?: boolean; navigate?: boolean } = {}) {
   clearAnswerTimer();
   const target = invitedPeerId.value;
   invitedPeerId.value = null;
@@ -116,7 +120,7 @@ async function cancelPendingCall({ notifyPeer = true }: { notifyPeer?: boolean }
       console.warn("[call] cancel_call failed:", e);
     }
   }
-  await terminateCall({ navigate: true });
+  await terminateCall({ navigate });
 }
 
 // Shared teardown for both the explicit "End Call" button and any path
@@ -163,12 +167,12 @@ async function terminateCall({ navigate = true }: { navigate?: boolean } = {}) {
 // (nobody ever joined) — route it through cancelPendingCall so the callee is
 // told and our own session-active flag is cleared, instead of silently
 // tearing down local state with nothing sent over the wire.
-async function endCall() {
+async function endCall({ navigate = true }: { navigate?: boolean } = {}) {
   if (state.value === "waiting") {
-    await cancelPendingCall();
+    await cancelPendingCall({ navigate });
     return;
   }
-  await terminateCall({ navigate: true });
+  await terminateCall({ navigate });
 }
 
 async function acceptInvite() {
