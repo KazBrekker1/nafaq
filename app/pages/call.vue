@@ -140,13 +140,26 @@ defineShortcuts({
 // Called both on the lobby → connected transition and, defensively, on mount
 // when the page is created with a call already connected (e.g. a stale
 // remount) — the transition watcher below only fires on a change, so it
-// never runs in that second case.
-async function startConnectedPipeline() {
+// never runs in that second case. Both can fire for the same connection
+// (state flips to connected while onMounted awaits the preview), so the
+// pipeline is single-flight: later callers share the first run.
+let pipelinePromise: Promise<void> | null = null;
+function startConnectedPipeline() {
+  if (!pipelinePromise) {
+    pipelinePromise = runConnectedPipeline().catch((e) => {
+      console.warn("[call] media pipeline failed to start:", e);
+      // Let a later connected transition retry.
+      pipelinePromise = null;
+    });
+  }
+  return pipelinePromise;
+}
+
+async function runConnectedPipeline() {
   // Guards against starting after an unmount-triggered cleanup — starting
   // transport after cleanup would leak it with no owner to stop it.
   if (cleaned) return;
 
-  // Clean up any previous instances (e.g. peer reconnect scenario)
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
   videoVisibilityObserver?.disconnect();
 
