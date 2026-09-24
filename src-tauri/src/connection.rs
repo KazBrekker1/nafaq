@@ -1979,16 +1979,6 @@ impl ConnectionManager {
         announced_peer_id: String,
         ticket: String,
     ) {
-        let is_self = {
-            let guard = self.endpoint.lock().await;
-            guard
-                .as_ref()
-                .is_some_and(|ep| announced_peer_id == ep.id().to_string())
-        };
-        if is_self {
-            return;
-        }
-
         let endpoint_ticket = match crate::node::parse_external_ticket(&ticket) {
             Ok(endpoint_ticket) => endpoint_ticket,
             Err(e) => {
@@ -1997,6 +1987,24 @@ impl ConnectionManager {
             }
         };
         let addr = endpoint_ticket.endpoint_addr().clone();
+
+        // The ticket is what gets cached, relayed and dialed, so it — not the
+        // peer-supplied id — decides who this announce is about. A mismatch
+        // would let one peer poison another peer's cached ticket.
+        if addr.id.to_string() != announced_peer_id {
+            tracing::warn!(
+                "Mesh: rejected announce from {sender_id}: ticket is for {}, not {announced_peer_id}",
+                addr.id
+            );
+            return;
+        }
+        let is_self = {
+            let guard = self.endpoint.lock().await;
+            guard.as_ref().is_some_and(|ep| addr.id == ep.id())
+        };
+        if is_self {
+            return;
+        }
 
         let ticket_changed = self.upsert_peer_ticket(&announced_peer_id, &ticket).await;
         if !ticket_changed {
@@ -3704,6 +3712,30 @@ mod tests {
         assert!(!manager.peers.lock().await.contains_key(&peer_id));
 
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn announce_whose_ticket_is_for_another_peer_is_rejected() {
+        let (event_tx, _) = broadcast::channel::<Event>(8);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(8);
+        let manager = test_manager(event_tx, audio_tx, video_tx);
+
+        let victim_addr = EndpointAddr::from_parts(
+            test_public_key(),
+            [TransportAddr::Relay(node::RELAY_URL_PARSED.clone())],
+        );
+        let victim_id = victim_addr.id.to_string();
+        let attacker_addr = EndpointAddr::from_parts(
+            test_public_key(),
+            [TransportAddr::Relay(node::RELAY_URL_PARSED.clone())],
+        );
+        let attacker_ticket = serialize_endpoint_addr(attacker_addr);
+
+        manager
+            .handle_peer_announce("sender", victim_id.clone(), attacker_ticket)
+            .await;
+        assert!(manager.peer_tickets.lock().await.is_empty());
     }
 
     #[tokio::test]
