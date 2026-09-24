@@ -803,10 +803,12 @@ pub struct ConnectionManager {
     /// third-party invite sent mid-call) must not shut the gate on a live call.
     pending_invitee: Arc<StdMutex<Option<String>>>,
     /// Peers whose stale call connection was evicted to make room for a
-    /// replacement that is still being set up. Their `PeerDisconnected` is
-    /// withheld so a reconnect doesn't look like the peer left; it is emitted
-    /// only if the replacement fails (see `setup_connection`).
-    replacing_peers: Arc<StdMutex<HashSet<String>>>,
+    /// replacement that is still being set up, mapped to the `stable_id` of
+    /// that replacement. Their `PeerDisconnected` is withheld so a reconnect
+    /// doesn't look like the peer left; it is emitted only if the replacement
+    /// fails (see `setup_connection`). Keyed by connection so a concurrent,
+    /// unrelated setup attempt for the same peer can't clear or emit it.
+    replacing_peers: Arc<StdMutex<HashMap<String, usize>>>,
     /// Recently-seen DM `Text` message ids per peer, for ack + dedup. Bounded
     /// per peer so a chatty (or malicious) peer can't grow this unbounded.
     recent_dm_ids: Arc<Mutex<HashMap<String, RecentIds>>>,
@@ -889,7 +891,7 @@ impl ConnectionManager {
             presence: Arc::new(Mutex::new(None)),
             call_session_active: Arc::new(AtomicBool::new(false)),
             pending_invitee: Arc::new(StdMutex::new(None)),
-            replacing_peers: Arc::new(StdMutex::new(HashSet::new())),
+            replacing_peers: Arc::new(StdMutex::new(HashMap::new())),
             recent_dm_ids: Arc::new(Mutex::new(HashMap::new())),
             contacts: Arc::new(StdMutex::new(HashSet::new())),
         }
@@ -1105,6 +1107,7 @@ impl ConnectionManager {
         &self,
         peer_id: &str,
         expected_connection_id: usize,
+        candidate_connection_id: usize,
         reason: &'static [u8],
     ) {
         let evicted = Self::cleanup_peer_entry(
@@ -1124,7 +1127,7 @@ impl ConnectionManager {
             self.replacing_peers
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .insert(peer_id.to_string());
+                .insert(peer_id.to_string(), candidate_connection_id);
             self.emit_peer_connection_status(
                 peer_id,
                 PeerConnectionKind::Reconnecting,
@@ -1137,6 +1140,7 @@ impl ConnectionManager {
         &self,
         peer_id: &str,
         direction: ConnectionDirection,
+        candidate_connection_id: usize,
     ) -> bool {
         let local_node_id = self.local_node_id().await;
 
@@ -1161,8 +1165,13 @@ impl ConnectionManager {
         // connection as already evicted so a returning peer isn't rejected
         // during the QUIC idle-timeout window.
         if conn_closed {
-            self.evict_stale_call_peer(peer_id, existing_conn_id, b"stale_call_connection")
-                .await;
+            self.evict_stale_call_peer(
+                peer_id,
+                existing_conn_id,
+                candidate_connection_id,
+                b"stale_call_connection",
+            )
+            .await;
             return true;
         }
 
@@ -1175,8 +1184,13 @@ impl ConnectionManager {
         if matches!(direction, ConnectionDirection::Inbound)
             && self.call_entry_predates_recent_rejoin(peer_id).await
         {
-            self.evict_stale_call_peer(peer_id, existing_conn_id, b"peer_rejoined_gossip")
-                .await;
+            self.evict_stale_call_peer(
+                peer_id,
+                existing_conn_id,
+                candidate_connection_id,
+                b"peer_rejoined_gossip",
+            )
+            .await;
             return true;
         }
 
@@ -1187,8 +1201,13 @@ impl ConnectionManager {
         // QUIC does not retransmit. The newest connection wins; rejecting it
         // would strand both sides on a half-dead connection until idle timeout.
         if existing_direction == direction {
-            self.evict_stale_call_peer(peer_id, existing_conn_id, b"superseded_by_redial")
-                .await;
+            self.evict_stale_call_peer(
+                peer_id,
+                existing_conn_id,
+                candidate_connection_id,
+                b"superseded_by_redial",
+            )
+            .await;
             return true;
         }
 
@@ -1817,14 +1836,22 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
     ) -> Result<()> {
+        let connection_id = connection.stable_id();
         let result = self
             .setup_connection_inner(peer_id.clone(), connection, direction)
             .await;
-        let was_replacing = self
-            .replacing_peers
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&peer_id);
+        // Only the attempt that performed the eviction may resolve it.
+        let was_replacing = {
+            let mut replacing = self
+                .replacing_peers
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let ours = replacing.get(&peer_id) == Some(&connection_id);
+            if ours {
+                replacing.remove(&peer_id);
+            }
+            ours
+        };
         if was_replacing && !self.call_peer_connected(&peer_id).await {
             // The old connection was evicted but the replacement never made
             // it in: now the peer really is gone.
@@ -1863,7 +1890,7 @@ impl ConnectionManager {
         }
 
         if !self
-            .should_accept_call_connection(&peer_id, direction)
+            .should_accept_call_connection(&peer_id, direction, connection.stable_id())
             .await
         {
             tracing::info!(
