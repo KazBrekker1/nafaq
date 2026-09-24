@@ -242,24 +242,17 @@ watch(() => call.peers.value, async (peerIds, oldPeerIds) => {
   if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
 }, { deep: true });
 
-// Restart transport when device is switched mid-call.
-let wasEncoding = false;
-watch(() => media.localStream.value, async (newStream) => {
+// Restart transport when device is switched mid-call. startPreview swaps the
+// stream synchronously (old → new, the intermediate null is never observed),
+// so compare the two streams directly.
+watch(() => media.localStream.value, async (newStream, oldStream) => {
   if (cleaned) return;
-  if (!newStream) {
-    wasEncoding = transport.encoding.value;
-    return;
-  }
-  // Reset unconditionally — a stale true (stream arrived with no peers yet)
-  // must not trigger a restart on a later, unrelated stream change.
-  const shouldRestart = wasEncoding && call.peers.value.length > 0;
-  wasEncoding = false;
-  if (shouldRestart) {
-    try {
-      await transport.restartSending(newStream);
-    } catch (e) {
-      console.warn("[call] restartSending failed:", e);
-    }
+  if (!newStream || !oldStream || newStream === oldStream) return;
+  if (!transport.encoding.value || call.peers.value.length === 0) return;
+  try {
+    await transport.restartSending(newStream);
+  } catch (e) {
+    console.warn("[call] restartSending failed:", e);
   }
 });
 
