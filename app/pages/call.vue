@@ -255,17 +255,19 @@ watch([() => media.localStream.value, localVideoEl], ([stream, el]) => {
   if (el) el.srcObject = stream || null;
 }, { immediate: true });
 
-watch(() => call.peers.value, async (peerIds, oldPeerIds) => {
+// peers is mutated in place (push/splice), so a deep watch hands over the
+// same array as old and new value — watch a copy to compare lengths.
+watch(() => [...call.peers.value], async (peerIds, oldPeerIds) => {
   if (cleaned) return;
+  // Notification sounds
+  if (oldPeerIds && peerIds.length > oldPeerIds.length) playPeerConnected();
+  if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
   await transport.syncSubscriptions(peerIds);
   if (cleaned) return;
   if (media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
     await transport.startSending(media.localStream.value);
   }
-  // Notification sounds
-  if (oldPeerIds && peerIds.length > oldPeerIds.length) playPeerConnected();
-  if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
-}, { deep: true });
+});
 
 // Restart transport when device is switched mid-call. startPreview swaps the
 // stream synchronously (old → new, the intermediate null is never observed),
@@ -507,8 +509,8 @@ function handleSendChat(text: string) {
                 :key="i"
                 class="w-[3px]"
                 :style="{
-                  height: `${3 + (i <= media.micLevel.value / 12 ? (media.micLevel.value / 12) * 1.5 : 0)}px`,
-                  background: i <= media.micLevel.value / 12 ? 'var(--ui-primary)' : 'var(--ui-border-muted)'
+                  height: `${3 + (i <= media.micLevel.value * 8 ? media.micLevel.value * 8 * 1.5 : 0)}px`,
+                  background: i <= media.micLevel.value * 8 ? 'var(--ui-primary)' : 'var(--ui-border-muted)'
                 }"
               />
             </div>
