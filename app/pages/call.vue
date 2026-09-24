@@ -10,6 +10,7 @@ const { peerConnectionStatuses } = useNodeRuntime();
 const { playPeerConnected, playPeerLeft, playMessageReceived } = useNotificationSounds();
 const { starFromCall, contacts } = useContacts();
 const { request: requestWakeLock, release: releaseWakeLock } = useWakeLock();
+const toast = useToast();
 
 const starredPeers = ref<Set<string>>(new Set());
 
@@ -230,6 +231,16 @@ onBeforeRouteLeave(async () => {
 watch(() => call.state.value, async (newState, oldState) => {
   if (newState === "connected" && oldState !== "connected") {
     await startConnectedPipeline();
+    return;
+  }
+  // Dropped back to idle without leaving the page ourselves (join failed,
+  // invite declined or unanswered): don't strand the user in the lobby.
+  // The toast outlives the navigation (UApp hosts it).
+  if (newState === "idle" && !cleaned) {
+    if (call.error.value) {
+      toast.add({ title: "Call ended", description: call.error.value, color: "error" });
+    }
+    navigateTo("/");
   }
 });
 
