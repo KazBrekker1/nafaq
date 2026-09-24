@@ -117,7 +117,12 @@ impl VideoReorderBuffer {
                 if frame.is_keyframe {
                     self.start_chain(frame, now, &mut out);
                 } else {
-                    self.hold(frame);
+                    // Kept in case its keyframe completes later; bounded by
+                    // evicting the oldest, which is least likely to matter.
+                    self.held.insert(frame.seq, frame);
+                    while self.held.len() > REORDER_MAX_HELD {
+                        self.held.pop_first();
+                    }
                     out.need_keyframe = true;
                 }
             }
@@ -128,7 +133,11 @@ impl VideoReorderBuffer {
                     // A keyframe ahead of a hole resynchronises immediately.
                     self.start_chain(frame, now, &mut out);
                 } else {
-                    self.hold(frame);
+                    // Not trimmed here: exceeding the cap means the hole
+                    // isn't going to fill, which the check below turns into
+                    // a reset + keyframe request. (Trimming would silently
+                    // drop the frames right after the hole instead.)
+                    self.held.insert(frame.seq, frame);
                     self.gap_since.get_or_insert(now);
                 }
             }
@@ -159,13 +168,6 @@ impl VideoReorderBuffer {
         }
         self.expected = Some(next);
         self.gap_since = if self.held.is_empty() { None } else { Some(now) };
-    }
-
-    fn hold(&mut self, frame: ReceivedVideoFrame) {
-        self.held.insert(frame.seq, frame);
-        while self.held.len() > REORDER_MAX_HELD {
-            self.held.pop_first();
-        }
     }
 }
 
@@ -431,6 +433,26 @@ mod tests {
         assert!(out.ready.is_empty());
         let out = buf.push(frame(5, true), start + REORDER_GAP_TIMEOUT);
         assert_eq!(seqs(&out), vec![5]);
+    }
+
+    #[test]
+    fn overflowing_the_hold_while_chained_resets_and_requests_keyframe() {
+        let mut buf = VideoReorderBuffer::new();
+        let now = Instant::now();
+        buf.push(frame(1, true), now);
+        // Frame 2 is missing; 3.. pile up before the gap timeout.
+        for seq in 3..(3 + REORDER_MAX_HELD as u32) {
+            let out = buf.push(frame(seq, false), now);
+            assert!(out.ready.is_empty());
+            assert!(!out.need_keyframe, "held {seq} within the cap");
+        }
+        let out = buf.push(frame(3 + REORDER_MAX_HELD as u32, false), now);
+        assert!(out.ready.is_empty());
+        assert!(out.need_keyframe, "overflow must reset and ask for a keyframe");
+        // The chain restarts only at a keyframe.
+        assert!(buf.push(frame(2, false), now).ready.is_empty());
+        let key = 4 + REORDER_MAX_HELD as u32;
+        assert_eq!(seqs(&buf.push(frame(key, true), now)), vec![key]);
     }
 
     #[test]
