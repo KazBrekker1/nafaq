@@ -6,7 +6,6 @@ import { truncateNodeId } from "~/utils/format";
 const { showName = true } = defineProps<{ showName?: boolean }>();
 
 const { nodeId, displayName } = useCall();
-const { settings } = useSettings();
 
 const shortNodeId = computed(() => (nodeId.value ? truncateNodeId(nodeId.value) : "—"));
 
@@ -26,7 +25,7 @@ const qrModalOpen = ref(false);
       </p>
       <div class="flex items-center gap-2" :class="{ 'mt-1': showName }">
         <p class="truncate text-xs text-muted">{{ shortNodeId }}</p>
-        <UBadge v-if="settings.persistentIdentity" color="primary" class="shrink-0">
+        <UBadge color="primary" class="shrink-0">
           Persistent
         </UBadge>
       </div>

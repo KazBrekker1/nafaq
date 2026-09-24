@@ -5,7 +5,14 @@ import { relayStatusColor } from "~/utils/format";
 
 const { public: { appVersion } } = useRuntimeConfig();
 const { displayName, relayStatus, nodeError, shareTicket } = useCall();
-const { settings, save } = useSettings();
+const { settings, save: saveSettings } = useSettings();
+const toast = useToast();
+
+async function save(patch: Partial<AppSettings>): Promise<boolean> {
+  const ok = await saveSettings(patch);
+  if (!ok) toast.add({ title: "Could not save setting", color: "error" });
+  return ok;
+}
 
 // ── Devices ───────────────────────────────────────────────
 const media = useMedia();
@@ -78,8 +85,7 @@ const qualityField: SelectField = {
 };
 
 async function onSelect(field: SelectField, value: string) {
-  await save({ [field.key]: value || null } as Partial<AppSettings>);
-  field.apply?.(value);
+  if (await save({ [field.key]: value || null } as Partial<AppSettings>)) field.apply?.(value);
 }
 
 onMounted(loadDevices);
