@@ -36,7 +36,7 @@ pub enum DmMessage {
     FileChunk {
         id: String,
         offset: u64,
-        #[serde(with = "serde_bytes")]
+        #[serde(with = "file_chunk_data")]
         data: Vec<u8>,
     },
     FileEnd {
@@ -45,7 +45,6 @@ pub enum DmMessage {
     CallInvite {
         ticket: String,
     },
-    CallAccept,
     CallDecline,
     /// Caller gives up on a pending invite (explicit cancel or ring timeout)
     /// before the callee answered. New variant — see wire-compat note below.
@@ -74,8 +73,58 @@ pub enum DmMessage {
 // `Text{id: Some(_)}` still deserializes on an old receiver (unknown fields
 // are ignored by default; no `deny_unknown_fields` is set on this enum).
 
-/// Stream type identifiers for binary frame protocol
-pub const STREAM_AUDIO: u8 = 0x01;
+/// Wire encoding of `FileChunk.data`.
+///
+/// Receive: accepts both the legacy JSON number array and a base64 string.
+/// Send: still the number array. A 0.10.0 receiver (`serde_bytes`) would
+/// accept a JSON string as the string's raw UTF-8 bytes, so base64 would be
+/// silently written to disk as file content (or rejected as oversized).
+// TODO: switch `serialize` to base64 (about 3x smaller frames) once no peers
+// on <= 0.10.0 remain, i.e. once every supported build decodes base64 here.
+mod file_chunk_data {
+    use base64::Engine;
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::Serializer;
+
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(data, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct DataVisitor;
+
+        impl<'de> Visitor<'de> for DataVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte array or a base64 string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                B64.decode(v).map_err(E::custom)
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(v.to_vec())
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64 * 1024));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(DataVisitor)
+    }
+}
+
+/// Stream type identifiers for binary frame protocol. 0x01 was a legacy
+/// uni-stream audio channel (audio travels as datagrams); don't reuse it.
 pub const STREAM_VIDEO: u8 = 0x02;
 pub const STREAM_CHAT: u8 = 0x03;
 pub const STREAM_CONTROL: u8 = 0x04;
@@ -84,6 +133,10 @@ pub const STREAM_DM: u8 = 0x05;
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
     pub peer_id: String,
+    /// `stable_id` of the QUIC connection the packet arrived on. The sender's
+    /// sequence counter restarts with every connection, so receivers reset
+    /// their per-peer sequence/decoder state when this changes.
+    pub connection_id: usize,
     pub timestamp_ms: u64,
     pub sequence: u16,
     pub payload: Vec<u8>,
@@ -125,28 +178,6 @@ pub struct MediaSessionProfile {
     pub session_id: String,
     pub receive_bridge_mode: MediaBridgeMode,
     pub receive_video_mode: MediaReceiveVideoMode,
-}
-
-/// Commands from frontend → Rust backend (via Tauri invoke)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Command {
-    GetNodeInfo,
-    CreateCall,
-    JoinCall {
-        ticket: String,
-    },
-    EndCall {
-        peer_id: String,
-    },
-    SendChat {
-        peer_id: String,
-        message: String,
-    },
-    SendControl {
-        peer_id: String,
-        action: ControlAction,
-    },
 }
 
 /// Control actions sent between peers
@@ -207,13 +238,6 @@ pub enum PeerConnectionKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    NodeInfo {
-        id: String,
-        ticket: String,
-    },
-    CallCreated {
-        ticket: String,
-    },
     PeerConnected {
         peer_id: String,
     },
@@ -228,17 +252,10 @@ pub enum Event {
         peer_id: String,
         action: ControlAction,
     },
-    ConnectionStatus {
-        peer_id: String,
-        status: ConnectionStatusKind,
-    },
     PeerConnectionStatusChanged {
         peer_id: String,
         status: PeerConnectionKind,
         reason: Option<String>,
-    },
-    Error {
-        message: String,
     },
     QualityProfileChanged {
         peer_count: usize,
@@ -289,6 +306,8 @@ pub enum Event {
     DmFileTransferFailed {
         peer_id: String,
         file_id: String,
+        /// Human-readable cause, for logs/UI. Additive field.
+        reason: Option<String>,
     },
     DmFileProgress {
         peer_id: String,
@@ -299,14 +318,6 @@ pub enum Event {
         peer_id: String,
         online: bool,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionStatusKind {
-    Direct,
-    Relayed,
-    Connecting,
 }
 
 #[derive(Debug, Clone)]
@@ -353,28 +364,48 @@ pub async fn write_framed(
     Ok(())
 }
 
-/// Maximum frame size (10 MB) — prevents OOM from malicious length prefixes.
-const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+/// Frame size cap for chat streams: chat messages are raw UTF-8 and the
+/// sender rejects anything over 64 KiB (`commands::MAX_CHAT_LEN`).
+pub const MAX_CHAT_FRAME_BYTES: usize = 64 * 1024;
+/// Frame size cap for control streams: small JSON `ControlAction`s (the
+/// largest is a `PeerAnnounce` carrying a ticket of at most a few KiB).
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+/// Frame size cap for DM streams. The largest legitimate frames:
+/// - a 64 KiB `FileChunk` in the (still sent) JSON number-array encoding:
+///   at most 4 bytes per byte (`255,`) = 256 KiB, plus a ~100 byte envelope
+///   (base64 would be ~88 KiB);
+/// - a 64 KiB `Text` whose JSON escaping expands control chars 6x
+///   (`\u0001`) = 384 KiB, plus envelope.
+///
+/// 512 KiB covers both with headroom (was a blanket 10 MiB).
+pub const MAX_DM_FRAME_BYTES: usize = 512 * 1024;
+
+/// Frames are read in slices of this size, so a peer declaring a large
+/// length only costs memory for bytes it actually sends.
+const FRAME_READ_SLICE: usize = 16 * 1024;
 
 /// Read a length-prefixed message from a QUIC stream.
-/// Returns None if the stream is finished.
+/// Returns None if the stream is finished, or if the peer declared a frame
+/// larger than `max_len` (the caller stops reading the stream).
 pub async fn read_framed(
     recv: &mut iroh::endpoint::RecvStream,
+    max_len: usize,
 ) -> Result<Option<Vec<u8>>, iroh::endpoint::ReadExactError> {
     let mut len_buf = [0u8; 4];
-    match recv.read_exact(&mut len_buf).await {
-        Ok(()) => {}
-        Err(e) => {
-            return Err(e);
-        }
-    }
+    recv.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        tracing::warn!("Frame too large ({len} bytes), dropping connection");
+    if len > max_len {
+        tracing::warn!("Frame too large ({len} > {max_len} bytes), dropping stream");
         return Ok(None);
     }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
+    // Grow the buffer as data arrives instead of allocating `len` up front.
+    let mut buf = Vec::with_capacity(len.min(FRAME_READ_SLICE));
+    while buf.len() < len {
+        let start = buf.len();
+        let slice = (len - start).min(FRAME_READ_SLICE);
+        buf.resize(start + slice, 0);
+        recv.read_exact(&mut buf[start..]).await?;
+    }
     Ok(Some(buf))
 }
 
@@ -425,26 +456,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_command_serialize_get_node_info() {
-        let cmd = Command::GetNodeInfo;
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"type":"get_node_info"}"#);
-    }
-
-    #[test]
-    fn test_command_serialize_join_call() {
-        let cmd = Command::JoinCall {
-            ticket: "abc123".into(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        match parsed {
-            Command::JoinCall { ticket } => assert_eq!(ticket, "abc123"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn test_event_serialize_peer_connected() {
         let evt = Event::PeerConnected {
             peer_id: "deadbeef".into(),
@@ -457,7 +468,7 @@ mod tests {
     #[test]
     fn test_media_frame_roundtrip() {
         let frame = MediaFrame {
-            stream_type: STREAM_AUDIO,
+            stream_type: STREAM_VIDEO,
             peer_id: [0xAB; 32],
             timestamp_ms: 1234567890,
             payload: vec![1, 2, 3, 4, 5],
@@ -466,7 +477,7 @@ mod tests {
         assert_eq!(encoded.len(), MediaFrame::HEADER_SIZE + 5);
 
         let decoded = MediaFrame::decode(&encoded).unwrap();
-        assert_eq!(decoded.stream_type, STREAM_AUDIO);
+        assert_eq!(decoded.stream_type, STREAM_VIDEO);
         assert_eq!(decoded.peer_id, [0xAB; 32]);
         assert_eq!(decoded.timestamp_ms, 1234567890);
         assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);
@@ -526,6 +537,32 @@ mod tests {
             DmMessage::Text { id, .. } => assert_eq!(id, None),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn file_chunk_is_still_sent_as_a_number_array() {
+        let msg = DmMessage::FileChunk {
+            id: "t".into(),
+            offset: 0,
+            data: vec![1, 2, 255],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""data":[1,2,255]"#), "{json}");
+    }
+
+    #[test]
+    fn file_chunk_accepts_array_and_base64_data() {
+        for json in [
+            r#"{"type":"file_chunk","id":"t","offset":0,"data":[1,2,255]}"#,
+            r#"{"type":"file_chunk","id":"t","offset":0,"data":"AQL/"}"#,
+        ] {
+            match serde_json::from_str::<DmMessage>(json).unwrap() {
+                DmMessage::FileChunk { data, .. } => assert_eq!(data, vec![1, 2, 255], "{json}"),
+                other => panic!("wrong variant {other:?}"),
+            }
+        }
+        let bad = r#"{"type":"file_chunk","id":"t","offset":0,"data":"not base64!"}"#;
+        assert!(serde_json::from_str::<DmMessage>(bad).is_err());
     }
 
     #[test]

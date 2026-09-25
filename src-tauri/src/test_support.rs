@@ -59,7 +59,7 @@ impl TestNode {
             video_tx,
             latest_ticket.clone(),
         ));
-        mgr.set_endpoint(endpoint.clone()).await;
+        mgr.set_endpoint(endpoint.clone());
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let presence = Arc::new(PresenceManager::new(
@@ -68,7 +68,7 @@ impl TestNode {
             event_tx.clone(),
             address_lookup,
         ));
-        mgr.set_presence(presence.clone()).await;
+        mgr.set_presence(presence.clone());
 
         let router = Router::builder(endpoint.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr.clone()))

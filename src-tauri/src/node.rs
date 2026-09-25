@@ -172,7 +172,7 @@ mod tests {
         let ticket_str = generate_ticket(&endpoint);
         assert!(!ticket_str.is_empty());
         let ticket = parse_ticket(&ticket_str).unwrap();
-        assert_eq!(ticket.endpoint_addr().id, endpoint.id().into());
+        assert_eq!(ticket.endpoint_addr().id, endpoint.id());
         endpoint.close().await;
     }
 
@@ -181,7 +181,7 @@ mod tests {
         let endpoint = create_test_endpoint().await.unwrap();
         let ticket_str = wait_for_online_ticket(&endpoint).await;
         let ticket = parse_ticket(&ticket_str).unwrap();
-        assert_eq!(ticket.endpoint_addr().id, endpoint.id().into());
+        assert_eq!(ticket.endpoint_addr().id, endpoint.id());
         assert!(
             !ticket.endpoint_addr().addrs.is_empty(),
             "shareable ticket should contain at least one dialable address"

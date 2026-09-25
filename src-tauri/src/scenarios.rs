@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::messages::{ControlAction, DmMessage, Event};
-use crate::test_support::{TestNode, wait_for_event};
+use crate::test_support::{wait_for_event, TestNode};
 
 /// Phase-1 sanity: when two nodes track each other as contacts, both sides
 /// should see `PresenceChanged { online: true }` via gossip neighbor-up.
@@ -136,7 +136,7 @@ async fn dm_survives_peer_restart_with_persistent_identity() {
     b_new.presence.track_contact(&a_id).await.unwrap();
 
     // A should see B come back online via gossip — this is what triggers
-    // the `peer_recently_rejoined_gossip` branch in should_accept_dm_connection.
+    // the `dm_entry_predates_recent_rejoin` eviction in dm_connection_handling.
     let a_sees_b_again = wait_for_event(&mut rx_a, Duration::from_secs(60), |e| {
         matches!(e,
             Event::PresenceChanged { peer_id, online: true } if peer_id == &b_id
@@ -1030,6 +1030,9 @@ async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
     .await
     .expect("A never saw B online before interrupted transfer");
 
+    // Only saved contacts may send files (mirrors the contacts store).
+    b.mgr.add_contact(&a_id);
+
     let file_id = "interrupted-large-transfer".to_string();
     let chunk = vec![7u8; 128 * 1024];
     a.mgr
@@ -1071,7 +1074,7 @@ async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
     a.mgr.disconnect_dm(&b_id).await;
     wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
         matches!(e,
-            Event::DmFileTransferFailed { peer_id, file_id: seen_id }
+            Event::DmFileTransferFailed { peer_id, file_id: seen_id, .. }
                 if peer_id == &a_id && seen_id == &file_id
         )
     })
@@ -1196,29 +1199,28 @@ async fn two_node_call_ready_for_mesh() -> (TestNode, TestNode, String, String, 
     let mut rx_a = a.event_tx.subscribe();
     let mut rx_b = b.event_tx.subscribe();
 
-    let a_ticket = a
-        .create_call_ticket()
-        .await
-        .expect("A create_call_ticket");
+    let a_ticket = a.create_call_ticket().await.expect("A create_call_ticket");
     // B must be independently reachable *before* it joins so A learns B's
     // address (via B's self-announce on connect) and can relay it onward.
-    b.create_call_ticket()
-        .await
-        .expect("B create_call_ticket");
+    b.create_call_ticket().await.expect("B create_call_ticket");
 
     b.mgr
         .connect_to_peer_with_ticket(&b.endpoint, &a_ticket)
         .await
         .expect("B joins A");
 
-    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id)
-    })
+    wait_for_event(
+        &mut rx_a,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id),
+    )
     .await
     .expect("A never saw B connect");
-    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id)
-    })
+    wait_for_event(
+        &mut rx_b,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id),
+    )
     .await
     .expect("B never saw A connect");
 
@@ -1251,32 +1253,42 @@ async fn three_node_mesh() -> (TestNode, TestNode, TestNode, String, String, Str
     let mut rx_b = b.event_tx.subscribe();
     let mut rx_c = c.event_tx.subscribe();
 
+    // Mirrors commands::join_call, which arms the call session before dialing.
+    c.mgr.set_call_session_active(true);
     c.mgr
         .connect_to_peer_with_ticket(&c.endpoint, &a_ticket)
         .await
         .expect("C joins A");
 
-    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_a,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("A never saw C connect");
-    wait_for_event(&mut rx_c, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id)
-    })
+    wait_for_event(
+        &mut rx_c,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id),
+    )
     .await
     .expect("C never saw A connect");
 
     // The mesh auto-connect: B and C should dial each other, triggered by
     // A relaying B's ticket to C at C's join (handle_peer_announce).
-    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_b,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("B never auto-connected to C via the peer-announce mesh relay");
-    wait_for_event(&mut rx_c, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id)
-    })
+    wait_for_event(
+        &mut rx_c,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id),
+    )
     .await
     .expect("C never auto-connected to B via the peer-announce mesh relay");
 
@@ -1345,29 +1357,37 @@ async fn leave_propagation_disconnects_cleanly_without_ghost_entries() {
         .await
         .expect("C disconnects from B");
 
-    wait_for_event(&mut rx_a, Duration::from_secs(15), |e| {
-        matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_a,
+        Duration::from_secs(15),
+        |e| matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("A never observed C's departure");
-    wait_for_event(&mut rx_b, Duration::from_secs(15), |e| {
-        matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_b,
+        Duration::from_secs(15),
+        |e| matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("B never observed C's departure");
 
     // No ghost duplicate disconnect events for C on either side.
-    let a_ghost = wait_for_event(&mut rx_a, Duration::from_millis(750), |e| {
-        matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id)
-    })
+    let a_ghost = wait_for_event(
+        &mut rx_a,
+        Duration::from_millis(750),
+        |e| matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id),
+    )
     .await;
     assert!(
         a_ghost.is_none(),
         "A observed a duplicate PeerDisconnected for C"
     );
-    let b_ghost = wait_for_event(&mut rx_b, Duration::from_millis(750), |e| {
-        matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id)
-    })
+    let b_ghost = wait_for_event(
+        &mut rx_b,
+        Duration::from_millis(750),
+        |e| matches!(e, Event::PeerDisconnected { peer_id } if peer_id == &c_id),
+    )
     .await;
     assert!(
         b_ghost.is_none(),
@@ -1423,30 +1443,40 @@ async fn late_joiner_connects_to_both_without_disrupting_existing_pair() {
     let c_id = c.node_id_str();
     let mut rx_c = c.event_tx.subscribe();
 
+    // Mirrors commands::join_call, which arms the call session before dialing.
+    c.mgr.set_call_session_active(true);
     c.mgr
         .connect_to_peer_with_ticket(&c.endpoint, &a_ticket)
         .await
         .expect("C joins A");
 
-    wait_for_event(&mut rx_a, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_a,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("A never saw C connect");
-    wait_for_event(&mut rx_c, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id)
-    })
+    wait_for_event(
+        &mut rx_c,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &a_id),
+    )
     .await
     .expect("C never saw A connect");
 
-    wait_for_event(&mut rx_b, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id)
-    })
+    wait_for_event(
+        &mut rx_b,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &c_id),
+    )
     .await
     .expect("B never auto-connected to late joiner C via peer-announce mesh relay");
-    wait_for_event(&mut rx_c, Duration::from_secs(30), |e| {
-        matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id)
-    })
+    wait_for_event(
+        &mut rx_c,
+        Duration::from_secs(30),
+        |e| matches!(e, Event::PeerConnected { peer_id } if peer_id == &b_id),
+    )
     .await
     .expect("C never auto-connected to B via peer-announce mesh relay");
 

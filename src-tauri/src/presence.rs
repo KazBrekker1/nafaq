@@ -139,18 +139,14 @@ impl PresenceManager {
         self.online.lock().await.clone()
     }
 
-    /// Has `remote_id` been reported as a gossip neighbor in the last `within`?
-    /// Used by the DM accept path to decide "this is a fresh reconnect, evict stale entry".
-    pub async fn is_recent_neighbor(&self, remote_id_str: &str, within: Duration) -> bool {
-        let ups = self.recent_neighbor_ups.lock().await;
-        ups.get(remote_id_str)
-            .is_some_and(|t| t.elapsed() <= within)
-    }
-
     /// Returns the Instant of the most recent `NeighborUp` for this peer, if any.
     /// Used by the outbound DM path to detect stale DM entries that pre-date a remote restart.
     pub async fn last_neighbor_up(&self, remote_id_str: &str) -> Option<Instant> {
-        self.recent_neighbor_ups.lock().await.get(remote_id_str).copied()
+        self.recent_neighbor_ups
+            .lock()
+            .await
+            .get(remote_id_str)
+            .copied()
     }
 }
 
@@ -277,9 +273,7 @@ async fn run_subscription_loop(
                 // may have missed a NeighborDown (peer left) or NeighborUp.
                 // Tear down and let the supervisor re-subscribe for a fresh mesh
                 // view rather than trusting now-possibly-stale online state.
-                tracing::warn!(
-                    "gossip presence stream lagged for {remote_id_str}; resubscribing"
-                );
+                tracing::warn!("gossip presence stream lagged for {remote_id_str}; resubscribing");
                 return;
             }
             Err(e) => {
