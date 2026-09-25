@@ -843,18 +843,50 @@ pub struct ConnectionManager {
     replacing_peers: Arc<StdMutex<HashMap<String, usize>>>,
     /// Recently-seen DM `Text` message ids per peer, for ack + dedup. Bounded
     /// per peer so a chatty (or malicious) peer can't grow this unbounded.
-    recent_dm_ids: Arc<Mutex<HashMap<String, RecentIds>>>,
+    recent_dm_ids: Arc<Mutex<RecentDmIds>>,
     /// Node ids of saved contacts (mirrors the contacts store). Only contacts
     /// may send us files. Kept in sync by startup load and add/remove_contact.
     contacts: Arc<StdMutex<HashSet<String>>>,
 }
 
 const RECENT_DM_IDS_CAPACITY: usize = 256;
+/// Peers tracked in `RecentDmIds`; the least recently active is evicted, so
+/// many distinct senders can't grow the map without bound.
+const RECENT_DM_PEERS_CAPACITY: usize = 256;
 
 #[derive(Default)]
 struct RecentIds {
     order: VecDeque<String>,
     set: HashSet<String>,
+    /// `RecentDmIds::clock` value at this peer's last message.
+    last_used: u64,
+}
+
+/// Per-peer recent DM ids, bounded both per peer and in number of peers.
+#[derive(Default)]
+struct RecentDmIds {
+    peers: HashMap<String, RecentIds>,
+    clock: u64,
+}
+
+impl RecentDmIds {
+    /// Returns true if `id` was already seen from `peer_id`, otherwise records it.
+    fn check_and_insert(&mut self, peer_id: &str, id: &str) -> bool {
+        self.clock += 1;
+        if !self.peers.contains_key(peer_id) && self.peers.len() >= RECENT_DM_PEERS_CAPACITY {
+            if let Some(lru) = self
+                .peers
+                .iter()
+                .min_by_key(|(_, ids)| ids.last_used)
+                .map(|(peer, _)| peer.clone())
+            {
+                self.peers.remove(&lru);
+            }
+        }
+        let ids = self.peers.entry(peer_id.to_string()).or_default();
+        ids.last_used = self.clock;
+        ids.check_and_insert(id)
+    }
 }
 
 impl RecentIds {
@@ -923,7 +955,7 @@ impl ConnectionManager {
             call_session_active: Arc::new(AtomicBool::new(false)),
             pending_invitee: Arc::new(StdMutex::new(None)),
             replacing_peers: Arc::new(StdMutex::new(HashMap::new())),
-            recent_dm_ids: Arc::new(Mutex::new(HashMap::new())),
+            recent_dm_ids: Arc::new(Mutex::new(RecentDmIds::default())),
             contacts: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
@@ -978,10 +1010,10 @@ impl ConnectionManager {
     /// Records `id` as seen for `peer_id` and returns whether it was already
     /// present (i.e. this is a duplicate delivery).
     async fn record_and_check_duplicate_dm_id(&self, peer_id: &str, id: &str) -> bool {
-        let mut map = self.recent_dm_ids.lock().await;
-        map.entry(peer_id.to_string())
-            .or_default()
-            .check_and_insert(id)
+        self.recent_dm_ids
+            .lock()
+            .await
+            .check_and_insert(peer_id, id)
     }
 
     pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
@@ -3710,6 +3742,20 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&chunk).unwrap();
         assert!(encoded.len() <= MAX_DM_FRAME_BYTES, "{} bytes", encoded.len());
+    }
+
+    #[test]
+    fn recent_dm_ids_evict_the_least_recently_active_peer() {
+        let mut recent = RecentDmIds::default();
+        for n in 0..RECENT_DM_PEERS_CAPACITY {
+            assert!(!recent.check_and_insert(&format!("peer-{n}"), "m"));
+        }
+        // peer-0 becomes the most recently active; peer-1 is now the LRU.
+        assert!(recent.check_and_insert("peer-0", "m"));
+        assert!(!recent.check_and_insert("newcomer", "m"));
+        assert_eq!(recent.peers.len(), RECENT_DM_PEERS_CAPACITY);
+        assert!(!recent.peers.contains_key("peer-1"));
+        assert!(recent.check_and_insert("peer-0", "m"), "peer-0 kept its ids");
     }
 
     #[test]
