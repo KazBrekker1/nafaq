@@ -396,10 +396,13 @@ pub async fn reinit_video_encoder(
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
     let mut guard = state.video_codec.encoder.lock().await;
-    let (bitrate_bps, fps) = guard
-        .as_ref()
-        .map(|e| (e.base_bitrate_bps(), e.base_fps()))
-        .unwrap_or((400_000, 12.0));
+    // No encoder means the codecs were destroyed (call ended): a late
+    // resize must not resurrect one.
+    let Some((bitrate_bps, fps)) = guard.as_ref().map(|e| (e.base_bitrate_bps(), e.base_fps()))
+    else {
+        tracing::debug!("Ignoring video encoder reinit: codecs are not initialized");
+        return Ok(());
+    };
     *guard = Some(
         VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
             .map_err(|e| e.to_string())?,
@@ -418,7 +421,14 @@ pub async fn reinit_video_encoder_with_config(
 ) -> Result<(), String> {
     validate_resolution(width, height)?;
     let (bitrate_bps, fps) = validate_rate(bitrate_bps, fps)?;
-    *state.video_codec.encoder.lock().await = Some(
+    let mut guard = state.video_codec.encoder.lock().await;
+    // No encoder means the codecs were destroyed (call ended): a late
+    // quality-profile event must not resurrect one.
+    if guard.is_none() {
+        tracing::debug!("Ignoring video encoder reinit: codecs are not initialized");
+        return Ok(());
+    }
+    *guard = Some(
         VideoEncoder::new_with_config(width, height, bitrate_bps, fps)
             .map_err(|e| e.to_string())?,
     );
