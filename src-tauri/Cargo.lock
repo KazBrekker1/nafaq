@@ -3233,7 +3233,6 @@ dependencies = [
  "opus",
  "rand",
  "serde",
- "serde_bytes",
  "serde_json",
  "tauri",
  "tauri-build",
