@@ -16,7 +16,7 @@ use crate::video_transport::{
 };
 use crate::messages::{
     AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, MAX_CHAT_FRAME_BYTES,
-    MAX_CONTROL_FRAME_BYTES, MAX_DM_FRAME_BYTES, PeerConnectionKind, STREAM_AUDIO, STREAM_CHAT,
+    MAX_CONTROL_FRAME_BYTES, MAX_DM_FRAME_BYTES, PeerConnectionKind, STREAM_CHAT,
     STREAM_CONTROL, STREAM_DM, STREAM_VIDEO, VideoLayerRequest, VideoPacket,
 };
 
@@ -459,7 +459,7 @@ impl ConnectionManager {
             .insert(peer_id.to_string())
     }
 
-    async fn reserve_call_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
+    fn reserve_call_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
         ConnectingReservation::try_reserve(self.call_connecting.clone(), peer_id, None)
     }
 
@@ -711,7 +711,6 @@ impl ConnectionManager {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn peer_count(&self) -> usize {
         self.peers.lock().await.len()
     }
@@ -798,7 +797,7 @@ impl ConnectionManager {
         if self.call_peer_connected(&peer_id).await {
             return Ok(peer_id);
         }
-        let Some(_reservation) = self.reserve_call_connecting_guard(&peer_id).await else {
+        let Some(_reservation) = self.reserve_call_connecting_guard(&peer_id) else {
             if self.call_peer_connected(&peer_id).await {
                 return Ok(peer_id);
             }
@@ -1178,7 +1177,7 @@ impl ConnectionManager {
     ) {
         let connection_id = connection.stable_id();
 
-        // Uni streams: one video frame per stream (and legacy audio).
+        // Uni streams: one video frame per stream.
         {
             let manager = self.clone();
             let peer_id = peer_id.clone();
@@ -1199,7 +1198,6 @@ impl ConnectionManager {
                                     .handle_uni_stream(
                                         recv,
                                         &peer_id,
-                                        connection_id,
                                         &video_state,
                                         &last_activity_ms,
                                     )
@@ -1346,12 +1344,12 @@ impl ConnectionManager {
         });
     }
 
-    /// Reads one peer-opened uni stream of a call connection.
+    /// Reads one peer-opened uni stream of a call connection: one video
+    /// frame per stream (no other uni-stream types are in use).
     async fn handle_uni_stream(
         &self,
         mut recv: RecvStream,
         peer_id: &str,
-        connection_id: usize,
         video_state: &StdMutex<VideoReceiveState>,
         last_activity_ms: &AtomicU64,
     ) {
@@ -1359,81 +1357,63 @@ impl ConnectionManager {
         if recv.read_exact(&mut type_buf).await.is_err() {
             return;
         }
-        match type_buf[0] {
-            STREAM_AUDIO => loop {
-                match crate::messages::read_framed(&mut recv, MAX_CONTROL_FRAME_BYTES).await {
-                    Ok(Some(data)) => {
-                        if let Some(packet) = AudioDatagram::decode(&data) {
-                            mark_active(last_activity_ms);
-                            let _ = self.audio_media_tx.send(AudioPacket {
-                                peer_id: peer_id.to_string(),
-                                connection_id,
-                                timestamp_ms: packet.timestamp_ms,
-                                sequence: packet.sequence,
-                                payload: packet.payload,
-                            });
-                        }
-                    }
-                    _ => break,
-                }
-            },
-            STREAM_VIDEO => {
-                // One frame per stream. A read error means the sender abandoned
-                // it (reset) — the reorder buffer handles the hole. Bounded in
-                // size and time, so a peer can't pin memory with stalled streams.
-                let read = tokio::time::timeout(
-                    VIDEO_FRAME_READ_TIMEOUT,
-                    recv.read_to_end(MAX_VIDEO_FRAME_BYTES + VIDEO_FRAME_HEADER_LEN),
+        if type_buf[0] != STREAM_VIDEO {
+            let _ = recv.stop(0u32.into());
+            return;
+        }
+        // One frame per stream. A read error means the sender abandoned
+        // it (reset) — the reorder buffer handles the hole. Bounded in
+        // size and time, so a peer can't pin memory with stalled streams.
+        let read = tokio::time::timeout(
+            VIDEO_FRAME_READ_TIMEOUT,
+            recv.read_to_end(MAX_VIDEO_FRAME_BYTES + VIDEO_FRAME_HEADER_LEN),
+        )
+        .await;
+        let Ok(Ok(body)) = read else {
+            let _ = recv.stop(0u32.into());
+            return;
+        };
+        let Some((seq, timestamp_ms, payload)) = decode_video_frame(&body) else {
+            return;
+        };
+        mark_active(last_activity_ms);
+        let frame = ReceivedVideoFrame {
+            seq,
+            timestamp_ms,
+            is_keyframe: is_keyframe(payload),
+            payload: payload.to_vec(),
+        };
+        let now = std::time::Instant::now();
+        let (ready, request_keyframe) = {
+            let mut state = video_state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let out = state.reorder.push(frame, now);
+            let request = out.need_keyframe
+                && state.last_keyframe_request.is_none_or(|at| {
+                    now.duration_since(at) >= RECEIVER_KEYFRAME_REQUEST_INTERVAL
+                });
+            if request {
+                state.last_keyframe_request = Some(now);
+            }
+            (out.ready, request)
+        };
+        for frame in ready {
+            let _ = self.video_media_tx.send(VideoPacket {
+                peer_id: peer_id.to_string(),
+                timestamp_ms: frame.timestamp_ms,
+                payload: frame.payload,
+            });
+        }
+        if request_keyframe {
+            let _ = self
+                .send_control(
+                    peer_id,
+                    &ControlAction::KeyframeRequest {
+                        layer: VideoLayerRequest::High,
+                    },
                 )
                 .await;
-                let Ok(Ok(body)) = read else {
-                    let _ = recv.stop(0u32.into());
-                    return;
-                };
-                let Some((seq, timestamp_ms, payload)) = decode_video_frame(&body) else {
-                    return;
-                };
-                mark_active(last_activity_ms);
-                let frame = ReceivedVideoFrame {
-                    seq,
-                    timestamp_ms,
-                    is_keyframe: is_keyframe(payload),
-                    payload: payload.to_vec(),
-                };
-                let now = std::time::Instant::now();
-                let (ready, request_keyframe) = {
-                    let mut state = video_state
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    let out = state.reorder.push(frame, now);
-                    let request = out.need_keyframe
-                        && state.last_keyframe_request.is_none_or(|at| {
-                            now.duration_since(at) >= RECEIVER_KEYFRAME_REQUEST_INTERVAL
-                        });
-                    if request {
-                        state.last_keyframe_request = Some(now);
-                    }
-                    (out.ready, request)
-                };
-                for frame in ready {
-                    let _ = self.video_media_tx.send(VideoPacket {
-                        peer_id: peer_id.to_string(),
-                        timestamp_ms: frame.timestamp_ms,
-                        payload: frame.payload,
-                    });
-                }
-                if request_keyframe {
-                    let _ = self
-                        .send_control(
-                            peer_id,
-                            &ControlAction::KeyframeRequest {
-                                layer: VideoLayerRequest::High,
-                            },
-                        )
-                        .await;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1515,7 +1495,7 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub async fn send_audio_to_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
+    pub async fn send_audio_to_all(&self, data: &[u8], timestamp: u64) {
         let peers: Vec<(String, Connection, Arc<AtomicU16>)> = {
             let peers = self.peers.lock().await;
             peers
@@ -1540,7 +1520,6 @@ impl ConnectionManager {
                 tracing::debug!("Audio datagram send failed for {peer_id}: {e}");
             }
         }
-        Ok(())
     }
 
     pub async fn send_video_frame_all(&self, data: &[u8], timestamp: u64) -> Result<()> {
@@ -1737,7 +1716,7 @@ impl ConnectionManager {
         let Some(endpoint) = self.endpoint.get().cloned() else {
             return;
         };
-        let Some(reservation) = self.reserve_call_connecting_guard(&peer_id).await else {
+        let Some(reservation) = self.reserve_call_connecting_guard(&peer_id) else {
             return;
         };
 
@@ -2275,12 +2254,10 @@ mod tests {
 
         let guard = manager
             .reserve_call_connecting_guard("peer-a")
-            .await
             .expect("first reservation should succeed");
         assert!(
             manager
                 .reserve_call_connecting_guard("peer-a")
-                .await
                 .is_none()
         );
 
@@ -2289,7 +2266,6 @@ mod tests {
         assert!(
             manager
                 .reserve_call_connecting_guard("peer-a")
-                .await
                 .is_some()
         );
     }
@@ -2303,12 +2279,10 @@ mod tests {
 
         let guard = manager
             .reserve_dm_connecting_guard("peer-a")
-            .await
             .expect("first reservation should succeed");
         assert!(
             manager
                 .reserve_dm_connecting_guard("peer-a")
-                .await
                 .is_none()
         );
 
@@ -2317,7 +2291,6 @@ mod tests {
         assert!(
             manager
                 .reserve_dm_connecting_guard("peer-a")
-                .await
                 .is_some()
         );
     }
@@ -2678,7 +2651,7 @@ mod tests {
 
     #[test]
     fn relay_target_selection_is_independent_of_auto_dial_outcome() {
-        let peers = vec![
+        let peers = [
             "sender".to_string(),
             "relay-target".to_string(),
             "announced".to_string(),

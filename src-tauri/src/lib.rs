@@ -341,11 +341,9 @@ pub fn run() {
                                 Event::PeerDisconnected { .. } => "peer-disconnected",
                                 Event::ChatReceived { .. } => "chat-received",
                                 Event::ControlReceived { .. } => "control-received",
-                                Event::ConnectionStatus { .. } => "connection-status",
                                 Event::PeerConnectionStatusChanged { .. } => {
                                     "peer-connection-status-changed"
                                 }
-                                Event::Error { .. } => "nafaq-error",
                                 Event::QualityProfileChanged { .. } => "quality-profile-changed",
                                 Event::RelayStatusChanged { .. } => "relay-status-changed",
                                 Event::TicketRefreshed { .. } => "ticket-refreshed",
@@ -360,7 +358,6 @@ pub fn run() {
                                 Event::DmFileTransferFailed { .. } => "dm-file-transfer-failed",
                                 Event::DmFileProgress { .. } => "dm-file-progress",
                                 Event::PresenceChanged { .. } => "presence-changed",
-                                Event::NodeInfo { .. } | Event::CallCreated { .. } => continue,
                             };
                             let _ = app_handle.emit(event_name, &event);
                         }

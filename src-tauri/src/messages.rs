@@ -45,7 +45,6 @@ pub enum DmMessage {
     CallInvite {
         ticket: String,
     },
-    CallAccept,
     CallDecline,
     /// Caller gives up on a pending invite (explicit cancel or ring timeout)
     /// before the callee answered. New variant — see wire-compat note below.
@@ -124,8 +123,8 @@ mod file_chunk_data {
     }
 }
 
-/// Stream type identifiers for binary frame protocol
-pub const STREAM_AUDIO: u8 = 0x01;
+/// Stream type identifiers for binary frame protocol. 0x01 was a legacy
+/// uni-stream audio channel (audio travels as datagrams); don't reuse it.
 pub const STREAM_VIDEO: u8 = 0x02;
 pub const STREAM_CHAT: u8 = 0x03;
 pub const STREAM_CONTROL: u8 = 0x04;
@@ -208,28 +207,6 @@ pub struct MediaPlaybackStatus {
     pub last_failure: Option<String>,
 }
 
-/// Commands from frontend → Rust backend (via Tauri invoke)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Command {
-    GetNodeInfo,
-    CreateCall,
-    JoinCall {
-        ticket: String,
-    },
-    EndCall {
-        peer_id: String,
-    },
-    SendChat {
-        peer_id: String,
-        message: String,
-    },
-    SendControl {
-        peer_id: String,
-        action: ControlAction,
-    },
-}
-
 /// Control actions sent between peers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -288,13 +265,6 @@ pub enum PeerConnectionKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    NodeInfo {
-        id: String,
-        ticket: String,
-    },
-    CallCreated {
-        ticket: String,
-    },
     PeerConnected {
         peer_id: String,
     },
@@ -309,17 +279,10 @@ pub enum Event {
         peer_id: String,
         action: ControlAction,
     },
-    ConnectionStatus {
-        peer_id: String,
-        status: ConnectionStatusKind,
-    },
     PeerConnectionStatusChanged {
         peer_id: String,
         status: PeerConnectionKind,
         reason: Option<String>,
-    },
-    Error {
-        message: String,
     },
     QualityProfileChanged {
         peer_count: usize,
@@ -382,14 +345,6 @@ pub enum Event {
         peer_id: String,
         online: bool,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConnectionStatusKind {
-    Direct,
-    Relayed,
-    Connecting,
 }
 
 #[derive(Debug, Clone)]
@@ -528,26 +483,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_command_serialize_get_node_info() {
-        let cmd = Command::GetNodeInfo;
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"type":"get_node_info"}"#);
-    }
-
-    #[test]
-    fn test_command_serialize_join_call() {
-        let cmd = Command::JoinCall {
-            ticket: "abc123".into(),
-        };
-        let json = serde_json::to_string(&cmd).unwrap();
-        let parsed: Command = serde_json::from_str(&json).unwrap();
-        match parsed {
-            Command::JoinCall { ticket } => assert_eq!(ticket, "abc123"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn test_event_serialize_peer_connected() {
         let evt = Event::PeerConnected {
             peer_id: "deadbeef".into(),
@@ -560,7 +495,7 @@ mod tests {
     #[test]
     fn test_media_frame_roundtrip() {
         let frame = MediaFrame {
-            stream_type: STREAM_AUDIO,
+            stream_type: STREAM_VIDEO,
             peer_id: [0xAB; 32],
             timestamp_ms: 1234567890,
             payload: vec![1, 2, 3, 4, 5],
@@ -569,7 +504,7 @@ mod tests {
         assert_eq!(encoded.len(), MediaFrame::HEADER_SIZE + 5);
 
         let decoded = MediaFrame::decode(&encoded).unwrap();
-        assert_eq!(decoded.stream_type, STREAM_AUDIO);
+        assert_eq!(decoded.stream_type, STREAM_VIDEO);
         assert_eq!(decoded.peer_id, [0xAB; 32]);
         assert_eq!(decoded.timestamp_ms, 1234567890);
         assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);

@@ -849,14 +849,9 @@ async fn encode_and_send_audio_all(
     drop(codec);
 
     if let Some(encoded) = encoded {
-        state
-            .conn_manager
-            .send_audio_to_all(&encoded, timestamp)
-            .await
-            .map_err(|e| e.to_string())
-    } else {
-        Ok(())
+        state.conn_manager.send_audio_to_all(&encoded, timestamp).await;
     }
+    Ok(())
 }
 
 /// Encode audio once and send to all peers

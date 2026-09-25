@@ -355,7 +355,7 @@ impl ConnectionManager {
             .insert(peer_id.to_string())
     }
 
-    pub(super) async fn reserve_dm_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
+    pub(super) fn reserve_dm_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
         ConnectingReservation::try_reserve(
             self.dm_connecting.clone(),
             peer_id,
@@ -371,7 +371,7 @@ impl ConnectionManager {
             .remove(peer_id);
     }
 
-    pub(super) async fn dm_connect_in_progress(&self, peer_id: &str) -> bool {
+    pub(super) fn dm_connect_in_progress(&self, peer_id: &str) -> bool {
         self.dm_connecting
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -773,7 +773,7 @@ impl ConnectionManager {
         if self.dm_peer_connected(node_id_str).await {
             return Ok(());
         }
-        let Some(_reservation) = self.reserve_dm_connecting_guard(node_id_str).await else {
+        let Some(_reservation) = self.reserve_dm_connecting_guard(node_id_str) else {
             if self.dm_peer_connected(node_id_str).await {
                 return Ok(());
             }
@@ -870,7 +870,7 @@ impl ConnectionManager {
                     // state change between check and wait can't be missed.
                     let notified = self.dm_connect_done.notified();
                     if self.dm_peer_connected(peer_id).await
-                        || !self.dm_connect_in_progress(peer_id).await
+                        || !self.dm_connect_in_progress(peer_id)
                     {
                         return Ok(());
                     }
@@ -900,7 +900,7 @@ impl ConnectionManager {
                 return Ok(());
             }
 
-            if self.dm_connect_in_progress(peer_id).await {
+            if self.dm_connect_in_progress(peer_id) {
                 self.wait_for_dm_connecting_to_finish(peer_id).await?;
                 continue;
             }
@@ -908,7 +908,7 @@ impl ConnectionManager {
             match self.connect_dm(peer_id).await {
                 Ok(()) => return Ok(()),
                 Err(_) if self.dm_peer_connected(peer_id).await => return Ok(()),
-                Err(err) if self.dm_connect_in_progress(peer_id).await => {
+                Err(err) if self.dm_connect_in_progress(peer_id) => {
                     tracing::debug!("DM connect for {peer_id} raced with another attempt: {err}");
                     self.wait_for_dm_connecting_to_finish(peer_id).await?;
                 }
