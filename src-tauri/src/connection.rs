@@ -156,6 +156,29 @@ struct ActiveFileReceive {
     final_name: String,
     expected_size: u64,
     received_bytes: u64,
+    /// Progress last reported to the frontend, for throttling.
+    last_progress_bytes: u64,
+    last_progress_at: std::time::Instant,
+}
+
+/// Emit `DmFileProgress` at most every this many bytes...
+const FILE_PROGRESS_MIN_BYTES: u64 = 1024 * 1024;
+/// ...or this often, whichever comes first; the first and final ones are
+/// always sent.
+/// A 64 KiB chunk per event would overflow the 256-slot event broadcast on a
+/// large transfer and make the forwarder drop unrelated events.
+const FILE_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+fn should_emit_file_progress(
+    received: u64,
+    expected: u64,
+    last_bytes: u64,
+    since_last: Duration,
+) -> bool {
+    last_bytes == 0
+        || received >= expected
+        || received.saturating_sub(last_bytes) >= FILE_PROGRESS_MIN_BYTES
+        || since_last >= FILE_PROGRESS_MIN_INTERVAL
 }
 
 /// Maximum size a peer may declare for an inbound transfer. Mirrors the
@@ -345,6 +368,8 @@ async fn handle_dm_file_message(
                             final_name: sanitize_file_name(name),
                             expected_size: *size,
                             received_bytes: 0,
+                            last_progress_bytes: 0,
+                            last_progress_at: std::time::Instant::now(),
                         },
                     );
                 }
@@ -385,13 +410,23 @@ async fn handle_dm_file_message(
                     } else {
                         recv.received_bytes =
                             (*offset + data.len() as u64).max(recv.received_bytes);
-                        // Tiny progress ping (no payload) so the receiver's
-                        // progress bar advances without re-streaming the chunk.
-                        let _ = event_tx.send(Event::DmFileProgress {
-                            peer_id: peer_id.to_string(),
-                            file_id: id.clone(),
-                            received: recv.received_bytes,
-                        });
+                        // Tiny, throttled progress ping (no payload) so the
+                        // receiver's progress bar advances without
+                        // re-streaming the chunk.
+                        if should_emit_file_progress(
+                            recv.received_bytes,
+                            recv.expected_size,
+                            recv.last_progress_bytes,
+                            recv.last_progress_at.elapsed(),
+                        ) {
+                            recv.last_progress_bytes = recv.received_bytes;
+                            recv.last_progress_at = std::time::Instant::now();
+                            let _ = event_tx.send(Event::DmFileProgress {
+                                peer_id: peer_id.to_string(),
+                                file_id: id.clone(),
+                                received: recv.received_bytes,
+                            });
+                        }
                     }
                 }
             } else {
@@ -3756,6 +3791,28 @@ mod tests {
         assert_eq!(recent.peers.len(), RECENT_DM_PEERS_CAPACITY);
         assert!(!recent.peers.contains_key("peer-1"));
         assert!(recent.check_and_insert("peer-0", "m"), "peer-0 kept its ids");
+    }
+
+    #[test]
+    fn file_progress_is_throttled_but_final_progress_always_emits() {
+        let short = Duration::from_millis(10);
+        let mib = FILE_PROGRESS_MIN_BYTES;
+        let last = 64 * 1024;
+        // First progress always reports.
+        assert!(should_emit_file_progress(last, 10 * mib, 0, short));
+        // Small step, soon after the last event: suppressed.
+        assert!(!should_emit_file_progress(2 * last, 10 * mib, last, short));
+        // A full MiB since the last event.
+        assert!(should_emit_file_progress(last + mib, 10 * mib, last, short));
+        // Enough time passed.
+        assert!(should_emit_file_progress(
+            2 * last,
+            10 * mib,
+            last,
+            FILE_PROGRESS_MIN_INTERVAL
+        ));
+        // Final chunk always reports.
+        assert!(should_emit_file_progress(10 * mib, 10 * mib, 10 * mib - 1, short));
     }
 
     #[test]
