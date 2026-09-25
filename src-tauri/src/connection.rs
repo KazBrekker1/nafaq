@@ -32,6 +32,7 @@ const DM_CONNECT_WAIT_TIMEOUT: Duration = Duration::from_secs(21);
 /// indefinitely instead of surfacing a failure.
 const DM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CHAT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SUSPECT_AFTER_MS: u64 = 10_000;
 const RECONNECT_AFTER_MS: u64 = 35_000;
 const DISCONNECT_AFTER_MS: u64 = 120_000;
@@ -84,6 +85,37 @@ async fn open_typed_bi_stream(
         },
     )
     .await
+}
+
+/// Writes one length-prefixed frame to a shared send stream, bounding both
+/// the wait for the stream lock and the write itself by `timeout`.
+///
+/// A write that times out may have put part of the frame on the wire; any
+/// later frame would then be parsed from the middle of this one. So on a
+/// write timeout the stream is taken out of its slot and reset: later writes
+/// fail loudly ("unavailable") and the reconnect/liveness paths take over,
+/// instead of silently corrupting the framing.
+async fn write_frame_or_reset(
+    slot: &Mutex<Option<SendStream>>,
+    data: &[u8],
+    timeout: Duration,
+    stream_name: &str,
+) -> Result<()> {
+    let mut guard = tokio::time::timeout(timeout, slot.lock())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for {stream_name} stream"))?;
+    let Some(send) = guard.as_mut() else {
+        anyhow::bail!("{stream_name} stream is unavailable");
+    };
+    match tokio::time::timeout(timeout, crate::messages::write_framed(send, data)).await {
+        Ok(result) => Ok(result?),
+        Err(_) => {
+            if let Some(mut send) = guard.take() {
+                let _ = send.reset(0u32.into());
+            }
+            anyhow::bail!("timed out writing {stream_name} frame; stream reset")
+        }
+    }
 }
 
 fn relay_targets_for_announce<'a>(
@@ -2739,13 +2771,9 @@ impl ConnectionManager {
             anyhow::bail!("Peer {peer_id} is not connected");
         };
 
-        let mut guard = s.lock().await;
-        if let Some(ref mut send) = *guard {
-            crate::messages::write_framed(send, message.as_bytes()).await?;
-        } else {
-            anyhow::bail!("Chat stream for peer {peer_id} is unavailable");
-        }
-        Ok(())
+        write_frame_or_reset(&s, message.as_bytes(), CHAT_WRITE_TIMEOUT, "chat")
+            .await
+            .map_err(|e| anyhow::anyhow!("chat to {peer_id} failed: {e}"))
     }
 
     pub async fn send_chat_to_all(&self, message: &str) -> Vec<String> {
@@ -2759,15 +2787,10 @@ impl ConnectionManager {
 
         let mut failed = Vec::new();
         for (peer_id, stream) in streams {
-            let mut guard = stream.lock().await;
-            let result = if let Some(ref mut send) = *guard {
-                crate::messages::write_framed(send, message.as_bytes()).await
-            } else {
-                failed.push(peer_id);
-                continue;
-            };
-
-            if result.is_err() {
+            if let Err(e) =
+                write_frame_or_reset(&stream, message.as_bytes(), CHAT_WRITE_TIMEOUT, "chat").await
+            {
+                tracing::debug!("Chat to {peer_id} failed: {e}");
                 failed.push(peer_id);
             }
         }
@@ -3024,20 +3047,11 @@ impl ConnectionManager {
             anyhow::bail!("Peer {peer_id} is not connected");
         };
 
-        let write = async {
-            let mut guard = s.lock().await;
-            if let Some(ref mut send) = *guard {
-                crate::messages::write_framed(send, &data).await?;
-                Ok(())
-            } else {
-                anyhow::bail!("Control stream for peer {peer_id} is unavailable");
-            }
-        };
         // A peer that stopped reading would otherwise block this forever
         // (and every caller queued behind the stream lock).
-        tokio::time::timeout(CONTROL_WRITE_TIMEOUT, write)
+        write_frame_or_reset(&s, &data, CONTROL_WRITE_TIMEOUT, "control")
             .await
-            .map_err(|_| anyhow::anyhow!("control write to {peer_id} timed out"))?
+            .map_err(|e| anyhow::anyhow!("control write to {peer_id} failed: {e}"))
     }
 
     pub async fn snapshot_network_stats(&self) -> Vec<NetworkPeerStats> {
@@ -3325,18 +3339,9 @@ impl ConnectionManager {
             anyhow::bail!("DM peer {peer_id} is not connected");
         };
 
-        let mut guard = s.lock().await;
-        if let Some(ref mut send) = *guard {
-            with_timeout(
-                DM_WRITE_TIMEOUT,
-                format!("timed out writing DM frame to peer {peer_id}"),
-                async { Ok(crate::messages::write_framed(send, data).await?) },
-            )
-            .await?;
-            Ok(())
-        } else {
-            anyhow::bail!("DM stream for peer {peer_id} is unavailable");
-        }
+        write_frame_or_reset(&s, data, DM_WRITE_TIMEOUT, "DM")
+            .await
+            .map_err(|e| anyhow::anyhow!("DM write to peer {peer_id} failed: {e}"))
     }
 
     /// Writes one DM frame to the current stream without connecting, reconnecting,
