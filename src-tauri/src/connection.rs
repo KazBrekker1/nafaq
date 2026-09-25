@@ -843,6 +843,19 @@ struct PeerTicketRecord {
     dial_failures: u32,
 }
 
+/// How `ConnectionManager::cleanup_peer` tears down a call peer entry.
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerCleanup {
+    /// Close the removed connection with this reason.
+    close_reason: Option<&'static [u8]>,
+    /// Only remove the entry if it still belongs to this connection.
+    connection_id: Option<usize>,
+    /// Keep the cached ticket so the peer can be re-dialed.
+    preserve_ticket: bool,
+    /// Don't announce a disconnect: a replacement is taking over the peer.
+    silent: bool,
+}
+
 #[derive(Clone)]
 pub struct ConnectionManager {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
@@ -955,12 +968,9 @@ impl ConnectionManager {
             .unwrap_or(0)
     }
 
-    async fn mark_peer_active_internal(
-        peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
-        peer_id: &str,
-    ) {
+    async fn mark_peer_active(&self, peer_id: &str) {
         let last_activity = {
-            let peers = peers.lock().await;
+            let peers = self.peers.lock().await;
             peers.get(peer_id).map(|p| p.last_activity_ms.clone())
         };
         if let Some(last_activity) = last_activity {
@@ -1208,18 +1218,19 @@ impl ConnectionManager {
         candidate_connection_id: usize,
         reason: &'static [u8],
     ) {
-        let evicted = Self::cleanup_peer_entry(
-            peer_id,
-            &self.peers,
-            &self.dm_peers,
-            &self.peer_tickets,
-            &self.event_tx,
-            Some(reason),
-            Some(expected_connection_id),
-            true, // reconnecting peer — keep its ticket
-            false,
-        )
-        .await;
+        let evicted = self
+            .cleanup_peer(
+                peer_id,
+                PeerCleanup {
+                    close_reason: Some(reason),
+                    connection_id: Some(expected_connection_id),
+                    // Reconnecting peer: keep its ticket, and don't announce
+                    // a disconnect — the replacement takes over.
+                    preserve_ticket: true,
+                    silent: true,
+                },
+            )
+            .await;
         if evicted {
             self.replacing_peers
                 .lock()
@@ -1342,13 +1353,7 @@ impl ConnectionManager {
         // The closed() cleanup task may not have fired yet; treat a dead
         // connection or taken stream as already evicted.
         if conn_closed || dm_send.lock().await.is_none() {
-            Self::cleanup_dm_internal(
-                peer_id,
-                &self.dm_peers,
-                &self.event_tx,
-                Some(b"stale_dm_connection"),
-                None,
-            )
+            self.cleanup_dm(peer_id, Some(b"stale_dm_connection"), None)
             .await;
             return DmConnectionHandling::Store;
         }
@@ -1359,13 +1364,7 @@ impl ConnectionManager {
         if matches!(direction, ConnectionDirection::Inbound)
             && self.dm_entry_predates_recent_rejoin(peer_id).await
         {
-            Self::cleanup_dm_internal(
-                peer_id,
-                &self.dm_peers,
-                &self.event_tx,
-                Some(b"peer_rejoined_gossip"),
-                None,
-            )
+            self.cleanup_dm(peer_id, Some(b"peer_rejoined_gossip"), None)
             .await;
             return DmConnectionHandling::Store;
         }
@@ -1376,13 +1375,7 @@ impl ConnectionManager {
         // lost). Newest wins; rejecting it strands both sides until the QUIC
         // idle timeout.
         if existing_direction == direction {
-            Self::cleanup_dm_internal(
-                peer_id,
-                &self.dm_peers,
-                &self.event_tx,
-                Some(b"superseded_by_redial"),
-                None,
-            )
+            self.cleanup_dm(peer_id, Some(b"superseded_by_redial"), None)
             .await;
             return DmConnectionHandling::Store;
         }
@@ -1566,17 +1559,19 @@ impl ConnectionManager {
         DmStreamRegistration::Stored
     }
 
-    async fn cleanup_dm_internal(
+    /// Remove a DM entry, optionally only if it still belongs to
+    /// `connection_id`, closing it with `close_reason` if we own it. Returns
+    /// whether an entry was removed.
+    async fn cleanup_dm(
+        &self,
         peer_id: &str,
-        dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
-        event_tx: &broadcast::Sender<Event>,
         close_reason: Option<&'static [u8]>,
-        expected_connection_id: Option<usize>,
+        connection_id: Option<usize>,
     ) -> bool {
         let removed = {
-            let mut dm_peers = dm_peers.lock().await;
+            let mut dm_peers = self.dm_peers.lock().await;
             let should_remove = dm_peers.get(peer_id).is_some_and(|peer| {
-                expected_connection_id.is_none_or(|id| peer.connection.stable_id() == id)
+                connection_id.is_none_or(|id| peer.connection.stable_id() == id)
             });
             if should_remove {
                 dm_peers.remove(peer_id)
@@ -1593,7 +1588,7 @@ impl ConnectionManager {
             dm_peer.close_if_owned(reason);
         }
 
-        let _ = event_tx.send(Event::DmDisconnected {
+        let _ = self.event_tx.send(Event::DmDisconnected {
             peer_id: peer_id.to_string(),
         });
         true
@@ -1836,32 +1831,19 @@ impl ConnectionManager {
             }
 
             // Connection closed — clean up
-            Self::cleanup_dm_internal(
-                &peer_id_reader,
-                &manager.dm_peers,
-                &manager.event_tx,
-                None,
-                Some(connection_reader_id),
-            )
-            .await;
+            manager
+                .cleanup_dm(&peer_id_reader, None, Some(connection_reader_id))
+                .await;
         });
 
         // Spawn a task to detect connection closure as a backstop
-        let event_tx_closed = self.event_tx.clone();
-        let dm_peers_closed = self.dm_peers.clone();
-        let peer_id_closed = peer_id;
-        let connection_closed = connection.clone();
-        let connection_closed_id = connection_closed.stable_id();
+        let manager = self.clone();
+        let connection_closed_id = connection.stable_id();
         tokio::spawn(async move {
-            connection_closed.closed().await;
-            Self::cleanup_dm_internal(
-                &peer_id_closed,
-                &dm_peers_closed,
-                &event_tx_closed,
-                None,
-                Some(connection_closed_id),
-            )
-            .await;
+            connection.closed().await;
+            manager
+                .cleanup_dm(&peer_id, None, Some(connection_closed_id))
+                .await;
         });
 
         Ok(())
@@ -2136,50 +2118,15 @@ impl ConnectionManager {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn cleanup_peer_internal(
-        peer_id: &str,
-        peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
-        dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
-        peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-        event_tx: &broadcast::Sender<Event>,
-        close_reason: Option<&'static [u8]>,
-        expected_connection_id: Option<usize>,
-        preserve_ticket: bool,
-    ) -> bool {
-        Self::cleanup_peer_entry(
-            peer_id,
-            peers,
-            dm_peers,
-            peer_tickets,
-            event_tx,
-            close_reason,
-            expected_connection_id,
-            preserve_ticket,
-            true,
-        )
-        .await
-    }
-
-    /// `announce_disconnect: false` is for evicting a stale connection that a
-    /// replacement is about to take over — the peer isn't leaving.
-    #[allow(clippy::too_many_arguments)]
-    async fn cleanup_peer_entry(
-        peer_id: &str,
-        peers: &Arc<Mutex<HashMap<String, PeerConnection>>>,
-        dm_peers: &Arc<Mutex<HashMap<String, DmPeerConnection>>>,
-        peer_tickets: &Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
-        event_tx: &broadcast::Sender<Event>,
-        close_reason: Option<&'static [u8]>,
-        expected_connection_id: Option<usize>,
-        preserve_ticket: bool,
-        announce_disconnect: bool,
-    ) -> bool {
+    /// Remove a call peer entry and tear down what hangs off it. Returns
+    /// whether an entry was removed.
+    async fn cleanup_peer(&self, peer_id: &str, opts: PeerCleanup) -> bool {
         let (removed, old_count, new_count) = {
-            let mut peers = peers.lock().await;
+            let mut peers = self.peers.lock().await;
             let old = peers.len();
             let should_remove = peers.get(peer_id).is_some_and(|peer| {
-                expected_connection_id.is_none_or(|id| peer.connection.stable_id() == id)
+                opts.connection_id
+                    .is_none_or(|id| peer.connection.stable_id() == id)
             });
             let removed = if should_remove {
                 peers.remove(peer_id)
@@ -2197,18 +2144,17 @@ impl ConnectionManager {
         // or a stale ticket would be announced to every future call peer. A
         // connection-scoped cleanup that lost the race to a newer connection
         // must leave the ticket alone: it belongs to the live entry.
-        if !preserve_ticket && (removed.is_some() || expected_connection_id.is_none()) {
-            peer_tickets.lock().await.remove(peer_id);
+        if !opts.preserve_ticket && (removed.is_some() || opts.connection_id.is_none()) {
+            self.peer_tickets.lock().await.remove(peer_id);
         }
 
         let Some(peer) = removed else {
             return false;
         };
 
-        if let Some(reason) = close_reason {
+        if let Some(reason) = opts.close_reason {
             peer.connection.close(0u32.into(), reason);
         }
-
 
         // A SharedCall DM rides the QUIC connection we just tore down; no DM
         // cleanup path observes call teardowns, so evict it here or the entry
@@ -2216,27 +2162,27 @@ impl ConnectionManager {
         // emitted, leaving the frontend's DM session in limbo.
         let dead_connection_id = peer.connection.stable_id();
         let shared_dm_dead = {
-            let dm_peers_guard = dm_peers.lock().await;
-            dm_peers_guard.get(peer_id).is_some_and(|dm| {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).is_some_and(|dm| {
                 dm.ownership == DmConnectionOwnership::SharedCall
                     && dm.connection.stable_id() == dead_connection_id
             })
         };
         if shared_dm_dead {
-            Self::cleanup_dm_internal(peer_id, dm_peers, event_tx, None, Some(dead_connection_id))
-                .await;
+            self.cleanup_dm(peer_id, None, Some(dead_connection_id)).await;
         }
 
-        if announce_disconnect {
-            let _ = event_tx.send(Event::PeerDisconnected {
+        if !opts.silent {
+            let _ = self.event_tx.send(Event::PeerDisconnected {
                 peer_id: peer_id.to_string(),
             });
-            let _ = event_tx.send(Event::PeerConnectionStatusChanged {
-                peer_id: peer_id.to_string(),
-                status: PeerConnectionKind::Disconnected,
-                reason: close_reason.map(|reason| String::from_utf8_lossy(reason).to_string()),
-            });
-            ConnectionManager::emit_quality_profile_if_changed(old_count, new_count, event_tx);
+            self.emit_peer_connection_status(
+                peer_id,
+                PeerConnectionKind::Disconnected,
+                opts.close_reason
+                    .map(|reason| String::from_utf8_lossy(reason).to_string()),
+            );
+            Self::emit_quality_profile_if_changed(old_count, new_count, &self.event_tx);
         }
 
         true
@@ -2327,211 +2273,107 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
     ) {
-        let audio_media_tx = self.audio_media_tx.clone();
-        let video_media_tx = self.video_media_tx.clone();
-        let peers_ref = self.peers.clone();
-        let peer_tickets_ref = self.peer_tickets.clone();
-        // Per-connection: dies with this connection's receiver tasks.
-        let video_state_uni = Arc::new(StdMutex::new(VideoReceiveState::default()));
-        let event_tx_cleanup = self.event_tx.clone();
-        let peer_id_uni = peer_id.clone();
-        let connection_uni = connection.clone();
         let connection_id = connection.stable_id();
-        let peers_ref_uni = peers_ref.clone();
-        let manager_uni = self.clone();
 
-        tokio::spawn(async move {
-            loop {
-                match connection_uni.accept_uni().await {
-                    Ok(mut recv) => {
-                        let peer_id = peer_id_uni.clone();
-                        let audio_tx = audio_media_tx.clone();
-                        let video_tx = video_media_tx.clone();
-                        let video_state = video_state_uni.clone();
-                        let peers_ref = peers_ref_uni.clone();
-                        let manager = manager_uni.clone();
-                        tokio::spawn(async move {
-                            let mut type_buf = [0u8; 1];
-                            if recv.read_exact(&mut type_buf).await.is_err() {
-                                return;
-                            }
-                            match type_buf[0] {
-                                STREAM_AUDIO => loop {
-                                    match crate::messages::read_framed(
-                                        &mut recv,
-                                        MAX_CONTROL_FRAME_BYTES,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(data)) => {
-                                            if let Some(packet) = AudioDatagram::decode(&data) {
-                                                Self::mark_peer_active_internal(
-                                                    &peers_ref, &peer_id,
-                                                )
-                                                .await;
-                                                let _ = audio_tx.send(AudioPacket {
-                                                    peer_id: peer_id.clone(),
-                                                    connection_id,
-                                                    timestamp_ms: packet.timestamp_ms,
-                                                    sequence: packet.sequence,
-                                                    payload: packet.payload,
-                                                });
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                },
-                                STREAM_VIDEO => {
-                                    // One frame per stream. A read error means
-                                    // the sender abandoned it (reset) — the
-                                    // reorder buffer handles the hole.
-                                    // Bounded in size and time, so a peer
-                                    // can't pin memory with stalled streams.
-                                    let read = tokio::time::timeout(
-                                        VIDEO_FRAME_READ_TIMEOUT,
-                                        recv.read_to_end(
-                                            MAX_VIDEO_FRAME_BYTES + VIDEO_FRAME_HEADER_LEN,
-                                        ),
-                                    )
+        // Uni streams: one video frame per stream (and legacy audio).
+        {
+            let manager = self.clone();
+            let peer_id = peer_id.clone();
+            let connection = connection.clone();
+            // Per-connection: dies with this connection's receiver tasks.
+            let video_state = Arc::new(StdMutex::new(VideoReceiveState::default()));
+            tokio::spawn(async move {
+                loop {
+                    match connection.accept_uni().await {
+                        Ok(recv) => {
+                            let manager = manager.clone();
+                            let peer_id = peer_id.clone();
+                            let video_state = video_state.clone();
+                            tokio::spawn(async move {
+                                manager
+                                    .handle_uni_stream(recv, &peer_id, connection_id, &video_state)
                                     .await;
-                                    let Ok(Ok(body)) = read else {
-                                        let _ = recv.stop(0u32.into());
-                                        return;
-                                    };
-                                    let Some((seq, timestamp_ms, payload)) =
-                                        decode_video_frame(&body)
-                                    else {
-                                        return;
-                                    };
-                                    Self::mark_peer_active_internal(&peers_ref, &peer_id).await;
-                                    let frame = ReceivedVideoFrame {
-                                        seq,
-                                        timestamp_ms,
-                                        is_keyframe: is_keyframe(payload),
-                                        payload: payload.to_vec(),
-                                    };
-                                    let now = std::time::Instant::now();
-                                    let (ready, request_keyframe) = {
-                                        let mut state = video_state
-                                            .lock()
-                                            .unwrap_or_else(|poison| poison.into_inner());
-                                        let out = state.reorder.push(frame, now);
-                                        let request = out.need_keyframe
-                                            && state.last_keyframe_request.is_none_or(|at| {
-                                                now.duration_since(at)
-                                                    >= RECEIVER_KEYFRAME_REQUEST_INTERVAL
-                                            });
-                                        if request {
-                                            state.last_keyframe_request = Some(now);
-                                        }
-                                        (out.ready, request)
-                                    };
-                                    for frame in ready {
-                                        let _ = video_tx.send(VideoPacket {
-                                            peer_id: peer_id.clone(),
-                                            timestamp_ms: frame.timestamp_ms,
-                                            payload: frame.payload,
-                                        });
-                                    }
-                                    if request_keyframe {
-                                        let _ = manager
-                                            .send_control(
-                                                &peer_id,
-                                                &ControlAction::KeyframeRequest {
-                                                    layer: VideoLayerRequest::High,
-                                                },
-                                            )
-                                            .await;
-                                    }
-                                }
-                                _ => {}
-                            }
-                        });
-                    }
-                    Err(_) => {
-                        tracing::info!("Uni stream accept ended for peer {peer_id_uni}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        let audio_media_tx = self.audio_media_tx.clone();
-        let peer_id_datagram = peer_id.clone();
-        let connection_datagram = connection.clone();
-        let datagram_connection_id = connection_datagram.stable_id();
-        let peers_ref_datagram = peers_ref.clone();
-        tokio::spawn(async move {
-            loop {
-                match connection_datagram.read_datagram().await {
-                    Ok(data) => {
-                        if let Some(packet) = AudioDatagram::decode(&data) {
-                            Self::mark_peer_active_internal(&peers_ref_datagram, &peer_id_datagram)
-                                .await;
-                            let _ = audio_media_tx.send(AudioPacket {
-                                peer_id: peer_id_datagram.clone(),
-                                connection_id: datagram_connection_id,
-                                timestamp_ms: packet.timestamp_ms,
-                                sequence: packet.sequence,
-                                payload: packet.payload,
                             });
                         }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Datagram receive ended for peer {peer_id_datagram}: {e}");
-                        break;
+                        Err(_) => {
+                            tracing::info!("Uni stream accept ended for peer {peer_id}");
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
 
-        let manager_closed = self.clone();
-        let peers_ref_closed = peers_ref.clone();
-        let dm_peers_ref_closed = self.dm_peers.clone();
-        let peer_tickets_ref = peer_tickets_ref.clone();
-        let event_tx_cleanup_closed = event_tx_cleanup.clone();
-        let peer_id_closed = peer_id.clone();
-        let connection_closed = connection.clone();
-        let connection_closed_id = connection_closed.stable_id();
-        tokio::spawn(async move {
-            let close_reason = connection_closed.closed().await;
-            tracing::info!("Connection closed for peer {peer_id_closed}: {close_reason}");
+        // Audio datagrams.
+        {
+            let manager = self.clone();
+            let peer_id = peer_id.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                loop {
+                    match connection.read_datagram().await {
+                        Ok(data) => {
+                            if let Some(packet) = AudioDatagram::decode(&data) {
+                                manager.mark_peer_active(&peer_id).await;
+                                let _ = manager.audio_media_tx.send(AudioPacket {
+                                    peer_id: peer_id.clone(),
+                                    connection_id,
+                                    timestamp_ms: packet.timestamp_ms,
+                                    sequence: packet.sequence,
+                                    payload: packet.payload,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Datagram receive ended for peer {peer_id}: {e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
-            // A silent QUIC idle-timeout (no CONNECTION_CLOSE frame reached us)
-            // means the network dropped, not that either side ended the call —
-            // give the peer a chance to reconnect instead of tearing the call
-            // down immediately. Any other close reason (explicit close by us
-            // or the peer, reset, protocol error) is treated as final, exactly
-            // as before.
-            if matches!(close_reason, ConnectionError::TimedOut)
-                && manager_closed
-                    .try_begin_peer_reconnect(&peer_id_closed, connection_closed_id)
-                    .await
-            {
-                return;
-            }
+        // Close watcher.
+        {
+            let manager = self.clone();
+            let peer_id = peer_id.clone();
+            let connection = connection.clone();
+            tokio::spawn(async move {
+                let close_reason = connection.closed().await;
+                tracing::info!("Connection closed for peer {peer_id}: {close_reason}");
 
-            // Only a silent drop keeps the ticket for a later redial; an
-            // explicit close (either side hung up) forgets it, so it isn't
-            // re-announced to the peers of a future call.
-            let preserve_ticket = matches!(close_reason, ConnectionError::TimedOut);
-            Self::cleanup_peer_internal(
-                &peer_id_closed,
-                &peers_ref_closed,
-                &dm_peers_ref_closed,
-                &peer_tickets_ref,
-                &event_tx_cleanup_closed,
-                None,
-                Some(connection_closed_id),
-                preserve_ticket,
-            )
-            .await;
-        });
+                // A silent QUIC idle-timeout (no CONNECTION_CLOSE frame reached
+                // us) means the network dropped, not that either side ended the
+                // call — give the peer a chance to reconnect instead of tearing
+                // the call down immediately. Any other close reason (explicit
+                // close by us or the peer, reset, protocol error) is final.
+                let timed_out = matches!(close_reason, ConnectionError::TimedOut);
+                if timed_out
+                    && manager
+                        .try_begin_peer_reconnect(&peer_id, connection_id)
+                        .await
+                {
+                    return;
+                }
 
-        let peer_id_bi = peer_id.clone();
-        let peers_ref_bi = peers_ref.clone();
-        let manager_bi = self.clone();
-        let connection_bi = connection.clone();
+                // Only a silent drop keeps the ticket for a later redial; an
+                // explicit close (either side hung up) forgets it, so it isn't
+                // re-announced to the peers of a future call.
+                manager
+                    .cleanup_peer(
+                        &peer_id,
+                        PeerCleanup {
+                            connection_id: Some(connection_id),
+                            preserve_ticket: timed_out,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            });
+        }
+
+        // Bidi streams: chat, control and (rarely) DM.
+        let manager = self.clone();
         tokio::spawn(async move {
             // A call connection carries exactly one chat, control and DM
             // stream from the peer; anything beyond that (or an unknown type)
@@ -2540,17 +2382,14 @@ impl ConnectionManager {
             loop {
                 match connection.accept_bi().await {
                     Ok((send, mut recv)) => {
-                        let peer_id = peer_id_bi.clone();
-                        let manager = manager_bi.clone();
-                        let peers_ref = peers_ref_bi.clone();
                         let mut type_buf = [0u8; 1];
                         if recv.read_exact(&mut type_buf).await.is_err() {
                             continue;
                         }
-                        if !accept_call_bi_stream_type(&mut seen_stream_types, type_buf[0]) {
+                        let stream_type = type_buf[0];
+                        if !accept_call_bi_stream_type(&mut seen_stream_types, stream_type) {
                             tracing::warn!(
-                                "Rejecting duplicate or unknown bi stream type {} from {peer_id}",
-                                type_buf[0]
+                                "Rejecting duplicate or unknown bi stream type {stream_type} from {peer_id}"
                             );
                             let _ = recv.stop(0u32.into());
                             continue;
@@ -2558,11 +2397,11 @@ impl ConnectionManager {
                         // For incoming DM streams, store the send side so we
                         // can reply, and emit DmConnected if this is a new
                         // DM peer.
-                        if type_buf[0] == STREAM_DM {
-                            let registration = manager_bi
+                        if stream_type == STREAM_DM {
+                            let registration = manager
                                 .register_dm_stream_on_call_connection(
                                     &peer_id,
-                                    connection_bi.clone(),
+                                    connection.clone(),
                                     direction,
                                     send,
                                 )
@@ -2577,19 +2416,14 @@ impl ConnectionManager {
                                 DmStreamRegistration::CloseDuplicate => continue,
                             }
                         }
+                        let manager = manager.clone();
+                        let peer_id = peer_id.clone();
                         tokio::spawn(async move {
-                            Self::handle_bi_stream(
-                                type_buf[0],
-                                &peer_id,
-                                recv,
-                                manager,
-                                peers_ref,
-                            )
-                            .await;
+                            manager.handle_bi_stream(stream_type, &peer_id, recv).await;
                         });
                     }
                     Err(_) => {
-                        tracing::info!("Bi stream accept ended for peer {peer_id_bi}");
+                        tracing::info!("Bi stream accept ended for peer {peer_id}");
                         break;
                     }
                 }
@@ -2597,13 +2431,97 @@ impl ConnectionManager {
         });
     }
 
-    async fn handle_bi_stream(
-        stream_type: u8,
-        peer_id: &str,
+    /// Reads one peer-opened uni stream of a call connection.
+    async fn handle_uni_stream(
+        &self,
         mut recv: RecvStream,
-        manager: ConnectionManager,
-        peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
+        peer_id: &str,
+        connection_id: usize,
+        video_state: &StdMutex<VideoReceiveState>,
     ) {
+        let mut type_buf = [0u8; 1];
+        if recv.read_exact(&mut type_buf).await.is_err() {
+            return;
+        }
+        match type_buf[0] {
+            STREAM_AUDIO => loop {
+                match crate::messages::read_framed(&mut recv, MAX_CONTROL_FRAME_BYTES).await {
+                    Ok(Some(data)) => {
+                        if let Some(packet) = AudioDatagram::decode(&data) {
+                            self.mark_peer_active(peer_id).await;
+                            let _ = self.audio_media_tx.send(AudioPacket {
+                                peer_id: peer_id.to_string(),
+                                connection_id,
+                                timestamp_ms: packet.timestamp_ms,
+                                sequence: packet.sequence,
+                                payload: packet.payload,
+                            });
+                        }
+                    }
+                    _ => break,
+                }
+            },
+            STREAM_VIDEO => {
+                // One frame per stream. A read error means the sender abandoned
+                // it (reset) — the reorder buffer handles the hole. Bounded in
+                // size and time, so a peer can't pin memory with stalled streams.
+                let read = tokio::time::timeout(
+                    VIDEO_FRAME_READ_TIMEOUT,
+                    recv.read_to_end(MAX_VIDEO_FRAME_BYTES + VIDEO_FRAME_HEADER_LEN),
+                )
+                .await;
+                let Ok(Ok(body)) = read else {
+                    let _ = recv.stop(0u32.into());
+                    return;
+                };
+                let Some((seq, timestamp_ms, payload)) = decode_video_frame(&body) else {
+                    return;
+                };
+                self.mark_peer_active(peer_id).await;
+                let frame = ReceivedVideoFrame {
+                    seq,
+                    timestamp_ms,
+                    is_keyframe: is_keyframe(payload),
+                    payload: payload.to_vec(),
+                };
+                let now = std::time::Instant::now();
+                let (ready, request_keyframe) = {
+                    let mut state = video_state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    let out = state.reorder.push(frame, now);
+                    let request = out.need_keyframe
+                        && state.last_keyframe_request.is_none_or(|at| {
+                            now.duration_since(at) >= RECEIVER_KEYFRAME_REQUEST_INTERVAL
+                        });
+                    if request {
+                        state.last_keyframe_request = Some(now);
+                    }
+                    (out.ready, request)
+                };
+                for frame in ready {
+                    let _ = self.video_media_tx.send(VideoPacket {
+                        peer_id: peer_id.to_string(),
+                        timestamp_ms: frame.timestamp_ms,
+                        payload: frame.payload,
+                    });
+                }
+                if request_keyframe {
+                    let _ = self
+                        .send_control(
+                            peer_id,
+                            &ControlAction::KeyframeRequest {
+                                layer: VideoLayerRequest::High,
+                            },
+                        )
+                        .await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_bi_stream(&self, stream_type: u8, peer_id: &str, mut recv: RecvStream) {
         let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
         let max_frame_len = match stream_type {
             STREAM_CHAT => MAX_CHAT_FRAME_BYTES,
@@ -2615,21 +2533,21 @@ impl ConnectionManager {
             match crate::messages::read_framed(&mut recv, max_frame_len).await {
                 Ok(Some(data)) => match stream_type {
                     STREAM_CHAT => {
-                        Self::mark_peer_active_internal(&peers, peer_id).await;
+                        self.mark_peer_active(peer_id).await;
                         if let Ok(message) = String::from_utf8(data) {
-                            let _ = manager.event_tx.send(Event::ChatReceived {
+                            let _ = self.event_tx.send(Event::ChatReceived {
                                 peer_id: peer_id.to_string(),
                                 message,
                             });
                         }
                     }
                     STREAM_CONTROL => {
-                        Self::mark_peer_active_internal(&peers, peer_id).await;
+                        self.mark_peer_active(peer_id).await;
                         if let Ok(action) = serde_json::from_slice::<ControlAction>(&data) {
                             if matches!(action, ControlAction::Heartbeat) {
                                 continue;
                             }
-                            let _ = manager.event_tx.send(Event::ControlReceived {
+                            let _ = self.event_tx.send(Event::ControlReceived {
                                 peer_id: peer_id.to_string(),
                                 action,
                             });
@@ -2639,7 +2557,7 @@ impl ConnectionManager {
                     // dispatch (call-signal/ack/dedup handling) as the
                     // dedicated DM connection reader.
                     STREAM_DM => {
-                        handle_dm_frame_payload(&manager, &data, peer_id, &mut active_files).await;
+                        handle_dm_frame_payload(self, &data, peer_id, &mut active_files).await;
                     }
                     _ => tracing::warn!("Unknown bi stream type: {stream_type}"),
                 },
@@ -2651,7 +2569,7 @@ impl ConnectionManager {
             }
         }
 
-        cleanup_active_dm_files(active_files, peer_id, &manager.event_tx).await;
+        cleanup_active_dm_files(active_files, peer_id, &self.event_tx).await;
     }
 
     fn send_audio_datagram(
@@ -3090,15 +3008,13 @@ impl ConnectionManager {
 
         for peer_id in disconnected_peer_ids {
             tracing::info!("Disconnecting stale peer {peer_id} after liveness timeout");
-            Self::cleanup_peer_internal(
+            // Reconnect attempts exhausted: forget the ticket.
+            self.cleanup_peer(
                 &peer_id,
-                &self.peers,
-                &self.dm_peers,
-                &self.peer_tickets,
-                    &self.event_tx,
-                Some(b"peer timeout"),
-                None,
-                false, // reconnect attempts exhausted — forget the ticket
+                PeerCleanup {
+                    close_reason: Some(b"peer timeout"),
+                    ..Default::default()
+                },
             )
             .await;
         }
@@ -3265,8 +3181,6 @@ impl ConnectionManager {
 
             // Spawn a reader task for additional incoming DM bistreams on this connection
             let manager = self.clone();
-            let event_tx = self.event_tx.clone();
-            let dm_peers_ref = self.dm_peers.clone();
             let peer_id_reader = peer_id.clone();
             let connection_reader = connection.clone();
             let connection_reader_id = connection_reader.stable_id();
@@ -3291,32 +3205,21 @@ impl ConnectionManager {
                 }
 
                 // Connection closed — clean up and emit DmDisconnected
-                Self::cleanup_dm_internal(
-                    &peer_id_reader,
-                    &dm_peers_ref,
-                    &event_tx,
-                    None,
-                    Some(connection_reader_id),
-                )
-                .await;
+                manager
+                    .cleanup_dm(&peer_id_reader, None, Some(connection_reader_id))
+                    .await;
             });
 
             // Spawn a task to detect connection closure
-            let event_tx_closed = self.event_tx.clone();
-            let dm_peers_closed = self.dm_peers.clone();
+            let manager = self.clone();
             let peer_id_closed = peer_id.clone();
             let connection_closed = connection.clone();
             let connection_closed_id = connection_closed.stable_id();
             tokio::spawn(async move {
                 connection_closed.closed().await;
-                Self::cleanup_dm_internal(
-                    &peer_id_closed,
-                    &dm_peers_closed,
-                    &event_tx_closed,
-                    None,
-                    Some(connection_closed_id),
-                )
-                .await;
+                manager
+                    .cleanup_dm(&peer_id_closed, None, Some(connection_closed_id))
+                    .await;
             });
 
             Ok(())
@@ -3363,13 +3266,7 @@ impl ConnectionManager {
                     tracing::info!(
                         "DM entry for {peer_id} pre-dates recent gossip rejoin; evicting + redialing"
                     );
-                    Self::cleanup_dm_internal(
-                        peer_id,
-                        &self.dm_peers,
-                        &self.event_tx,
-                        Some(b"dm_entry_predates_rejoin"),
-                        None,
-                    )
+                    self.cleanup_dm(peer_id, Some(b"dm_entry_predates_rejoin"), None)
                     .await;
                     continue;
                 }
@@ -3441,13 +3338,7 @@ impl ConnectionManager {
             }
             Err(first_err) => {
                 tracing::warn!("DM write to peer {peer_id} failed; reconnecting once: {first_err}");
-                Self::cleanup_dm_internal(
-                    peer_id,
-                    &self.dm_peers,
-                    &self.event_tx,
-                    Some(b"dm_write_failed"),
-                    active_connection_id,
-                )
+                self.cleanup_dm(peer_id, Some(b"dm_write_failed"), active_connection_id)
                 .await;
 
                 self.ensure_dm_connected(peer_id).await.map_err(|reconnect_err| {
@@ -3466,26 +3357,18 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_dm(&self, peer_id: &str) {
-        Self::cleanup_dm_internal(
-            peer_id,
-            &self.dm_peers,
-            &self.event_tx,
-            Some(b"dm_closed"),
-            None,
-        )
+        self.cleanup_dm(peer_id, Some(b"dm_closed"), None)
         .await;
     }
 
     pub async fn disconnect_peer(&self, peer_id: &str) -> Result<()> {
-        Self::cleanup_peer_internal(
+        // User ended the call: forget the ticket.
+        self.cleanup_peer(
             peer_id,
-            &self.peers,
-            &self.dm_peers,
-            &self.peer_tickets,
-            &self.event_tx,
-            Some(b"call ended"),
-            None,
-            false, // user ended the call — forget the ticket
+            PeerCleanup {
+                close_reason: Some(b"call ended"),
+                ..Default::default()
+            },
         )
         .await;
         // This is the explicit, user-initiated hang-up path (the `end_call`
@@ -4303,17 +4186,15 @@ mod tests {
         // A stale connection's watcher that finds no matching entry must not
         // touch the ticket owned by whatever replaced it.
         assert!(manager.upsert_peer_ticket("peer-a", "ticket-1").await);
-        let removed = ConnectionManager::cleanup_peer_internal(
-            "peer-a",
-            &manager.peers,
-            &manager.dm_peers,
-            &manager.peer_tickets,
-            &manager.event_tx,
-            None,
-            Some(12345),
-            false,
-        )
-        .await;
+        let removed = manager
+            .cleanup_peer(
+                "peer-a",
+                PeerCleanup {
+                    connection_id: Some(12345),
+                    ..Default::default()
+                },
+            )
+            .await;
         assert!(!removed);
         assert!(manager.peer_tickets.lock().await.contains_key("peer-a"));
     }
