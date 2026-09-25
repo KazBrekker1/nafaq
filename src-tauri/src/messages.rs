@@ -36,7 +36,7 @@ pub enum DmMessage {
     FileChunk {
         id: String,
         offset: u64,
-        #[serde(with = "serde_bytes")]
+        #[serde(with = "file_chunk_data")]
         data: Vec<u8>,
     },
     FileEnd {
@@ -73,6 +73,56 @@ pub enum DmMessage {
 // id-less `Text` still deserializes on a new receiver, and a new peer's
 // `Text{id: Some(_)}` still deserializes on an old receiver (unknown fields
 // are ignored by default; no `deny_unknown_fields` is set on this enum).
+
+/// Wire encoding of `FileChunk.data`.
+///
+/// Receive: accepts both the legacy JSON number array and a base64 string.
+/// Send: still the number array. A 0.10.0 receiver (`serde_bytes`) would
+/// accept a JSON string as the string's raw UTF-8 bytes, so base64 would be
+/// silently written to disk as file content (or rejected as oversized).
+// TODO: switch `serialize` to base64 (about 3x smaller frames) once no peers
+// on <= 0.10.0 remain, i.e. once every supported build decodes base64 here.
+mod file_chunk_data {
+    use base64::Engine;
+    use serde::de::{self, Deserializer, SeqAccess, Visitor};
+    use serde::Serializer;
+
+    const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+
+    pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(data, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct DataVisitor;
+
+        impl<'de> Visitor<'de> for DataVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a byte array or a base64 string")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                B64.decode(v).map_err(E::custom)
+            }
+
+            fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(v.to_vec())
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64 * 1024));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_any(DataVisitor)
+    }
+}
 
 /// Stream type identifiers for binary frame protocol
 pub const STREAM_AUDIO: u8 = 0x01;
@@ -579,6 +629,32 @@ mod tests {
             DmMessage::Text { id, .. } => assert_eq!(id, None),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn file_chunk_is_still_sent_as_a_number_array() {
+        let msg = DmMessage::FileChunk {
+            id: "t".into(),
+            offset: 0,
+            data: vec![1, 2, 255],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""data":[1,2,255]"#), "{json}");
+    }
+
+    #[test]
+    fn file_chunk_accepts_array_and_base64_data() {
+        for json in [
+            r#"{"type":"file_chunk","id":"t","offset":0,"data":[1,2,255]}"#,
+            r#"{"type":"file_chunk","id":"t","offset":0,"data":"AQL/"}"#,
+        ] {
+            match serde_json::from_str::<DmMessage>(json).unwrap() {
+                DmMessage::FileChunk { data, .. } => assert_eq!(data, vec![1, 2, 255], "{json}"),
+                other => panic!("wrong variant {other:?}"),
+            }
+        }
+        let bad = r#"{"type":"file_chunk","id":"t","offset":0,"data":"not base64!"}"#;
+        assert!(serde_json::from_str::<DmMessage>(bad).is_err());
     }
 
     #[test]
