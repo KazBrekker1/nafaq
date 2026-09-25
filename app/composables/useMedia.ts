@@ -16,6 +16,7 @@ const audioMuted = ref(false);
 const videoMuted = ref(false);
 const error = ref<string | null>(null);
 
+const IS_ANDROID = /android/i.test(navigator.userAgent);
 let micLevelTimer: ReturnType<typeof setInterval> | null = null;
 let audioContext: AudioContext | null = null;
 
@@ -57,20 +58,19 @@ export function useMedia() {
     }
   }
 
-  async function startPreview() {
+  /** Returns whether a stream with video was acquired. `releaseCamera` stops
+   *  the current camera first — Android's camera HAL won't open a second one
+   *  while it's held (NotReadableError). */
+  async function startPreview({ releaseCamera = false }: { releaseCamera?: boolean } = {}) {
     error.value = null;
 
     if (!navigator.mediaDevices?.getUserMedia) {
       error.value = MEDIA_API_UNAVAILABLE;
-      return;
+      return false;
     }
 
     const generation = ++previewGeneration;
-
-    // Replacing a live stream (device switch): release the current camera
-    // first — Android's camera HAL won't open a second one while it's held,
-    // so asking for the new device would fail with NotReadableError.
-    localStream.value?.getVideoTracks().forEach((t) => t.stop());
+    if (releaseCamera) localStream.value?.getVideoTracks().forEach((t) => t.stop());
 
     // Capture is downscaled to at most 640x360 @ 12 fps before encoding;
     // asking for more only burns camera/CPU (notably on Android).
@@ -112,7 +112,7 @@ export function useMedia() {
             error.value = "Camera unavailable — audio only.";
           } catch {
             error.value = `Camera/mic access failed: ${e instanceof Error ? e.message : String(e)}`;
-            return;
+            return false;
           }
           break;
         }
@@ -124,13 +124,35 @@ export function useMedia() {
         // A newer startPreview/stopPreview superseded this attempt while
         // getUserMedia was in flight — release the orphaned capture.
         stream.getTracks().forEach((t) => t.stop());
-        return;
+        return false;
       }
       stopPreview();
       localStream.value = stream;
       await enumerateDevices();
       applyMuteState();
       startMicLevelMonitor(stream);
+      return stream.getVideoTracks().length > 0;
+    }
+    return false;
+  }
+
+  // Mid-call device switch. Desktop keeps the old stream until the new one
+  // is up; Android must release the camera first. If the new device can't
+  // be opened (or only audio comes back), go back to the previous one
+  // rather than leaving the call on a dead or missing camera.
+  async function switchDevice(kind: "camera" | "mic", deviceId: string) {
+    const selected = kind === "camera" ? selectedCamera : selectedMic;
+    const previous = selected.value;
+    selected.value = deviceId;
+    if (!localStream.value) return;
+    const releaseCamera = kind === "camera" || IS_ANDROID;
+    const hadVideo = localStream.value.getVideoTracks().length > 0;
+    const gotVideo = await startPreview({ releaseCamera });
+    if (hadVideo && !gotVideo && previous !== deviceId) {
+      const failure = error.value;
+      selected.value = previous;
+      await startPreview({ releaseCamera: true });
+      error.value = failure ?? `Couldn't switch ${kind}; kept the previous one.`;
     }
   }
 
@@ -207,13 +229,11 @@ export function useMedia() {
   }
 
   async function switchCamera(deviceId: string) {
-    selectedCamera.value = deviceId;
-    if (localStream.value) await startPreview();
+    await switchDevice("camera", deviceId);
   }
 
   async function switchMic(deviceId: string) {
-    selectedMic.value = deviceId;
-    if (localStream.value) await startPreview();
+    await switchDevice("mic", deviceId);
   }
 
   return {

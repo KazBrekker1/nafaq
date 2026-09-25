@@ -593,12 +593,12 @@ export function teardownCapture() {
   clearCaptureSurface();
 }
 
-export async function restartSending(newStream: MediaStream) {
+export async function restartSending(getStream: () => MediaStream) {
   teardownCapture();
   const token = currentCaptureRun();
-  await initCodecs(newStream);
+  await initCodecs(getStream());
   if (token !== currentCaptureRun()) return; // stopped meanwhile
-  await startSending(newStream);
+  await startSending(getStream());
 }
 
 // Per-call capture settings back to defaults (after teardownCapture).

@@ -101,6 +101,12 @@ function enqueue<T>(nodeId: string, task: () => Promise<T>): Promise<T> {
 // automatic retry can't both queue the same message.
 const queuedTexts = new Set<string>();
 
+// When a send to a peer fails (typically: offline, the dial timed out), every
+// text queued behind it would otherwise sit through its own full dial.
+// Messages queued before that failure fail fast instead; the dm-connected /
+// presence retry sends them once the peer is reachable.
+const sendFailures = new Map<string, number>();
+
 // Deliver an existing text message (already in the conversation) and resolve its
 // status to "sent" or "failed". Shared by sendText, manual resend, and the
 // automatic retry on reconnect. Never throws — failure is surfaced via status.
@@ -108,11 +114,18 @@ function deliverText(nodeId: string, message: DmTextMessage): Promise<boolean> {
   const clientId = message.clientId;
   if (!clientId || queuedTexts.has(clientId)) return Promise.resolve(false);
   queuedTexts.add(clientId);
+  const failuresAtQueue = sendFailures.get(nodeId) ?? 0;
+  // Show a queued retry as in progress right away (not only once it runs).
+  if (message.status === "failed") setDmTextStatus(nodeId, clientId, "sending");
   return enqueue(nodeId, async () => {
     try {
       const current = findTextMsg(nodeId, clientId);
       if (!current) return false;
       if (STATUS_RANK[current.status] >= STATUS_RANK.sent) return true;
+      if ((sendFailures.get(nodeId) ?? 0) > failuresAtQueue) {
+        setDmTextStatus(nodeId, clientId, "failed");
+        return false;
+      }
       current.status = "sending";
       await invoke("send_dm", {
         peerId: nodeId,
@@ -122,6 +135,7 @@ function deliverText(nodeId: string, message: DmTextMessage): Promise<boolean> {
       return true;
     } catch (error) {
       console.warn("[dm] send failed:", error);
+      sendFailures.set(nodeId, (sendFailures.get(nodeId) ?? 0) + 1);
       setDmTextStatus(nodeId, clientId, "failed");
       return false;
     } finally {
@@ -152,6 +166,10 @@ async function dial(nodeId: string) {
     // Intentionally do NOT add to connectedPeers here — the "dm-connected"
     // event is the source of truth. If Rust rejected the stream, no event
     // fires and a later dial correctly re-dials.
+    // Rust may already have been connected (no new dm-connected, e.g. after
+    // a frontend reload): retry anything still failed now. Deduped by
+    // queuedTexts if dm-connected also fires.
+    void retryFailedMessages(nodeId);
   } catch (error) {
     console.warn("[dm] connect_dm failed:", error);
     connectErrors.value[nodeId] = true;
@@ -343,8 +361,10 @@ export function useDM() {
     unreadCounts.value[nodeId] = 0;
   }
 
-  function clearActiveConversation() {
-    activeConversation = null;
+  // Only clear if it's still ours: on /dm/A → /dm/B the new page may have
+  // set B before A's unmount runs.
+  function clearActiveConversation(nodeId: string) {
+    if (activeConversation === nodeId) activeConversation = null;
   }
 
   return {

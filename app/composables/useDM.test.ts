@@ -99,6 +99,23 @@ describe("useDM", () => {
     expect(mocks.invoke).toHaveBeenCalledTimes(2);
   });
 
+  it("fails queued messages fast once a send to that peer fails", async () => {
+    const firstSend = deferred();
+    mocks.invoke.mockImplementationOnce(() => firstSend.promise);
+    const dm = await freshDM();
+
+    const first = dm.sendText("peer", "one");
+    const second = dm.sendText("peer", "two");
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    firstSend.reject(new Error("unreachable"));
+    await Promise.all([first, second]);
+
+    const statuses = dm.conversations.value.peer!.map(m => m.type === "text" && m.status);
+    expect(statuses).toEqual(["failed", "failed"]);
+    // Only the first message paid for a dial attempt.
+    expect(mocks.invoke).toHaveBeenCalledTimes(1);
+  });
+
   it("counts unread messages outside the open conversation", async () => {
     mocks.invoke.mockResolvedValue(undefined);
     const dm = await freshDM();

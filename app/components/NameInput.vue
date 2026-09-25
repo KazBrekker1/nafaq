@@ -6,6 +6,10 @@ const { namePinned } = useCall();
 const pinned = computed(() => namePinned.value === true);
 const loaded = computed(() => namePinned.value !== null);
 
+// Debounced persist — avoids an IPC call on every keystroke
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+let pendingName: string | null = null;
+
 async function setPinnedName(name: string | null, pin: boolean) {
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("set_pinned_name", { name, pinned: pin });
@@ -13,6 +17,12 @@ async function setPinnedName(name: string | null, pin: boolean) {
 
 async function togglePin() {
   const next = !pinned.value;
+  // Unpinning must win over a debounced save still waiting to run (which
+  // would re-pin the name).
+  if (!next) {
+    clearTimeout(persistTimer);
+    pendingName = null;
+  }
   namePinned.value = next;
   try {
     await setPinnedName(next ? model.value : null, next);
@@ -21,9 +31,6 @@ async function togglePin() {
   }
 }
 
-// Debounced persist — avoids an IPC call on every keystroke
-let persistTimer: ReturnType<typeof setTimeout> | undefined;
-let pendingName: string | null = null;
 
 function flushPersist() {
   clearTimeout(persistTimer);

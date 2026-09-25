@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
 import type { DmMessageItem } from "~/composables/useDM";
 import { formatTime } from "~/utils/format";
 
@@ -79,8 +80,10 @@ function callFailed(description: string) {
 }
 
 async function initiateCall() {
-  if (callBusy.value) return;
-  const { invoke } = await import("@tauri-apps/api/core");
+  if (callBusy.value) {
+    toast.add({ title: "Already in a call", description: "Finish the current call first.", color: "warning" });
+    return;
+  }
   // Create a call first, then send the ticket via DM.
   const t = await createCall();
   if (!t) {
@@ -127,7 +130,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
-  clearActiveConversation();
+  clearActiveConversation(peerId.value);
 });
 </script>
 

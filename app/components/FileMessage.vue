@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { formatSize } from "~/utils/format";
 
-const { progress, localPath, failed } = defineProps<{
+const { name, progress, localPath, failed } = defineProps<{
   name: string;
   size: number;
   progress: number;
@@ -16,13 +16,32 @@ const progressPct = computed(() => Math.round(progress * 100));
 
 const toast = useToast();
 
-// Received files land in ~/Downloads (see the FileEnd handler in
-// connection.rs); the opener capability is scoped to that directory.
+// Android's opener can't hand a private path to another app, so there's
+// nothing useful to offer there.
+const canOpen = !/android/i.test(navigator.userAgent);
+
+// Files we write carry no "downloaded from the internet" mark, so opening an
+// executable a peer sent would run it without any OS prompt. Show those in
+// the file manager instead.
+const EXECUTABLE_EXTENSIONS = new Set([
+  "exe", "msi", "msix", "appx", "bat", "cmd", "com", "scr", "pif", "cpl", "msc",
+  "lnk", "url", "reg", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+  "hta", "jar", "app", "command", "tool", "pkg", "dmg", "sh", "bash", "zsh",
+  "run", "bin", "appimage", "deb", "rpm", "desktop",
+]);
+const isExecutable = computed(() => {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  return name.includes(".") && EXECUTABLE_EXTENSIONS.has(ext);
+});
+
+// Received files land in ~/Downloads (see dm_files.rs); the opener
+// capability is scoped to that directory.
 async function openFile() {
   if (!localPath) return;
   try {
-    const { openPath } = await import("@tauri-apps/plugin-opener");
-    await openPath(localPath);
+    const { openPath, revealItemInDir } = await import("@tauri-apps/plugin-opener");
+    if (isExecutable.value) await revealItemInDir(localPath);
+    else await openPath(localPath);
   } catch (e) {
     toast.add({ title: "Could not open file", description: String(e), color: "error" });
   }
@@ -68,11 +87,11 @@ async function openFile() {
     <!-- Completion: OPEN button for received files (the only paths the
          opener scope allows), otherwise status badge -->
     <div
-      v-if="isComplete && localPath && from === 'peer'"
+      v-if="canOpen && isComplete && !failed && localPath && from === 'peer'"
       class="border-t border-primary/40"
     >
       <UButton
-        label="OPEN"
+        :label="isExecutable ? 'SHOW IN FOLDER' : 'OPEN'"
         variant="ghost"
         color="primary"
         size="xs"

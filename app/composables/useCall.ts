@@ -60,7 +60,8 @@ async function loadPinnedName() {
     const { invoke } = await import("@tauri-apps/api/core");
     const saved = await invoke<string | null>("get_pinned_name");
     if (saved && !displayName.value) displayName.value = saved;
-    namePinned.value = Boolean(saved);
+    // A pinned empty name is still pinned.
+    namePinned.value = saved !== null && saved !== undefined;
   } catch {
     namePinned.value = false;
   }
@@ -440,15 +441,16 @@ async function initCallListeners() {
           }
         }, 30_000);
       } else {
-        // Already busy — record as missed call
-        showMissedCall(callerName(pid));
-        // Tell the second caller we're busy instead of letting them ring
-        // out. Skip peers already part of this call (a duplicate invite
-        // from the caller we're ringing for, or someone we're talking to).
+        // Already busy. A duplicate invite from someone already part of this
+        // call (the caller we're ringing for or just accepted, the person we
+        // invited, a participant) is ignored: declining it would cancel the
+        // very call we're joining. Anyone else gets a missed call + busy.
         const partOfThisCall = incomingInvite.value?.peerId === pid
+          || peerId.value === pid
           || invitedPeerId.value === pid
           || peers.value.includes(pid);
         if (!partOfThisCall) {
+          showMissedCall(callerName(pid));
           invoke("send_call_decline", { peerId: pid }).catch((e) => {
             console.warn(`[call] failed to send busy decline to ${pid}:`, e);
           });

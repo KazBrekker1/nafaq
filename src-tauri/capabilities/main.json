@@ -18,6 +18,7 @@
         { "path": "$TEMP/**" }
       ]
     },
+    "opener:allow-reveal-item-in-dir",
     "dialog:allow-open",
     "os:default",
     "updater:default",

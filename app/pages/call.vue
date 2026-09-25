@@ -184,7 +184,14 @@ async function runConnectedPipeline() {
 
   // Receiving first: it picks up the current call-size profile, which the
   // encoder created by initCodecs must start with.
-  await transport.startReceiving(() => call.peers.value);
+  // A receive failure (no playback worklet, bridge probe timeout) must not
+  // also silence what we send.
+  try {
+    await transport.startReceiving(() => call.peers.value);
+  } catch (e) {
+    console.warn("[call] startReceiving failed:", e);
+    toast.add({ title: "Can't play the other side's audio/video", description: String(e), color: "error" });
+  }
   if (cleaned) return;
   await transport.initCodecs(media.localStream.value);
   if (cleaned) return;
@@ -283,7 +290,9 @@ watch(() => media.localStream.value, async (newStream, oldStream) => {
   if (!newStream || !oldStream || newStream === oldStream) return;
   if (!transport.encoding.value || call.peers.value.length === 0) return;
   try {
-    await transport.restartSending(newStream);
+    // Read the stream again after the restart's awaits: a second switch in
+    // between already replaced (and stopped) newStream.
+    await transport.restartSending(() => media.localStream.value ?? newStream);
   } catch (e) {
     console.warn("[call] restartSending failed:", e);
   }
