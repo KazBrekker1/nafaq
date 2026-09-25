@@ -1031,7 +1031,7 @@ async fn interrupted_file_transfer_cleans_up_and_later_dms_work() {
     .expect("A never saw B online before interrupted transfer");
 
     // Only saved contacts may send files (mirrors the contacts store).
-    b.mgr.add_contact(&a_id);
+    b.mgr.add_contact(&a_id).unwrap();
 
     let file_id = "interrupted-large-transfer".to_string();
     let chunk = vec![7u8; 128 * 1024];
