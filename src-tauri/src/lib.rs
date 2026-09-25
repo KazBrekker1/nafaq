@@ -294,6 +294,7 @@ pub fn run() {
                 latest_ticket,
                 relay_status,
                 presence: presence.clone(),
+                contacts_lock: Mutex::new(()),
             };
 
             let media_bridge_ref = media_bridge.current.clone();

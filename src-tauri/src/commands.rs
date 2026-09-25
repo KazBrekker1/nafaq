@@ -718,7 +718,7 @@ pub async fn add_contact(
     contact: Contact,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Vec<Contact>, String> {
     // Reject malformed ids before persisting — otherwise an invalid contact is
     // saved to disk and only fails later at presence.track_contact.
     contact
@@ -729,6 +729,8 @@ pub async fn add_contact(
         return Err("Display name too long".into());
     }
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
+    // Held across load..save so concurrent add/remove can't lose an update.
+    let _contacts_guard = state.contacts_lock.lock().await;
     let mut contacts = load_contacts(&store);
     let node_id = contact.node_id.clone();
     let is_new = !contacts.iter().any(|c| c.node_id == node_id);
@@ -751,7 +753,7 @@ pub async fn add_contact(
             tracing::warn!("presence track failed for {node_id}: {e}");
         }
     }
-    Ok(())
+    Ok(contacts)
 }
 
 #[tauri::command]
@@ -759,8 +761,9 @@ pub async fn remove_contact(
     node_id: String,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<Vec<Contact>, String> {
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
+    let _contacts_guard = state.contacts_lock.lock().await;
     let mut contacts = load_contacts(&store);
     contacts.retain(|c| c.node_id != node_id);
     store.set(
@@ -771,7 +774,7 @@ pub async fn remove_contact(
     state.conn_manager.remove_contact(&node_id);
 
     state.presence.untrack_contact(&node_id).await;
-    Ok(())
+    Ok(contacts)
 }
 
 // ── Identity persistence commands ───────────────────────────────────

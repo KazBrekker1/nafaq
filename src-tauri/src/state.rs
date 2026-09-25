@@ -39,4 +39,6 @@ pub struct AppState {
     pub latest_ticket: Arc<Mutex<Option<String>>>,
     pub relay_status: Arc<Mutex<RelayStatusKind>>,
     pub presence: Arc<PresenceManager>,
+    /// Serializes read-modify-write of the contacts store (add/remove_contact).
+    pub contacts_lock: Mutex<()>,
 }
