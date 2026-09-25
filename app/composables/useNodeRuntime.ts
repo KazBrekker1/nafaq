@@ -158,7 +158,6 @@ export function useNodeRuntime() {
     relayStatus,
     ticket,
     // Alias kept for useCall/settings, which expose it as the share ticket.
-    shareTicket: ticket,
     nodeError,
     peerConnectionStatuses,
     init,

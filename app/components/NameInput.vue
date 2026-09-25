@@ -33,7 +33,28 @@ function flushPersist() {
   setPinnedName(name, true).catch(() => {});
 }
 
+// The backend caps names at 64 UTF-8 bytes (not characters): an Arabic name
+// hits that at ~32 characters, so trim by bytes rather than relying on
+// maxlength alone.
+const MAX_NAME_BYTES = 64;
+const encoder = new TextEncoder();
+
+function clampToBytes(name: string) {
+  if (encoder.encode(name).length <= MAX_NAME_BYTES) return name;
+  let out = "";
+  for (const ch of name) {
+    if (encoder.encode(out + ch).length > MAX_NAME_BYTES) break;
+    out += ch;
+  }
+  return out;
+}
+
 watch(() => model.value, (name) => {
+  const clamped = clampToBytes(name);
+  if (clamped !== name) {
+    model.value = clamped;
+    return;
+  }
   if (!pinned.value) return;
   pendingName = name;
   clearTimeout(persistTimer);

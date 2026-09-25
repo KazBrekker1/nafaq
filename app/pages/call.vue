@@ -12,6 +12,10 @@ const { starFromCall, contacts } = useContacts();
 const { request: requestWakeLock, release: releaseWakeLock } = useWakeLock();
 const toast = useToast();
 
+watch(call.lastDisconnectedPeer, (left) => {
+  if (left) toast.add({ title: `${left.name} left the call`, icon: "i-heroicons-arrow-right-start-on-rectangle", duration: 3000 });
+});
+
 const starredPeers = ref<Set<string>>(new Set());
 
 async function handleStar(peerId: string) {
@@ -383,7 +387,7 @@ function handleSendChat(text: string) {
           Connecting...
         </div>
         <div v-else class="w-full max-w-md">
-          <TicketCreate :ticket="shareConnectionTicket" :state="call.state.value" :disabled="true" />
+          <TicketCreate :ticket="shareConnectionTicket" :state="call.state.value" />
         </div>
 
         <!-- Cancel -->
@@ -399,13 +403,6 @@ function handleSendChat(text: string) {
 
     <!-- ═══════════════════ ACTIVE CALL VIEW ═══════════════════ -->
     <template v-else>
-      <!-- Disconnect toast -->
-      <DisconnectToast
-        v-if="call.lastDisconnectedPeer.value"
-        :key="call.lastDisconnectedPeer.value.id"
-        :name="call.lastDisconnectedPeer.value.name"
-      />
-
       <!-- Last peer left prompt -->
       <div
         v-if="call.allPeersLeft.value"
@@ -567,7 +564,6 @@ function handleSendChat(text: string) {
       <ChatSidebar
         v-if="chatOpen"
         :messages="chat.messages.value"
-        :peer-id="call.peerId.value || ''"
         :display-name="call.displayName.value"
         :peer-names="call.peerNames.value"
         @send="handleSendChat"

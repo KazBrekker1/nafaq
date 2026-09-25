@@ -224,7 +224,7 @@ async function declineInvite() {
 export function useCall() {
   const nodeRuntime = useNodeRuntime();
   const nodeId = nodeRuntime.nodeId;
-  const shareTicket = nodeRuntime.shareTicket;
+  const shareTicket = nodeRuntime.ticket;
   const nodeReady = computed(() => Boolean(nodeId.value && nodeRuntime.relayStatus.value === "online" && shareTicket.value));
   const connectionProgress = computed<ConnectionProgress>(() => {
     if (callConnectionProgress.value !== "idle") return callConnectionProgress.value;
@@ -391,12 +391,8 @@ async function initCallListeners() {
         peerVideoOff.value = restVideo;
       }
 
+      // A fresh object each time so watchers fire even for the same peer.
       lastDisconnectedPeer.value = { id: pid, name: peerName };
-      setTimeout(() => {
-        if (lastDisconnectedPeer.value?.id === pid) {
-          lastDisconnectedPeer.value = null;
-        }
-      }, 3500);
 
       if (peers.value.length === 0) {
         allPeersLeft.value = true;
