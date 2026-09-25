@@ -75,6 +75,10 @@ pub(super) async fn handle_dm_frame_payload(
         });
         return;
     }
+    if let DmMessage::FileReject { id, reason } = &dm_msg {
+        manager.handle_file_reject(peer_id, id, reason);
+        return;
+    }
     if handle_call_signal(manager, &dm_msg, peer_id).await {
         return;
     }
@@ -98,7 +102,7 @@ pub(super) async fn handle_dm_frame_payload(
 
     let sender_is_contact =
         !matches!(dm_msg, DmMessage::FileStart { .. }) || manager.is_contact(peer_id);
-    let skip_dm_event = handle_dm_file_message(
+    let outcome = handle_dm_file_message(
         &dm_msg,
         peer_id,
         sender_is_contact,
@@ -106,7 +110,18 @@ pub(super) async fn handle_dm_frame_payload(
         &manager.event_tx,
     )
     .await;
-    if !skip_dm_event {
+    if let Some((id, reason)) = outcome.reject {
+        // Tell the sender so it stops streaming (and doesn't report success).
+        // Best effort: an older peer just drops the unknown frame.
+        let reject = DmMessage::FileReject {
+            id: id.clone(),
+            reason: reason.to_string(),
+        };
+        if let Err(e) = manager.send_dm_frame_strict(peer_id, &reject).await {
+            tracing::debug!("Failed to send FileReject for {id} to {peer_id}: {e}");
+        }
+    }
+    if !outcome.skip_dm_event {
         let _ = manager.event_tx.send(Event::DmReceived {
             peer_id: peer_id.to_string(),
             message: dm_msg,

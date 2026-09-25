@@ -55,6 +55,13 @@ pub enum DmMessage {
         id: String,
     },
     Heartbeat,
+    /// Receiver → sender: the transfer `id` failed on the receiving side
+    /// (rejected FileStart, or a write/save failure), so the sender stops
+    /// streaming and reports it failed. New variant — see wire-compat note.
+    FileReject {
+        id: String,
+        reason: String,
+    },
 }
 
 // Wire-compat note (additive enum variants over serde_json):
@@ -72,6 +79,10 @@ pub enum DmMessage {
 // id-less `Text` still deserializes on a new receiver, and a new peer's
 // `Text{id: Some(_)}` still deserializes on an old receiver (unknown fields
 // are ignored by default; no `deny_unknown_fields` is set on this enum).
+// `FileReject` follows the same rule (0.10.x's `handle_dm_frame_payload`
+// already drops unparseable frames and keeps reading): an older sender just
+// never learns about the rejection, exactly as before, and an older receiver
+// never sends one.
 
 /// `FileChunk.data` travels as base64 (a JSON number array was ~3.5x
 /// larger on the wire and slow to parse).
@@ -555,5 +566,22 @@ mod tests {
         // frame, keep reading" rather than closing the stream.
         let json = r#"{"type":"some_future_variant","stuff":1}"#;
         assert!(serde_json::from_str::<DmMessage>(json).is_err());
+    }
+
+    #[test]
+    fn test_dm_file_reject_roundtrip() {
+        let msg = DmMessage::FileReject {
+            id: "t-1".into(),
+            reason: "sender is not a contact".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"file_reject","id":"t-1","reason":"sender is not a contact"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<DmMessage>(&json).unwrap(),
+            DmMessage::FileReject { id, reason } if id == "t-1" && reason == "sender is not a contact"
+        ));
     }
 }

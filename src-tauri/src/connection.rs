@@ -118,6 +118,17 @@ fn classify_call_close_reason(reason: &[u8]) -> CallCloseDisposition {
     }
 }
 
+/// The canonical string form of a node id — the one `remote_id().to_string()`
+/// produces, and the key of every per-peer map here — or `None` if `id` isn't
+/// a valid node id. Accepts any encoding `iroh::PublicKey` parses (e.g. a
+/// base32 id typed in by a user).
+pub fn canonical_node_id(id: &str) -> Option<String> {
+    id.trim()
+        .parse::<iroh::PublicKey>()
+        .ok()
+        .map(|key| key.to_string())
+}
+
 async fn with_timeout<T, F>(
     timeout_duration: Duration,
     timeout_message: impl Into<String>,
@@ -516,6 +527,9 @@ pub struct ConnectionManager {
     /// Node ids of saved contacts (mirrors the contacts store). Only contacts
     /// may send us files. Kept in sync by startup load and add/remove_contact.
     contacts: Arc<StdMutex<HashSet<String>>>,
+    /// Outgoing file transfers, so a receiver's `FileReject` can stop the
+    /// sender's chunk loop (`send_file`) and mark the transfer failed.
+    file_sends: Arc<StdMutex<OutgoingFileSends>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -556,6 +570,7 @@ impl ConnectionManager {
             replacing_peers: Arc::new(StdMutex::new(HashMap::new())),
             recent_dm_ids: Arc::new(Mutex::new(RecentDmIds::default())),
             contacts: Arc::new(StdMutex::new(HashSet::new())),
+            file_sends: Arc::new(StdMutex::new(OutgoingFileSends::default())),
         }
     }
 
@@ -3777,6 +3792,72 @@ mod tests {
 
         router_a.shutdown().await.ok();
         router_b.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_file_start_reaches_the_sender_as_a_failure() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a, audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = test_manager(event_tx_b.clone(), audio_tx_b, video_tx_b);
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+        wait_for_relay_addr(&endpoint_a).await;
+
+        // B is not one of A's contacts, so A rejects the transfer.
+        let a_id = endpoint_a.id().to_string();
+        let mut rx_b = event_tx_b.subscribe();
+        mgr_b.ensure_dm_connected(&a_id).await.unwrap();
+        let _guard = mgr_b.begin_file_send(&a_id, "t-rejected");
+        mgr_b
+            .send_dm_frame_strict(
+                &a_id,
+                &DmMessage::FileStart {
+                    name: "x.bin".into(),
+                    size: 4,
+                    id: "t-rejected".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reason = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(Event::DmFileTransferFailed {
+                    peer_id,
+                    file_id,
+                    reason,
+                }) = rx_b.recv().await
+                {
+                    if peer_id == a_id && file_id == "t-rejected" {
+                        break reason;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the sender should learn the file was rejected");
+        assert_eq!(reason.as_deref(), Some("sender is not a contact"));
+        assert_eq!(
+            mgr_b.file_send_rejection("t-rejected").as_deref(),
+            Some("sender is not a contact"),
+            "send_file's chunk loop must see the cancellation"
+        );
+
+        router_a.shutdown().await.ok();
         endpoint_b.close().await;
         endpoint_a.close().await;
     }

@@ -522,6 +522,13 @@ pub async fn send_file(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Lets a FileReject from the receiver stop the loop below.
+    let _send_guard = state.conn_manager.begin_file_send(&peer_id, &id);
+    let check_rejected = || match state.conn_manager.file_send_rejection(&id) {
+        Some(reason) => Err(format!("{peer_id} rejected the file: {reason}")),
+        None => Ok(()),
+    };
+
     state
         .conn_manager
         .send_dm_frame_strict(
@@ -543,6 +550,7 @@ pub async fn send_file(
     let mut offset = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        check_rejected()?;
         let n = file.read(&mut buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
             break;
@@ -563,6 +571,7 @@ pub async fn send_file(
     }
 
     // Send FileEnd
+    check_rejected()?;
     state
         .conn_manager
         .send_dm_frame_strict(&peer_id, &DmMessage::FileEnd { id: id.clone() })
