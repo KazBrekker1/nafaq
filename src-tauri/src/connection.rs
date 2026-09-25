@@ -736,18 +736,59 @@ enum DmConnectionOwnership {
     SharedCall,
 }
 
+/// Outcome of offering a DM connection or stream for registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmConnectionHandling {
+enum DmDecision {
+    /// The candidate is (or may become) the peer's DM path.
     Store,
+    /// An existing path wins; read one frame the remote may already have
+    /// sent on the candidate so it isn't lost, then close it.
     DrainDuplicate,
+    /// An existing path wins; close the candidate without reading.
     CloseDuplicate,
 }
 
+/// How a DM candidate on a new connection relates to a live existing entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DmStreamRegistration {
-    Stored,
-    DrainDuplicate,
-    CloseDuplicate,
+enum DmArbitration {
+    /// Same direction as the existing entry: the initiator re-dialed, which it
+    /// only does once it considers the old path dead (e.g. its
+    /// CONNECTION_CLOSE was lost). Newest wins; the old connection is closed.
+    Redial,
+    /// Crossed simultaneous dial and the candidate wins the tiebreak. The old
+    /// connection's stream is finished gracefully: the remote resolves the
+    /// same tiebreak the other way round.
+    CandidateWins,
+    /// Crossed simultaneous dial and the existing entry wins the tiebreak.
+    ExistingWins,
+    /// Our own id is unknown (endpoint not set yet), so the tiebreak can't be
+    /// evaluated: keep what we have.
+    Undecidable,
+}
+
+fn arbitrate_dm_candidate(
+    local_node_id: Option<&str>,
+    remote_peer_id: &str,
+    existing_direction: ConnectionDirection,
+    candidate_direction: ConnectionDirection,
+) -> DmArbitration {
+    if existing_direction == candidate_direction {
+        return DmArbitration::Redial;
+    }
+    match local_node_id {
+        Some(local_id)
+            if should_replace_connection(
+                local_id,
+                remote_peer_id,
+                existing_direction,
+                candidate_direction,
+            ) =>
+        {
+            DmArbitration::CandidateWins
+        }
+        Some(_) => DmArbitration::ExistingWins,
+        None => DmArbitration::Undecidable,
+    }
 }
 
 struct DmPeerConnection {
@@ -1328,7 +1369,7 @@ impl ConnectionManager {
         &self,
         peer_id: &str,
         direction: ConnectionDirection,
-    ) -> DmConnectionHandling {
+    ) -> DmDecision {
         let local_node_id = self.local_node_id().await;
 
         let probe = {
@@ -1343,15 +1384,15 @@ impl ConnectionManager {
         };
 
         let Some((conn_closed, dm_send, existing_direction)) = probe else {
-            return DmConnectionHandling::Store;
+            return DmDecision::Store;
         };
 
         // The closed() cleanup task may not have fired yet; treat a dead
         // connection or taken stream as already evicted.
         if conn_closed || dm_send.lock().await.is_none() {
             self.cleanup_dm(peer_id, Some(b"stale_dm_connection"), None)
-            .await;
-            return DmConnectionHandling::Store;
+                .await;
+            return DmDecision::Store;
         }
 
         // NeighborUp is stale-DM evidence only when it is newer than the stored
@@ -1361,29 +1402,26 @@ impl ConnectionManager {
             && self.dm_entry_predates_recent_rejoin(peer_id).await
         {
             self.cleanup_dm(peer_id, Some(b"peer_rejoined_gossip"), None)
-            .await;
-            return DmConnectionHandling::Store;
+                .await;
+            return DmDecision::Store;
         }
 
-        // Same-direction duplicate: not the crossed-dial race (that pairs one
-        // inbound with one outbound) — the initiator re-dialed because it
-        // considers the old path dead (e.g. its CONNECTION_CLOSE to us was
-        // lost). Newest wins; rejecting it strands both sides until the QUIC
-        // idle timeout.
-        if existing_direction == direction {
-            self.cleanup_dm(peer_id, Some(b"superseded_by_redial"), None)
-            .await;
-            return DmConnectionHandling::Store;
-        }
-
-        match local_node_id.as_deref() {
-            Some(local_id)
-                if should_replace_connection(local_id, peer_id, existing_direction, direction) =>
-            {
-                DmConnectionHandling::Store
+        match arbitrate_dm_candidate(
+            local_node_id.as_deref(),
+            peer_id,
+            existing_direction,
+            direction,
+        ) {
+            DmArbitration::Redial => {
+                // Rejecting it would strand both sides until the QUIC idle
+                // timeout.
+                self.cleanup_dm(peer_id, Some(b"superseded_by_redial"), None)
+                    .await;
+                DmDecision::Store
             }
-            Some(_) => DmConnectionHandling::DrainDuplicate,
-            None => DmConnectionHandling::CloseDuplicate,
+            DmArbitration::CandidateWins => DmDecision::Store,
+            DmArbitration::ExistingWins => DmDecision::DrainDuplicate,
+            DmArbitration::Undecidable => DmDecision::CloseDuplicate,
         }
     }
 
@@ -1393,7 +1431,7 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
         dm_send: SendStream,
-    ) -> DmStreamRegistration {
+    ) -> DmDecision {
         self.store_dm_peer_connection_with_ownership(
             peer_id,
             connection,
@@ -1410,7 +1448,7 @@ impl ConnectionManager {
         connection: Connection,
         direction: ConnectionDirection,
         dm_send: SendStream,
-    ) -> DmStreamRegistration {
+    ) -> DmDecision {
         self.store_dm_peer_connection_with_ownership(
             peer_id,
             connection,
@@ -1431,11 +1469,11 @@ impl ConnectionManager {
         peer_id: &str,
         existing_send: Arc<Mutex<Option<SendStream>>>,
         new_send: Option<SendStream>,
-    ) -> DmStreamRegistration {
+    ) -> DmDecision {
         {
             let mut slot = existing_send.lock().await;
             if slot.is_some() {
-                return DmStreamRegistration::DrainDuplicate;
+                return DmDecision::DrainDuplicate;
             }
             *slot = new_send;
         }
@@ -1449,10 +1487,10 @@ impl ConnectionManager {
             if let Some(mut send) = existing_send.lock().await.take() {
                 let _ = send.finish();
             }
-            return DmStreamRegistration::CloseDuplicate;
+            return DmDecision::CloseDuplicate;
         }
         self.dm_connect_done.notify_waiters();
-        DmStreamRegistration::Stored
+        DmDecision::Store
     }
 
     async fn store_dm_peer_connection_with_ownership(
@@ -1462,7 +1500,7 @@ impl ConnectionManager {
         direction: ConnectionDirection,
         dm_send: SendStream,
         ownership: DmConnectionOwnership,
-    ) -> DmStreamRegistration {
+    ) -> DmDecision {
         let dm_send = Arc::new(Mutex::new(Some(dm_send)));
         let dm_peer = DmPeerConnection {
             connection: connection.clone(),
@@ -1483,7 +1521,7 @@ impl ConnectionManager {
                 .filter(|existing| existing.connection.stable_id() == connection.stable_id())
             {
                 if ownership == DmConnectionOwnership::SharedCall {
-                    return DmStreamRegistration::CloseDuplicate;
+                    return DmDecision::CloseDuplicate;
                 }
                 // Same underlying QUIC connection re-presented its DM stream.
                 // Never await a dm_send lock while holding dm_peers (a writer
@@ -1496,30 +1534,25 @@ impl ConnectionManager {
                     .reattach_dm_send_stream(peer_id, existing_send, new_send)
                     .await;
             }
-            let should_insert = match dm_peers.get(peer_id) {
-                None => true,
-                // Same-direction duplicate: the initiator re-dialed, which only
-                // happens once it considers the old connection dead — replace
-                // rather than reject (see dm_connection_handling).
-                Some(existing) if existing.direction == direction => true,
-                Some(existing) => match local_node_id.as_ref() {
-                    Some(local_id)
-                        if should_replace_connection(
-                            local_id,
-                            peer_id,
-                            existing.direction,
-                            direction,
-                        ) =>
-                    {
-                        close_replaced_connection = false;
-                        true
-                    }
-                    Some(_) => {
-                        close_ignored_candidate = false;
-                        false
-                    }
-                    None => false,
-                },
+            let arbitration = dm_peers.get(peer_id).map(|existing| {
+                arbitrate_dm_candidate(
+                    local_node_id.as_deref(),
+                    peer_id,
+                    existing.direction,
+                    direction,
+                )
+            });
+            let should_insert = match arbitration {
+                None | Some(DmArbitration::Redial) => true,
+                Some(DmArbitration::CandidateWins) => {
+                    close_replaced_connection = false;
+                    true
+                }
+                Some(DmArbitration::ExistingWins) => {
+                    close_ignored_candidate = false;
+                    false
+                }
+                Some(DmArbitration::Undecidable) => false,
             };
 
             if !should_insert {
@@ -1529,11 +1562,11 @@ impl ConnectionManager {
                 );
                 if close_ignored_candidate {
                     dm_peer.close_if_owned(b"duplicate_dm_connection");
-                    return DmStreamRegistration::CloseDuplicate;
+                    return DmDecision::CloseDuplicate;
                 }
                 return match ownership {
-                    DmConnectionOwnership::Dedicated => DmStreamRegistration::DrainDuplicate,
-                    DmConnectionOwnership::SharedCall => DmStreamRegistration::CloseDuplicate,
+                    DmConnectionOwnership::Dedicated => DmDecision::DrainDuplicate,
+                    DmConnectionOwnership::SharedCall => DmDecision::CloseDuplicate,
                 };
             }
 
@@ -1552,7 +1585,7 @@ impl ConnectionManager {
             peer_id: peer_id.to_string(),
         });
         self.dm_connect_done.notify_waiters();
-        DmStreamRegistration::Stored
+        DmDecision::Store
     }
 
     /// Remove a DM entry, optionally only if it still belongs to
@@ -1722,8 +1755,8 @@ impl ConnectionManager {
     ) -> Result<()> {
         let connection_handling = self.dm_connection_handling(&peer_id, direction).await;
         match connection_handling {
-            DmConnectionHandling::Store => {}
-            DmConnectionHandling::DrainDuplicate => {
+            DmDecision::Store => {}
+            DmDecision::DrainDuplicate => {
                 tracing::info!(
                     "Draining duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
                 );
@@ -1758,7 +1791,7 @@ impl ConnectionManager {
                 });
                 return Ok(());
             }
-            DmConnectionHandling::CloseDuplicate => {
+            DmDecision::CloseDuplicate => {
                 tracing::info!(
                     "Closing duplicate {direction:?} DM connection for peer {peer_id}; existing connection wins"
                 );
@@ -1767,82 +1800,77 @@ impl ConnectionManager {
             }
         }
 
+        self.spawn_dm_connection_tasks(peer_id, connection, direction, None);
+
+        Ok(())
+    }
+
+    /// Spawns the tasks serving a dedicated DM connection: a reader for the
+    /// DM stream we opened (`opened_stream`, outbound only), and an accept
+    /// loop for peer-opened streams. On an inbound connection the peer's DM
+    /// stream is registered as it arrives; on an outbound one we already
+    /// registered our own, so a peer-opened DM stream is a duplicate — one
+    /// frame is drained and the connection closed. Non-DM streams are
+    /// ignored. When the loop ends the connection is closed (if it isn't
+    /// already) and its DM entry cleaned up, exactly once.
+    fn spawn_dm_connection_tasks(
+        &self,
+        peer_id: String,
+        connection: Connection,
+        direction: ConnectionDirection,
+        opened_stream: Option<RecvStream>,
+    ) {
+        let accepts_peer_stream = opened_stream.is_none();
+        if let Some(mut recv) = opened_stream {
+            let manager = self.clone();
+            let peer_id = peer_id.clone();
+            tokio::spawn(async move {
+                run_dm_reader(&mut recv, &peer_id, &manager).await;
+            });
+        }
+
         let manager = self.clone();
-        let peer_id_reader = peer_id.clone();
-        let connection_reader = connection.clone();
-        let connection_reader_id = connection_reader.stable_id();
-        // Spawn bi-stream reader for incoming DM streams
         tokio::spawn(async move {
-            loop {
-                match connection_reader.accept_bi().await {
-                    Ok((send, mut recv)) => {
-                        let mut type_buf = [0u8; 1];
-                        if recv.read_exact(&mut type_buf).await.is_err() {
-                            continue;
-                        }
-                        if type_buf[0] == STREAM_DM {
-                            let registration = match connection_handling {
-                                DmConnectionHandling::Store => {
-                                    manager
-                                        .store_dm_peer_connection(
-                                            &peer_id_reader,
-                                            connection_reader.clone(),
-                                            direction,
-                                            send,
-                                        )
-                                        .await
-                                }
-                                DmConnectionHandling::DrainDuplicate => {
-                                    DmStreamRegistration::DrainDuplicate
-                                }
-                                DmConnectionHandling::CloseDuplicate => {
-                                    DmStreamRegistration::CloseDuplicate
-                                }
-                            };
-                            match registration {
-                                DmStreamRegistration::Stored => {
-                                    let manager = manager.clone();
-                                    let peer_id = peer_id_reader.clone();
-                                    tokio::spawn(async move {
-                                        run_dm_reader(&mut recv, &peer_id, &manager).await;
-                                    });
-                                }
-                                DmStreamRegistration::DrainDuplicate => {
-                                    drain_duplicate_dm_frame_once(
-                                        &mut recv,
-                                        &peer_id_reader,
-                                        &manager,
-                                    )
-                                    .await;
-                                    connection_reader.close(0u32.into(), b"duplicate_dm_drained");
-                                    break;
-                                }
-                                DmStreamRegistration::CloseDuplicate => break,
-                            }
-                        }
-                        // Ignore non-DM streams on a DM connection
+            let connection_id = connection.stable_id();
+            while let Ok((send, mut recv)) = connection.accept_bi().await {
+                let mut type_buf = [0u8; 1];
+                if recv.read_exact(&mut type_buf).await.is_err() || type_buf[0] != STREAM_DM {
+                    continue;
+                }
+                let decision = if accepts_peer_stream {
+                    manager
+                        .store_dm_peer_connection(&peer_id, connection.clone(), direction, send)
+                        .await
+                } else {
+                    DmDecision::DrainDuplicate
+                };
+                match decision {
+                    DmDecision::Store => {
+                        let manager = manager.clone();
+                        let peer_id = peer_id.clone();
+                        tokio::spawn(async move {
+                            run_dm_reader(&mut recv, &peer_id, &manager).await;
+                        });
                     }
-                    Err(_) => break,
+                    DmDecision::DrainDuplicate => {
+                        drain_duplicate_dm_frame_once(&mut recv, &peer_id, &manager).await;
+                        connection.close(0u32.into(), b"duplicate_dm_drained");
+                        break;
+                    }
+                    DmDecision::CloseDuplicate => {
+                        connection.close(0u32.into(), b"duplicate_dm_connection");
+                        break;
+                    }
                 }
             }
 
-            // Connection closed — clean up
-            manager
-                .cleanup_dm(&peer_id_reader, None, Some(connection_reader_id))
-                .await;
-        });
-
-        // Spawn a task to detect connection closure as a backstop
-        let manager = self.clone();
-        let connection_closed_id = connection.stable_id();
-        tokio::spawn(async move {
+            // Connection closed (or we just closed it) — the single cleanup
+            // point for this connection's DM entry.
             connection.closed().await;
             manager
-                .cleanup_dm(&peer_id, None, Some(connection_closed_id))
+                .cleanup_dm(&peer_id, None, Some(connection_id))
                 .await;
         });
-
-        Ok(())
     }
 
     pub async fn connect_to_peer(
@@ -2416,13 +2444,13 @@ impl ConnectionManager {
                                 )
                                 .await;
                             match registration {
-                                DmStreamRegistration::Stored => {}
-                                DmStreamRegistration::DrainDuplicate => {
+                                DmDecision::Store => {}
+                                DmDecision::DrainDuplicate => {
                                     drain_duplicate_dm_frame_once(&mut recv, &peer_id, &manager)
                                         .await;
                                     continue;
                                 }
-                                DmStreamRegistration::CloseDuplicate => continue,
+                                DmDecision::CloseDuplicate => continue,
                             }
                         }
                         let manager = manager.clone();
@@ -3176,70 +3204,24 @@ impl ConnectionManager {
                 )
                 .await;
             match registration {
-                DmStreamRegistration::Stored => {}
-                DmStreamRegistration::DrainDuplicate => {
+                DmDecision::Store => {}
+                DmDecision::DrainDuplicate => {
                     drain_duplicate_dm_frame_once(&mut dm_recv, &peer_id, self).await;
                     connection.close(0u32.into(), b"duplicate_dm_drained");
                     return Ok(());
                 }
-                DmStreamRegistration::CloseDuplicate => {
+                DmDecision::CloseDuplicate => {
                     connection.close(0u32.into(), b"duplicate_dm_connection");
                     return Ok(());
                 }
             }
 
-            // Spawn a reader for the initial bistream's recv side so the remote
-            // peer can reply on the same bistream (via accept_bi's send half).
-            {
-                let manager = self.clone();
-                let peer_id = peer_id.clone();
-                tokio::spawn(async move {
-                    run_dm_reader(&mut dm_recv, &peer_id, &manager).await;
-                });
-            }
-
-            // Spawn a reader task for additional incoming DM bistreams on this connection
-            let manager = self.clone();
-            let peer_id_reader = peer_id.clone();
-            let connection_reader = connection.clone();
-            let connection_reader_id = connection_reader.stable_id();
-            tokio::spawn(async move {
-                loop {
-                    match connection_reader.accept_bi().await {
-                        Ok((_, mut recv)) => {
-                            let mut type_buf = [0u8; 1];
-                            if recv.read_exact(&mut type_buf).await.is_err() {
-                                continue;
-                            }
-                            if type_buf[0] != STREAM_DM {
-                                continue;
-                            }
-                            drain_duplicate_dm_frame_once(&mut recv, &peer_id_reader, &manager)
-                                .await;
-                            connection_reader.close(0u32.into(), b"duplicate_dm_drained");
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-
-                // Connection closed — clean up and emit DmDisconnected
-                manager
-                    .cleanup_dm(&peer_id_reader, None, Some(connection_reader_id))
-                    .await;
-            });
-
-            // Spawn a task to detect connection closure
-            let manager = self.clone();
-            let peer_id_closed = peer_id.clone();
-            let connection_closed = connection.clone();
-            let connection_closed_id = connection_closed.stable_id();
-            tokio::spawn(async move {
-                connection_closed.closed().await;
-                manager
-                    .cleanup_dm(&peer_id_closed, None, Some(connection_closed_id))
-                    .await;
-            });
+            self.spawn_dm_connection_tasks(
+                peer_id,
+                connection,
+                ConnectionDirection::Outbound,
+                Some(dm_recv),
+            );
 
             Ok(())
         }
@@ -3715,6 +3697,33 @@ mod tests {
         ));
         // Final chunk always reports.
         assert!(should_emit_file_progress(10 * mib, 10 * mib, 10 * mib - 1, short));
+    }
+
+    #[test]
+    fn dm_arbitration_covers_redial_crossed_dial_and_unknown_local_id() {
+        use ConnectionDirection::{Inbound, Outbound};
+        // Same direction: always a redial, regardless of ids.
+        assert_eq!(
+            arbitrate_dm_candidate(Some("node-a"), "node-z", Inbound, Inbound),
+            DmArbitration::Redial
+        );
+        assert_eq!(
+            arbitrate_dm_candidate(None, "node-z", Outbound, Outbound),
+            DmArbitration::Redial
+        );
+        // Crossed dial: the higher id keeps its outbound connection.
+        assert_eq!(
+            arbitrate_dm_candidate(Some("node-z"), "node-a", Inbound, Outbound),
+            DmArbitration::CandidateWins
+        );
+        assert_eq!(
+            arbitrate_dm_candidate(Some("node-z"), "node-a", Outbound, Inbound),
+            DmArbitration::ExistingWins
+        );
+        assert_eq!(
+            arbitrate_dm_candidate(None, "node-a", Outbound, Inbound),
+            DmArbitration::Undecidable
+        );
     }
 
     #[test]
