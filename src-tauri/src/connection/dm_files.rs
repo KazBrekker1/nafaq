@@ -364,7 +364,7 @@ pub(super) async fn handle_dm_file_message(
                 .await;
             match created {
                 Ok(file) => {
-                    active_files.insert(
+                    let replaced = active_files.insert(
                         id.clone(),
                         ActiveFileReceive {
                             file,
@@ -376,6 +376,12 @@ pub(super) async fn handle_dm_file_message(
                             last_progress_at: std::time::Instant::now(),
                         },
                     );
+                    // A repeated FileStart restarts the transfer: the earlier
+                    // attempt's temp file would otherwise stay on disk.
+                    if let Some(old) = replaced {
+                        drop(old.file);
+                        let _ = tokio::fs::remove_file(&old.temp_path).await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to create temp file for transfer {id}: {e}");
@@ -704,6 +710,27 @@ mod tests {
             next_transfer_failure(&mut rx),
             Some((id, Some("incomplete transfer".to_string())))
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_file_start_deletes_the_previous_temp_file() {
+        let (event_tx, _rx) = broadcast::channel::<Event>(16);
+        let mut active_files = HashMap::new();
+        let start = DmMessage::FileStart {
+            name: "x.bin".into(),
+            size: 4,
+            id: "t-again".into(),
+        };
+        handle_dm_file_message(&start, "peer", true, &mut active_files, &event_tx).await;
+        let first = active_files["t-again"].temp_path.clone();
+        handle_dm_file_message(&start, "peer", true, &mut active_files, &event_tx).await;
+        let second = active_files["t-again"].temp_path.clone();
+
+        assert_ne!(first, second);
+        assert!(!first.exists(), "the replaced temp file must be deleted");
+        assert!(second.exists());
+        cleanup_active_dm_files(active_files, "peer", &event_tx).await;
+        assert!(!second.exists());
     }
 
     #[tokio::test]
