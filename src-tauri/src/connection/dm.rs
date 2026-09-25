@@ -338,8 +338,7 @@ impl ConnectionManager {
         let Some(established_at) = entry_established else {
             return false;
         };
-        let presence = self.presence.lock().await.clone();
-        let Some(presence) = presence else {
+        let Some(presence) = self.presence.get() else {
             return false;
         };
         match presence.last_neighbor_up(peer_id).await {
@@ -788,12 +787,11 @@ impl ConnectionManager {
             let addr = iroh::EndpointAddr::new(node_public_key)
                 .with_relay_url(crate::node::RELAY_URL_PARSED.clone());
 
-            let endpoint = {
-                let guard = self.endpoint.lock().await;
-                guard
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?
-            };
+            let endpoint = self
+                .endpoint
+                .get()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Endpoint not initialized"))?;
 
             let connection: iroh::endpoint::Connection = match dial_peer_with_timeout(
                 &endpoint,

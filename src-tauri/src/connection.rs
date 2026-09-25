@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -319,13 +319,15 @@ pub struct ConnectionManager {
     /// Woken whenever a DM connect attempt finishes (reservation released) or
     /// a DM connection is stored — lets waiters block instead of polling.
     dm_connect_done: Arc<Notify>,
-    endpoint: Arc<Mutex<Option<iroh::Endpoint>>>,
+    /// Set once at startup (`set_endpoint`), before any connection exists.
+    endpoint: Arc<OnceLock<iroh::Endpoint>>,
     latest_ticket: Arc<Mutex<Option<String>>>,
     peer_tickets: Arc<Mutex<HashMap<String, PeerTicketRecord>>>,
     event_tx: broadcast::Sender<Event>,
     audio_media_tx: broadcast::Sender<AudioPacket>,
     video_media_tx: broadcast::Sender<VideoPacket>,
-    presence: Arc<Mutex<Option<Arc<crate::presence::PresenceManager>>>>,
+    /// Set once at startup (`set_presence`).
+    presence: Arc<OnceLock<Arc<crate::presence::PresenceManager>>>,
     /// True while we've deliberately created or joined a call (create_call /
     /// join_call) and haven't cancelled or fully left it yet. Gates inbound
     /// call-media connection acceptance in `setup_connection` — see the
@@ -378,13 +380,13 @@ impl ConnectionManager {
             call_connecting: Arc::new(StdMutex::new(HashSet::new())),
             dm_connecting: Arc::new(StdMutex::new(HashSet::new())),
             dm_connect_done: Arc::new(Notify::new()),
-            endpoint: Arc::new(Mutex::new(None)),
+            endpoint: Arc::new(OnceLock::new()),
             latest_ticket,
             peer_tickets: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             audio_media_tx,
             video_media_tx,
-            presence: Arc::new(Mutex::new(None)),
+            presence: Arc::new(OnceLock::new()),
             call_session_active: Arc::new(AtomicBool::new(false)),
             pending_invitee: Arc::new(StdMutex::new(None)),
             replacing_peers: Arc::new(StdMutex::new(HashMap::new())),
@@ -417,20 +419,23 @@ impl ConnectionManager {
         self.call_session_active.load(Ordering::SeqCst)
     }
 
-    pub async fn set_endpoint(&self, endpoint: iroh::Endpoint) {
-        *self.endpoint.lock().await = Some(endpoint);
+    /// Installs the endpoint. Called once at startup; later calls are ignored.
+    pub fn set_endpoint(&self, endpoint: iroh::Endpoint) {
+        if self.endpoint.set(endpoint).is_err() {
+            tracing::warn!("ConnectionManager endpoint already set; ignoring");
+        }
     }
 
-    pub async fn set_presence(&self, presence: Arc<crate::presence::PresenceManager>) {
-        *self.presence.lock().await = Some(presence);
+    /// Installs the presence manager. Called once at startup; later calls are
+    /// ignored.
+    pub fn set_presence(&self, presence: Arc<crate::presence::PresenceManager>) {
+        if self.presence.set(presence).is_err() {
+            tracing::warn!("ConnectionManager presence already set; ignoring");
+        }
     }
 
     async fn local_node_id(&self) -> Option<String> {
-        self.endpoint
-            .lock()
-            .await
-            .as_ref()
-            .map(|endpoint| endpoint.id().to_string())
+        self.endpoint.get().map(|endpoint| endpoint.id().to_string())
     }
 
     fn emit_peer_connection_status(
@@ -502,8 +507,7 @@ impl ConnectionManager {
         let Some(established_at) = established_at else {
             return false;
         };
-        let presence = self.presence.lock().await.clone();
-        let Some(presence) = presence else {
+        let Some(presence) = self.presence.get() else {
             return false;
         };
         match presence.last_neighbor_up(peer_id).await {
@@ -685,7 +689,7 @@ impl ConnectionManager {
     }
 
     async fn self_announce_action(&self, ticket: String) -> Option<ControlAction> {
-        let own_id = self.endpoint.lock().await.as_ref()?.id().to_string();
+        let own_id = self.endpoint.get()?.id().to_string();
         Some(ControlAction::PeerAnnounce {
             peer_id: own_id,
             ticket,
@@ -1113,10 +1117,7 @@ impl ConnectionManager {
             );
             return;
         }
-        let is_self = {
-            let guard = self.endpoint.lock().await;
-            guard.as_ref().is_some_and(|ep| addr.id == ep.id())
-        };
+        let is_self = self.endpoint.get().is_some_and(|ep| addr.id == ep.id());
         if is_self {
             return;
         }
@@ -1143,8 +1144,7 @@ impl ConnectionManager {
             return;
         }
 
-        let endpoint = self.endpoint.lock().await.clone();
-        let Some(ep) = endpoint else {
+        let Some(ep) = self.endpoint.get().cloned() else {
             return;
         };
 
@@ -1734,7 +1734,7 @@ impl ConnectionManager {
     }
 
     async fn spawn_peer_reconnect(&self, peer_id: String, ticket: String) {
-        let Some(endpoint) = self.endpoint.lock().await.clone() else {
+        let Some(endpoint) = self.endpoint.get().cloned() else {
             return;
         };
         let Some(reservation) = self.reserve_call_connecting_guard(&peer_id).await else {
@@ -2127,8 +2127,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
@@ -2710,7 +2710,7 @@ mod tests {
         let manager = test_manager(event_tx, audio_tx, video_tx);
         let endpoint = node::create_test_endpoint().await.unwrap();
         let own_id = endpoint.id().to_string();
-        manager.set_endpoint(endpoint.clone()).await;
+        manager.set_endpoint(endpoint.clone());
 
         assert!(manager.latest_self_announce_action().await.is_none());
 
@@ -3158,8 +3158,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -3224,8 +3224,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -3286,8 +3286,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -3362,8 +3362,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -3443,8 +3443,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
@@ -3538,8 +3538,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -3701,8 +3701,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
@@ -3942,8 +3942,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
@@ -3988,8 +3988,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_ALPN, NafaqProtocol::new(mgr_a.clone()))
@@ -4077,8 +4077,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
@@ -4135,8 +4135,8 @@ mod tests {
 
         let endpoint_a = node::create_test_endpoint().await.unwrap();
         let endpoint_b = node::create_test_endpoint().await.unwrap();
-        mgr_a.set_endpoint(endpoint_a.clone()).await;
-        mgr_b.set_endpoint(endpoint_b.clone()).await;
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
 
         let router_a = Router::builder(endpoint_a.clone())
             .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))

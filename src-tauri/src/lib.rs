@@ -201,7 +201,7 @@ pub fn run() {
                                 tracing::info!("Node ID: {}", endpoint.id());
 
                                 // Give connection manager a reference to the endpoint for mesh formation
-                                conn_manager_for_rt.set_endpoint(endpoint.clone()).await;
+                                conn_manager_for_rt.set_endpoint(endpoint.clone());
 
                                 let gossip = Gossip::builder().spawn(endpoint.clone());
                                 let local_id = endpoint.id();
@@ -211,7 +211,7 @@ pub fn run() {
                                     event_tx_for_presence,
                                     address_lookup,
                                 ));
-                                conn_manager_for_rt.set_presence(presence.clone()).await;
+                                conn_manager_for_rt.set_presence(presence.clone());
 
                                 let router = Router::builder(endpoint.clone())
                                     .accept(
