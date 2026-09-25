@@ -31,6 +31,8 @@
     "vue": "^3.5.43"
   },
   "devDependencies": {
+    "@iconify-json/heroicons": "^1.2.3",
+    "@iconify-json/lucide": "^1.2.136",
     "@tauri-apps/cli": "^2.11.5",
     "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-vue": "^6.0.9",
