@@ -456,6 +456,17 @@ struct VideoReceiveState {
     last_keyframe_request: Option<std::time::Instant>,
 }
 
+/// Result of the ghost-call gate rejecting a call connection. An outbound
+/// dial is our own attempt (`join_call`, mesh auto-dial, reconnect), so it
+/// fails visibly instead of looking like a successful join; an inbound one
+/// is simply turned away.
+fn call_gate_rejection(direction: ConnectionDirection) -> Result<()> {
+    match direction {
+        ConnectionDirection::Outbound => anyhow::bail!("no active call session"),
+        ConnectionDirection::Inbound => Ok(()),
+    }
+}
+
 const RECEIVER_KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1080,7 +1091,7 @@ impl ConnectionManager {
                 "Rejecting {direction:?} call connection with {peer_id}: no active call session"
             );
             connection.close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
-            return Ok(());
+            return call_gate_rejection(direction);
         }
 
         if !self
@@ -1137,7 +1148,7 @@ impl ConnectionManager {
                 peer_conn
                     .connection
                     .close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
-                return Ok(());
+                return call_gate_rejection(direction);
             }
             let old = peers.len();
             let should_insert = match peers.get(&peer_id) {
@@ -4440,14 +4451,17 @@ mod tests {
         let addr_a =
             iroh::EndpointAddr::new(endpoint_a.id()).with_relay_url(node::RELAY_URL_PARSED.clone());
         let connection = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
-        mgr_b
+        // Our own dial being turned away must surface (join_call fails
+        // visibly instead of reporting a join that never happened).
+        let err = mgr_b
             .setup_connection(
                 endpoint_a.id().to_string(),
                 connection.clone(),
                 ConnectionDirection::Outbound,
             )
             .await
-            .unwrap();
+            .expect_err("a gate-rejected outbound dial must be an error");
+        assert!(err.to_string().contains("no active call session"), "{err}");
 
         assert!(mgr_b.peers.lock().await.is_empty());
         assert!(connection.close_reason().is_some());
