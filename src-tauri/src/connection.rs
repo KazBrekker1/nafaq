@@ -91,30 +91,62 @@ async fn open_typed_bi_stream(
 /// A write that times out may have put part of the frame on the wire; any
 /// later frame would then be parsed from the middle of this one. So on a
 /// write timeout the stream is taken out of its slot and reset: later writes
-/// fail loudly ("unavailable") and the reconnect/liveness paths take over,
-/// instead of silently corrupting the framing.
+/// fail loudly ("unavailable"), and the caller gets `FrameWriteError::Stalled`
+/// so it can tear down the path the stream belonged to (see `send_control`,
+/// `write_dm_frame`) instead of silently corrupting the framing.
 async fn write_frame_or_reset(
     slot: &Mutex<Option<SendStream>>,
     data: &[u8],
     timeout: Duration,
     stream_name: &str,
-) -> Result<()> {
+) -> std::result::Result<(), FrameWriteError> {
     let mut guard = tokio::time::timeout(timeout, slot.lock())
         .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for {stream_name} stream"))?;
+        .map_err(|_| FrameWriteError::LockTimeout(stream_name.to_string()))?;
     let Some(send) = guard.as_mut() else {
-        anyhow::bail!("{stream_name} stream is unavailable");
+        return Err(FrameWriteError::Unavailable(stream_name.to_string()));
     };
     match tokio::time::timeout(timeout, crate::messages::write_framed(send, data)).await {
-        Ok(result) => Ok(result?),
+        Ok(result) => result.map_err(FrameWriteError::Io),
         Err(_) => {
             if let Some(mut send) = guard.take() {
                 let _ = send.reset(0u32.into());
             }
-            anyhow::bail!("timed out writing {stream_name} frame; stream reset")
+            Err(FrameWriteError::Stalled(stream_name.to_string()))
         }
     }
 }
+
+#[derive(Debug)]
+enum FrameWriteError {
+    /// Another writer held the stream for the whole timeout.
+    LockTimeout(String),
+    /// The stream was already taken out of its slot.
+    Unavailable(String),
+    /// The write itself did not complete in time; the stream was reset and
+    /// can't be used again. The caller must retire the path it belonged to.
+    Stalled(String),
+    Io(iroh::endpoint::WriteError),
+}
+
+impl FrameWriteError {
+    fn is_stalled(&self) -> bool {
+        matches!(self, Self::Stalled(_))
+    }
+}
+
+impl std::fmt::Display for FrameWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LockTimeout(name) => write!(f, "timed out waiting for {name} stream"),
+            Self::Unavailable(name) => write!(f, "{name} stream is unavailable"),
+            Self::Stalled(name) => write!(f, "timed out writing {name} frame; stream reset"),
+            Self::Io(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameWriteError {}
 
 fn relay_targets_for_announce<'a>(
     peer_ids: impl IntoIterator<Item = &'a String>,
@@ -1332,9 +1364,18 @@ impl ConnectionManager {
                         let peer_id = peer_id.clone();
                         let last_activity_ms = last_activity_ms.clone();
                         tokio::spawn(async move {
-                            manager
+                            let failed = manager
                                 .handle_bi_stream(stream_type, &peer_id, recv, &last_activity_ms)
                                 .await;
+                            // The peer reset its DM stream on this call connection
+                            // (its write stalled) and has dropped the DM path; it
+                            // can't reopen one here (one stream per type), so drop
+                            // ours too or a redial would lose arbitration to it.
+                            if failed && stream_type == STREAM_DM {
+                                manager
+                                    .cleanup_dm(&peer_id, None, Some(connection_id))
+                                    .await;
+                            }
                         });
                     }
                     Err(_) => {
@@ -1419,14 +1460,18 @@ impl ConnectionManager {
         }
     }
 
+    /// Reads one peer-opened chat, control or DM stream until it ends.
+    /// Returns `true` if it ended with a read error (reset by the peer, or the
+    /// connection was lost) rather than a graceful finish.
     async fn handle_bi_stream(
         &self,
         stream_type: u8,
         peer_id: &str,
         mut recv: RecvStream,
         last_activity_ms: &AtomicU64,
-    ) {
+    ) -> bool {
         let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
+        let mut failed = false;
         let max_frame_len = match stream_type {
             STREAM_CHAT => MAX_CHAT_FRAME_BYTES,
             STREAM_DM => MAX_DM_FRAME_BYTES,
@@ -1468,12 +1513,14 @@ impl ConnectionManager {
                 Ok(None) => break,
                 Err(e) => {
                     tracing::warn!("Error reading bi stream from {peer_id}: {e}");
+                    failed = true;
                     break;
                 }
             }
         }
 
         cleanup_active_dm_files(active_files, peer_id, &self.event_tx).await;
+        failed
     }
 
     fn send_audio_datagram(
@@ -3403,6 +3450,87 @@ mod tests {
         );
 
         router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn dm_entry_with_empty_send_slot_is_evicted_and_redial_recovers() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_a, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_a, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_a = Arc::new(test_manager(event_tx_a.clone(), audio_tx_a, video_tx_a));
+
+        let (event_tx_b, _) = broadcast::channel::<Event>(64);
+        let (audio_tx_b, _) = broadcast::channel::<AudioPacket>(8);
+        let (video_tx_b, _) = broadcast::channel::<VideoPacket>(8);
+        let mgr_b = Arc::new(test_manager(event_tx_b, audio_tx_b, video_tx_b));
+
+        let endpoint_a = node::create_test_endpoint().await.unwrap();
+        let endpoint_b = node::create_test_endpoint().await.unwrap();
+        mgr_a.set_endpoint(endpoint_a.clone());
+        mgr_b.set_endpoint(endpoint_b.clone());
+
+        let router_a = Router::builder(endpoint_a.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_a.clone()))
+            .spawn();
+        let router_b = Router::builder(endpoint_b.clone())
+            .accept(node::NAFAQ_DM_ALPN, NafaqDmProtocol::new(mgr_b.clone()))
+            .spawn();
+        wait_for_relay_addr(&endpoint_a).await;
+        wait_for_relay_addr(&endpoint_b).await;
+
+        let a_id = endpoint_a.id().to_string();
+        let b_id = endpoint_b.id().to_string();
+        mgr_b.connect_dm(&a_id).await.unwrap();
+        timeout(Duration::from_secs(10), async {
+            while !mgr_a.dm_peer_connected(&b_id).await {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("A should register B's inbound DM stream");
+
+        // Simulate a write timeout on A: the stream was taken out of its slot.
+        let (stale_send, stale_id) = {
+            let dm_peers = mgr_a.dm_peers.lock().await;
+            let entry = dm_peers.get(&b_id).expect("A has a DM entry for B");
+            (entry.dm_send.clone(), entry.connection.stable_id())
+        };
+        *stale_send.lock().await = None;
+
+        // The same connection re-presenting its stream keeps the entry...
+        assert!(!mgr_a.evict_stale_dm_entry(&b_id, Some(stale_id)).await);
+        assert!(mgr_a.dm_peers.lock().await.contains_key(&b_id));
+        // ...any other candidate evicts it rather than arbitrating against it.
+        assert!(mgr_a.evict_stale_dm_entry(&b_id, None).await);
+        assert!(!mgr_a.dm_peers.lock().await.contains_key(&b_id));
+
+        // The eviction closed the dedicated connection, so B drops its entry
+        // too and A's redial isn't rejected by B's arbitration.
+        timeout(Duration::from_secs(10), async {
+            while mgr_b.dm_peers.lock().await.contains_key(&a_id) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("B should drop its entry once A closes the stale connection");
+
+        mgr_a.ensure_dm_connected(&b_id).await.unwrap();
+        mgr_a
+            .send_dm_frame_strict(
+                &b_id,
+                &DmMessage::FileStart {
+                    name: "x.bin".into(),
+                    size: 1,
+                    id: "after-evict".into(),
+                },
+            )
+            .await
+            .expect("FileStart must go out on the redialed stream");
+
+        router_a.shutdown().await.ok();
+        router_b.shutdown().await.ok();
         endpoint_b.close().await;
         endpoint_a.close().await;
     }

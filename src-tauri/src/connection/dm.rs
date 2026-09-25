@@ -389,6 +389,44 @@ impl ConnectionManager {
             .contains(peer_id)
     }
 
+    /// Evicts `peer_id`'s DM entry if it can no longer carry frames: its
+    /// connection is closed (the closed() cleanup task may not have fired
+    /// yet) or its send slot is empty (the stream was reset after a write
+    /// timeout, or finished). Such an entry must never take part in
+    /// arbitration — a live candidate could lose to it, leaving every later
+    /// send failing with "stream is unavailable". The single rule shared by
+    /// the inbound (`dm_connection_handling`) and store paths. An entry on
+    /// `keep_connection_id` is left alone: that is the same connection
+    /// re-presenting its stream (`reattach_dm_send_stream`). Returns whether
+    /// an entry was evicted.
+    pub(super) async fn evict_stale_dm_entry(
+        &self,
+        peer_id: &str,
+        keep_connection_id: Option<usize>,
+    ) -> bool {
+        let probe = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|existing| {
+                (
+                    existing.connection.stable_id(),
+                    existing.connection.close_reason().is_some(),
+                    existing.dm_send.clone(),
+                )
+            })
+        };
+        let Some((connection_id, conn_closed, dm_send)) = probe else {
+            return false;
+        };
+        if keep_connection_id == Some(connection_id) {
+            return false;
+        }
+        if !conn_closed && dm_send.lock().await.is_some() {
+            return false;
+        }
+        self.cleanup_dm(peer_id, Some(b"stale_dm_connection"), Some(connection_id))
+            .await
+    }
+
     pub(super) async fn dm_connection_handling(
         &self,
         peer_id: &str,
@@ -396,28 +434,16 @@ impl ConnectionManager {
     ) -> DmDecision {
         let local_node_id = self.local_node_id().await;
 
-        let probe = {
-            let dm_peers = self.dm_peers.lock().await;
-            dm_peers.get(peer_id).map(|existing| {
-                (
-                    existing.connection.close_reason().is_some(),
-                    existing.dm_send.clone(),
-                    existing.direction,
-                )
-            })
-        };
-
-        let Some((conn_closed, dm_send, existing_direction)) = probe else {
-            return DmDecision::Store;
-        };
-
-        // The closed() cleanup task may not have fired yet; treat a dead
-        // connection or taken stream as already evicted.
-        if conn_closed || dm_send.lock().await.is_none() {
-            self.cleanup_dm(peer_id, Some(b"stale_dm_connection"), None)
-                .await;
+        if self.evict_stale_dm_entry(peer_id, None).await {
             return DmDecision::Store;
         }
+        let existing_direction = {
+            let dm_peers = self.dm_peers.lock().await;
+            dm_peers.get(peer_id).map(|existing| existing.direction)
+        };
+        let Some(existing_direction) = existing_direction else {
+            return DmDecision::Store;
+        };
 
         // NeighborUp is stale-DM evidence only when it is newer than the stored
         // entry. Initial blank-state presence is also recent, so it must not
@@ -525,6 +551,11 @@ impl ConnectionManager {
         dm_send: SendStream,
         ownership: DmConnectionOwnership,
     ) -> DmDecision {
+        // Same rule as dm_connection_handling (the outbound connect_dm and
+        // call-connection paths come straight here).
+        self.evict_stale_dm_entry(peer_id, Some(connection.stable_id()))
+            .await;
+
         let dm_send = Arc::new(Mutex::new(Some(dm_send)));
         let dm_peer = DmPeerConnection {
             connection: connection.clone(),
@@ -935,15 +966,28 @@ impl ConnectionManager {
     pub(super) async fn write_dm_frame(&self, peer_id: &str, data: &[u8]) -> Result<()> {
         let stream = {
             let dm_peers = self.dm_peers.lock().await;
-            dm_peers.get(peer_id).map(|p| p.dm_send.clone())
+            dm_peers
+                .get(peer_id)
+                .map(|p| (p.dm_send.clone(), p.connection.stable_id()))
         };
-        let Some(s) = stream else {
+        let Some((s, connection_id)) = stream else {
             anyhow::bail!("DM peer {peer_id} is not connected");
         };
 
-        write_frame_or_reset(&s, data, DM_WRITE_TIMEOUT, "DM")
-            .await
-            .map_err(|e| anyhow::anyhow!("DM write to peer {peer_id} failed: {e}"))
+        let result = write_frame_or_reset(&s, data, DM_WRITE_TIMEOUT, "DM").await;
+        if let Err(error) = &result {
+            if error.is_stalled() {
+                // The reset stream can't be reopened on this path. Retire it
+                // now: closing a dedicated connection also makes the peer drop
+                // its (otherwise still "live") entry, so our redial isn't
+                // rejected by arbitration against it. A DM riding a call
+                // connection only loses its entry; the peer notices the reset
+                // on its reader (`handle_bi_stream`).
+                self.cleanup_dm(peer_id, Some(b"dm_stream_stalled"), Some(connection_id))
+                    .await;
+            }
+        }
+        result.map_err(|e| anyhow::anyhow!("DM write to peer {peer_id} failed: {e}"))
     }
 
     /// Writes one DM frame to the current stream without connecting, reconnecting,
