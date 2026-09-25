@@ -41,6 +41,77 @@ const RECONNECT_RETRY_AFTER_MS: u64 = 15_000;
 /// reconnect ladder already have their own retry cadence and are untouched.
 const INITIAL_DIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
+// Close reasons on call connections. The peer sees them in its close watcher,
+// which decides via `classify_call_close` whether the peer is gone for good.
+/// The user hung up (`end_call`).
+const CLOSE_CALL_ENDED: &[u8] = b"call ended";
+/// The liveness ladder gave up on the peer.
+const CLOSE_PEER_TIMEOUT: &[u8] = b"peer timeout";
+/// No call session is active on our side (ghost-call gate).
+const CLOSE_CALL_NOT_ACTIVE: &[u8] = b"call_not_active";
+/// A redial finished after the peer stopped being wanted.
+const CLOSE_RECONNECT_NO_LONGER_WANTED: &[u8] = b"reconnect_no_longer_wanted";
+/// Crossed dial / arbitration: the other connection to this peer wins.
+const CLOSE_DUPLICATE_CALL_CONNECTION: &[u8] = b"duplicate_call_connection";
+/// A newer connection to the same peer took this one's place.
+const CLOSE_REPLACED_CALL_CONNECTION: &[u8] = b"replaced_call_connection";
+/// Evicted: already closed on our side when a new candidate arrived.
+const CLOSE_STALE_CALL_CONNECTION: &[u8] = b"stale_call_connection";
+/// Evicted: presence saw the peer rejoin after this connection was made.
+const CLOSE_PEER_REJOINED_GOSSIP: &[u8] = b"peer_rejoined_gossip";
+/// Evicted: the initiator re-dialed in the same direction.
+const CLOSE_SUPERSEDED_BY_REDIAL: &[u8] = b"superseded_by_redial";
+
+/// What a call connection's close means for the peer entry and its ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallCloseDisposition {
+    /// The path broke but both sides still want the call: redial now.
+    Reconnect,
+    /// The connection went away (replaced, deduplicated, reset, …) but
+    /// nobody hung up: drop the entry, keep the ticket for a later redial.
+    KeepTicket,
+    /// A deliberate hang-up/teardown: drop the entry and forget the ticket
+    /// so it isn't re-announced to the peers of a future call.
+    ForgetTicket,
+}
+
+/// The single place deciding what each call close reason means. Only real
+/// hang-ups forget the ticket: replacement and arbitration closes routinely
+/// reach a peer that is still in the call (e.g. our entry still points at
+/// the connection the peer just replaced), and wiping its ticket there
+/// would make it impossible to redial it later.
+fn classify_call_close(error: &ConnectionError) -> CallCloseDisposition {
+    match error {
+        // Silent drop: the network went away, not the peer.
+        ConnectionError::TimedOut => CallCloseDisposition::Reconnect,
+        // We closed it ourselves. Every deliberate local teardown removes
+        // (or replaces) the entry first, so the watcher's connection-scoped
+        // handling is a no-op for them; an entry still on this connection
+        // means we closed a broken path while staying in the call.
+        ConnectionError::LocallyClosed => CallCloseDisposition::Reconnect,
+        ConnectionError::ApplicationClosed(close) => classify_call_close_reason(&close.reason),
+        _ => CallCloseDisposition::KeepTicket,
+    }
+}
+
+fn classify_call_close_reason(reason: &[u8]) -> CallCloseDisposition {
+    match reason {
+        // Empty: the peer's endpoint shut down (app quit).
+        CLOSE_CALL_ENDED
+        | CLOSE_PEER_TIMEOUT
+        | CLOSE_CALL_NOT_ACTIVE
+        | CLOSE_RECONNECT_NO_LONGER_WANTED
+        | b"" => CallCloseDisposition::ForgetTicket,
+        CLOSE_DUPLICATE_CALL_CONNECTION
+        | CLOSE_REPLACED_CALL_CONNECTION
+        | CLOSE_STALE_CALL_CONNECTION
+        | CLOSE_PEER_REJOINED_GOSSIP
+        | CLOSE_SUPERSEDED_BY_REDIAL => CallCloseDisposition::KeepTicket,
+        // Unknown (e.g. a newer peer's reason): not known to be a hang-up.
+        _ => CallCloseDisposition::KeepTicket,
+    }
+}
+
 async fn with_timeout<T, F>(
     timeout_duration: Duration,
     timeout_message: impl Into<String>,
@@ -617,7 +688,7 @@ impl ConnectionManager {
                 peer_id,
                 existing_conn_id,
                 candidate_connection_id,
-                b"stale_call_connection",
+                CLOSE_STALE_CALL_CONNECTION,
             )
             .await;
             return true;
@@ -636,7 +707,7 @@ impl ConnectionManager {
                 peer_id,
                 existing_conn_id,
                 candidate_connection_id,
-                b"peer_rejoined_gossip",
+                CLOSE_PEER_REJOINED_GOSSIP,
             )
             .await;
             return true;
@@ -653,7 +724,7 @@ impl ConnectionManager {
                 peer_id,
                 existing_conn_id,
                 candidate_connection_id,
-                b"superseded_by_redial",
+                CLOSE_SUPERSEDED_BY_REDIAL,
             )
             .await;
             return true;
@@ -929,7 +1000,7 @@ impl ConnectionManager {
             tracing::info!(
                 "Rejecting {direction:?} call connection with {peer_id}: no active call session"
             );
-            connection.close(0u32.into(), b"call_not_active");
+            connection.close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
             return Ok(());
         }
 
@@ -940,7 +1011,7 @@ impl ConnectionManager {
             tracing::info!(
                 "Closing duplicate {direction:?} call connection for peer {peer_id}; existing connection wins"
             );
-            connection.close(0u32.into(), b"duplicate_call_connection");
+            connection.close(0u32.into(), CLOSE_DUPLICATE_CALL_CONNECTION);
             return Ok(());
         }
 
@@ -984,7 +1055,7 @@ impl ConnectionManager {
                 tracing::info!(
                     "Rejecting {direction:?} call connection with {peer_id}: call ended during setup"
                 );
-                peer_conn.connection.close(0u32.into(), b"call_not_active");
+                peer_conn.connection.close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
                 return Ok(());
             }
             let old = peers.len();
@@ -1006,7 +1077,7 @@ impl ConnectionManager {
                 );
                 peer_conn
                     .connection
-                    .close(0u32.into(), b"duplicate_call_connection");
+                    .close(0u32.into(), CLOSE_DUPLICATE_CALL_CONNECTION);
                 return Ok(());
             }
 
@@ -1017,7 +1088,7 @@ impl ConnectionManager {
         };
 
         if let Some(old_connection) = old_connection {
-            old_connection.close(0u32.into(), b"replaced_call_connection");
+            old_connection.close(0u32.into(), CLOSE_REPLACED_CALL_CONNECTION);
         }
 
         video_writer.spawn(peer_id.clone(), connection.clone());
@@ -1286,13 +1357,13 @@ impl ConnectionManager {
                 let close_reason = connection.closed().await;
                 tracing::info!("Connection closed for peer {peer_id}: {close_reason}");
 
-                // A silent QUIC idle-timeout (no CONNECTION_CLOSE frame reached
-                // us) means the network dropped, not that either side ended the
-                // call — give the peer a chance to reconnect instead of tearing
-                // the call down immediately. Any other close reason (explicit
-                // close by us or the peer, reset, protocol error) is final.
-                let timed_out = matches!(close_reason, ConnectionError::TimedOut);
-                if timed_out
+                // A broken path (e.g. a silent QUIC idle-timeout: the network
+                // dropped, nobody hung up) gets a reconnect attempt instead of
+                // an immediate teardown. Only a real hang-up forgets the
+                // ticket; replacement/arbitration closes keep it, since the
+                // peer may well still be in the call.
+                let disposition = classify_call_close(&close_reason);
+                if disposition == CallCloseDisposition::Reconnect
                     && manager
                         .try_begin_peer_reconnect(&peer_id, connection_id)
                         .await
@@ -1300,15 +1371,12 @@ impl ConnectionManager {
                     return;
                 }
 
-                // Only a silent drop keeps the ticket for a later redial; an
-                // explicit close (either side hung up) forgets it, so it isn't
-                // re-announced to the peers of a future call.
                 manager
                     .cleanup_peer(
                         &peer_id,
                         PeerCleanup {
                             connection_id: Some(connection_id),
-                            preserve_ticket: timed_out,
+                            preserve_ticket: disposition != CallCloseDisposition::ForgetTicket,
                             ..Default::default()
                         },
                     )
@@ -1804,7 +1872,7 @@ impl ConnectionManager {
                     // before reviving it, so a straggler reconnect can't
                     // resurrect a call that was intentionally torn down.
                     if !manager.peers.lock().await.contains_key(&peer_id) {
-                        connection.close(0u32.into(), b"reconnect_no_longer_wanted");
+                        connection.close(0u32.into(), CLOSE_RECONNECT_NO_LONGER_WANTED);
                         return;
                     }
                     if let Err(e) = manager.setup_outgoing_connection(connection).await {
@@ -1962,7 +2030,7 @@ impl ConnectionManager {
             self.cleanup_peer(
                 &peer_id,
                 PeerCleanup {
-                    close_reason: Some(b"peer timeout"),
+                    close_reason: Some(CLOSE_PEER_TIMEOUT),
                     ..Default::default()
                 },
             )
@@ -2050,7 +2118,7 @@ impl ConnectionManager {
         self.cleanup_peer(
             peer_id,
             PeerCleanup {
-                close_reason: Some(b"call ended"),
+                close_reason: Some(CLOSE_CALL_ENDED),
                 ..Default::default()
             },
         )
@@ -2175,6 +2243,17 @@ mod tests {
             .endpoint_addr()
             .clone();
         let peer_id = mgr_b.connect_to_peer(&endpoint_b, addr_a).await.unwrap();
+        // A registers the inbound side asynchronously (router accept); wait
+        // for it so tests that immediately act on the connection don't race
+        // A's setup.
+        let b_id = endpoint_b.id().to_string();
+        timeout(Duration::from_secs(10), async {
+            while !mgr_a.call_peer_connected(&b_id).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("A should register B's inbound call connection");
 
         (mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id)
     }
@@ -2996,29 +3075,41 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_is_the_only_close_reason_that_triggers_reconnect() {
+    fn call_close_reasons_are_classified_explicitly() {
         use iroh::endpoint::ApplicationClose;
+        use CallCloseDisposition::{ForgetTicket, KeepTicket, Reconnect};
 
-        // The per-connection watcher only treats a silent QUIC idle-timeout as
-        // "network dropped, try to reconnect" — every other close reason (ours
-        // or the peer's explicit close, a reset, a protocol error) is final,
-        // exactly as it was before this behavior existed.
-        assert!(matches!(
-            ConnectionError::TimedOut,
-            ConnectionError::TimedOut
-        ));
-        assert!(!matches!(
-            ConnectionError::LocallyClosed,
-            ConnectionError::TimedOut
-        ));
-        assert!(!matches!(ConnectionError::Reset, ConnectionError::TimedOut));
-        assert!(!matches!(
-            ConnectionError::ApplicationClosed(ApplicationClose {
+        let app = |reason: &'static [u8]| {
+            classify_call_close(&ConnectionError::ApplicationClosed(ApplicationClose {
                 error_code: 0u32.into(),
-                reason: Bytes::from_static(b"call ended"),
-            }),
-            ConnectionError::TimedOut
-        ));
+                reason: Bytes::from_static(reason),
+            }))
+        };
+
+        // Real hang-ups / teardowns forget the ticket.
+        for reason in [
+            CLOSE_CALL_ENDED,
+            CLOSE_PEER_TIMEOUT,
+            CLOSE_CALL_NOT_ACTIVE,
+            CLOSE_RECONNECT_NO_LONGER_WANTED,
+            b"",
+        ] {
+            assert_eq!(app(reason), ForgetTicket, "{:?}", String::from_utf8_lossy(reason));
+        }
+        // Replacement / arbitration closes reach peers still in the call.
+        for reason in [
+            CLOSE_DUPLICATE_CALL_CONNECTION,
+            CLOSE_REPLACED_CALL_CONNECTION,
+            CLOSE_STALE_CALL_CONNECTION,
+            CLOSE_PEER_REJOINED_GOSSIP,
+            CLOSE_SUPERSEDED_BY_REDIAL,
+            b"some_future_reason",
+        ] {
+            assert_eq!(app(reason), KeepTicket, "{:?}", String::from_utf8_lossy(reason));
+        }
+        assert_eq!(classify_call_close(&ConnectionError::TimedOut), Reconnect);
+        assert_eq!(classify_call_close(&ConnectionError::LocallyClosed), Reconnect);
+        assert_eq!(classify_call_close(&ConnectionError::Reset), KeepTicket);
     }
 
     #[tokio::test]
