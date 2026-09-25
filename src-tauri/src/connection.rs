@@ -1,23 +1,23 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::endpoint::{Connection, ConnectionError, PathId, RecvStream, SendStream};
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::codec::is_keyframe;
-use crate::video_transport::{
-    MAX_VIDEO_FRAME_BYTES, PeerVideoWriter, PendingVideoFrame, ReceivedVideoFrame,
-    VIDEO_FRAME_HEADER_LEN, VIDEO_FRAME_READ_TIMEOUT, VideoReorderBuffer, decode_video_frame,
-};
 use crate::messages::{
-    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, MAX_CHAT_FRAME_BYTES,
-    MAX_CONTROL_FRAME_BYTES, MAX_DM_FRAME_BYTES, PeerConnectionKind, STREAM_CHAT,
-    STREAM_CONTROL, STREAM_DM, STREAM_VIDEO, VideoLayerRequest, VideoPacket,
+    AudioDatagram, AudioPacket, ControlAction, DmMessage, Event, PeerConnectionKind,
+    VideoLayerRequest, VideoPacket, MAX_CHAT_FRAME_BYTES, MAX_CONTROL_FRAME_BYTES,
+    MAX_DM_FRAME_BYTES, STREAM_CHAT, STREAM_CONTROL, STREAM_DM, STREAM_VIDEO,
+};
+use crate::video_transport::{
+    decode_video_frame, PeerVideoWriter, PendingVideoFrame, ReceivedVideoFrame, VideoReorderBuffer,
+    MAX_VIDEO_FRAME_BYTES, VIDEO_FRAME_HEADER_LEN, VIDEO_FRAME_READ_TIMEOUT,
 };
 
 mod dm;
@@ -367,7 +367,6 @@ impl ConnectionManager {
             .unwrap_or(0)
     }
 
-
     pub fn new(
         event_tx: broadcast::Sender<Event>,
         audio_media_tx: broadcast::Sender<AudioPacket>,
@@ -435,7 +434,9 @@ impl ConnectionManager {
     }
 
     async fn local_node_id(&self) -> Option<String> {
-        self.endpoint.get().map(|endpoint| endpoint.id().to_string())
+        self.endpoint
+            .get()
+            .map(|endpoint| endpoint.id().to_string())
     }
 
     fn emit_peer_connection_status(
@@ -1072,7 +1073,8 @@ impl ConnectionManager {
             })
         };
         if shared_dm_dead {
-            self.cleanup_dm(peer_id, None, Some(dead_connection_id)).await;
+            self.cleanup_dm(peer_id, None, Some(dead_connection_id))
+                .await;
         }
 
         if !opts.silent {
@@ -1390,9 +1392,9 @@ impl ConnectionManager {
                 .unwrap_or_else(|poison| poison.into_inner());
             let out = state.reorder.push(frame, now);
             let request = out.need_keyframe
-                && state.last_keyframe_request.is_none_or(|at| {
-                    now.duration_since(at) >= RECEIVER_KEYFRAME_REQUEST_INTERVAL
-                });
+                && state
+                    .last_keyframe_request
+                    .is_none_or(|at| now.duration_since(at) >= RECEIVER_KEYFRAME_REQUEST_INTERVAL);
             if request {
                 state.last_keyframe_request = Some(now);
             }
@@ -2030,8 +2032,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use iroh::{EndpointAddr, SecretKey, TransportAddr, endpoint::Connection, protocol::Router};
-    use iroh_tickets::{Ticket, endpoint::EndpointTicket};
+    use iroh::{endpoint::Connection, protocol::Router, EndpointAddr, SecretKey, TransportAddr};
+    use iroh_tickets::{endpoint::EndpointTicket, Ticket};
     use tokio::time::timeout;
 
     use crate::node;
@@ -2139,7 +2141,10 @@ mod tests {
         assert!(!accept_call_bi_stream_type(&mut seen, STREAM_CHAT));
         assert!(!accept_call_bi_stream_type(&mut seen, STREAM_CONTROL));
         assert!(!accept_call_bi_stream_type(&mut seen, STREAM_DM));
-        assert!(!accept_call_bi_stream_type(&mut HashSet::new(), STREAM_VIDEO));
+        assert!(!accept_call_bi_stream_type(
+            &mut HashSet::new(),
+            STREAM_VIDEO
+        ));
         assert!(!accept_call_bi_stream_type(&mut HashSet::new(), 0x7f));
     }
 
@@ -2151,7 +2156,11 @@ mod tests {
             data: vec![255u8; 64 * 1024],
         };
         let encoded = serde_json::to_vec(&chunk).unwrap();
-        assert!(encoded.len() <= MAX_DM_FRAME_BYTES, "{} bytes", encoded.len());
+        assert!(
+            encoded.len() <= MAX_DM_FRAME_BYTES,
+            "{} bytes",
+            encoded.len()
+        );
     }
 
     #[test]
@@ -2255,19 +2264,11 @@ mod tests {
         let guard = manager
             .reserve_call_connecting_guard("peer-a")
             .expect("first reservation should succeed");
-        assert!(
-            manager
-                .reserve_call_connecting_guard("peer-a")
-                .is_none()
-        );
+        assert!(manager.reserve_call_connecting_guard("peer-a").is_none());
 
         drop(guard);
 
-        assert!(
-            manager
-                .reserve_call_connecting_guard("peer-a")
-                .is_some()
-        );
+        assert!(manager.reserve_call_connecting_guard("peer-a").is_some());
     }
 
     #[tokio::test]
@@ -2280,19 +2281,11 @@ mod tests {
         let guard = manager
             .reserve_dm_connecting_guard("peer-a")
             .expect("first reservation should succeed");
-        assert!(
-            manager
-                .reserve_dm_connecting_guard("peer-a")
-                .is_none()
-        );
+        assert!(manager.reserve_dm_connecting_guard("peer-a").is_none());
 
         drop(guard);
 
-        assert!(
-            manager
-                .reserve_dm_connecting_guard("peer-a")
-                .is_some()
-        );
+        assert!(manager.reserve_dm_connecting_guard("peer-a").is_some());
     }
 
     #[tokio::test]
@@ -2963,8 +2956,14 @@ mod tests {
         // "network dropped, try to reconnect" — every other close reason (ours
         // or the peer's explicit close, a reset, a protocol error) is final,
         // exactly as it was before this behavior existed.
-        assert!(matches!(ConnectionError::TimedOut, ConnectionError::TimedOut));
-        assert!(!matches!(ConnectionError::LocallyClosed, ConnectionError::TimedOut));
+        assert!(matches!(
+            ConnectionError::TimedOut,
+            ConnectionError::TimedOut
+        ));
+        assert!(!matches!(
+            ConnectionError::LocallyClosed,
+            ConnectionError::TimedOut
+        ));
         assert!(!matches!(ConnectionError::Reset, ConnectionError::TimedOut));
         assert!(!matches!(
             ConnectionError::ApplicationClosed(ApplicationClose {
@@ -3224,7 +3223,10 @@ mod tests {
                 match rx_a.recv().await {
                     Ok(Event::DmReceived {
                         peer_id,
-                        message: DmMessage::Text { content, timestamp, .. },
+                        message:
+                            DmMessage::Text {
+                                content, timestamp, ..
+                            },
                     }) if peer_id == endpoint_b.id().to_string()
                         && content == "hello without explicit connect"
                         && timestamp == 1 =>
@@ -3300,7 +3302,10 @@ mod tests {
                 match rx_a.recv().await {
                     Ok(Event::DmReceived {
                         peer_id,
-                        message: DmMessage::Text { content, timestamp, .. },
+                        message:
+                            DmMessage::Text {
+                                content, timestamp, ..
+                            },
                     }) if peer_id == endpoint_b.id().to_string()
                         && content == "retry after stale stream"
                         && timestamp == 2 =>
@@ -3875,8 +3880,8 @@ mod tests {
 
         // B redials in the same direction (as it does once it believes the
         // old path is dead): A replaces the entry.
-        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
-            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let addr_a =
+            iroh::EndpointAddr::new(endpoint_a.id()).with_relay_url(node::RELAY_URL_PARSED.clone());
         let _redial = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
 
         timeout(Duration::from_secs(10), async {
@@ -3925,8 +3930,8 @@ mod tests {
 
         // mgr_b's call already ended (flag cleared) while this dial — e.g. a
         // late mesh auto-dial or reconnect — was in flight.
-        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
-            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let addr_a =
+            iroh::EndpointAddr::new(endpoint_a.id()).with_relay_url(node::RELAY_URL_PARSED.clone());
         let connection = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
         mgr_b
             .setup_connection(
@@ -3977,8 +3982,8 @@ mod tests {
         // rejection is observed, so asserting on the dialer-side
         // ConnectionManager's return value would be racy/wrong — the
         // authoritative signal is the close reason the acceptor sends back.
-        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
-            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let addr_a =
+            iroh::EndpointAddr::new(endpoint_a.id()).with_relay_url(node::RELAY_URL_PARSED.clone());
         let connection = endpoint_b.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
 
         let close_reason = timeout(Duration::from_secs(10), connection.closed())
@@ -4014,8 +4019,8 @@ mod tests {
         // rejected — mirrors a callee's join arriving after the caller hung
         // up (or cancelled) and nobody re-armed create_call/join_call.
         let endpoint_c = node::create_test_endpoint().await.unwrap();
-        let addr_a = iroh::EndpointAddr::new(endpoint_a.id())
-            .with_relay_url(node::RELAY_URL_PARSED.clone());
+        let addr_a =
+            iroh::EndpointAddr::new(endpoint_a.id()).with_relay_url(node::RELAY_URL_PARSED.clone());
         let connection = endpoint_c.connect(addr_a, node::NAFAQ_ALPN).await.unwrap();
 
         let close_reason = timeout(Duration::from_secs(10), connection.closed())

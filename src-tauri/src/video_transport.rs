@@ -167,7 +167,11 @@ impl VideoReorderBuffer {
             next = next.wrapping_add(1);
         }
         self.expected = Some(next);
-        self.gap_since = if self.held.is_empty() { None } else { Some(now) };
+        self.gap_since = if self.held.is_empty() {
+            None
+        } else {
+            Some(now)
+        };
     }
 }
 
@@ -218,7 +222,9 @@ impl PeerVideoWriter {
     }
 
     fn lock_slot(&self) -> std::sync::MutexGuard<'_, WriterSlot> {
-        self.slot.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Offer a freshly encoded frame. Deltas are only accepted while the
@@ -306,7 +312,9 @@ impl PeerVideoWriter {
                     tokio::spawn(async move {
                         let delivered = send_frame(&connection, seq, &frame).await;
                         if let Err(reason) = delivered {
-                            tracing::debug!("Video frame {seq} to {peer_id} not delivered: {reason}");
+                            tracing::debug!(
+                                "Video frame {seq} to {peer_id} not delivered: {reason}"
+                            );
                             writer.frame_lost();
                         }
                         writer.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -448,7 +456,10 @@ mod tests {
         }
         let out = buf.push(frame(3 + REORDER_MAX_HELD as u32, false), now);
         assert!(out.ready.is_empty());
-        assert!(out.need_keyframe, "overflow must reset and ask for a keyframe");
+        assert!(
+            out.need_keyframe,
+            "overflow must reset and ask for a keyframe"
+        );
         // The chain restarts only at a keyframe.
         assert!(buf.push(frame(2, false), now).ready.is_empty());
         let key = 4 + REORDER_MAX_HELD as u32;

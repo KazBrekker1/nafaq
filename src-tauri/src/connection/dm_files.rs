@@ -62,7 +62,13 @@ pub(super) fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = base
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            }
+        })
         .take(200)
         .collect();
     let trimmed = cleaned
@@ -384,7 +390,10 @@ mod tests {
 
     #[test]
     fn sanitize_file_name_replaces_windows_forbidden_and_control_chars() {
-        assert_eq!(sanitize_file_name("a<b>c:d\"e|f?g*h.txt"), "a_b_c_d_e_f_g_h.txt");
+        assert_eq!(
+            sanitize_file_name("a<b>c:d\"e|f?g*h.txt"),
+            "a_b_c_d_e_f_g_h.txt"
+        );
         assert_eq!(sanitize_file_name("file.txt:stream"), "file.txt_stream");
         assert_eq!(sanitize_file_name("tab\there\u{7}.txt"), "tabhere.txt");
     }
@@ -405,8 +414,19 @@ mod tests {
     #[test]
     fn sanitize_file_name_rejects_windows_reserved_device_names() {
         for name in [
-            "CON", "con", "Prn", "AUX", "nul", "COM1", "com9", "LPT1", "lpt9", "nul.txt",
-            "CON.tar.gz", "aux .log", "com3.",
+            "CON",
+            "con",
+            "Prn",
+            "AUX",
+            "nul",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "nul.txt",
+            "CON.tar.gz",
+            "aux .log",
+            "com3.",
         ] {
             let sanitized = sanitize_file_name(name);
             assert!(
@@ -415,7 +435,14 @@ mod tests {
             );
             assert!(sanitized.starts_with('_'), "{name:?} -> {sanitized:?}");
         }
-        for name in ["COM0", "COM10", "LPT", "console.txt", "nullable", "auxiliary.md"] {
+        for name in [
+            "COM0",
+            "COM10",
+            "LPT",
+            "console.txt",
+            "nullable",
+            "auxiliary.md",
+        ] {
             assert_eq!(sanitize_file_name(name), name);
         }
     }
@@ -477,7 +504,9 @@ mod tests {
             size: 4,
             id: "t-busy-overflow".into(),
         };
-        assert!(handle_dm_file_message(&overflow, "peer", true, &mut active_files, &event_tx).await);
+        assert!(
+            handle_dm_file_message(&overflow, "peer", true, &mut active_files, &event_tx).await
+        );
         assert_eq!(
             next_transfer_failure(&mut rx).map(|(id, _)| id),
             Some("t-busy-overflow".to_string())
@@ -508,7 +537,10 @@ mod tests {
         let handled =
             handle_dm_file_message(&end, "peer", true, &mut active_files, &event_tx).await;
 
-        assert!(handled, "an incomplete FileEnd must not mark the card complete");
+        assert!(
+            handled,
+            "an incomplete FileEnd must not mark the card complete"
+        );
         assert!(!temp_path.exists());
         assert_eq!(
             next_transfer_failure(&mut rx),
@@ -535,6 +567,11 @@ mod tests {
             FILE_PROGRESS_MIN_INTERVAL
         ));
         // Final chunk always reports.
-        assert!(should_emit_file_progress(10 * mib, 10 * mib, 10 * mib - 1, short));
+        assert!(should_emit_file_progress(
+            10 * mib,
+            10 * mib,
+            10 * mib - 1,
+            short
+        ));
     }
 }

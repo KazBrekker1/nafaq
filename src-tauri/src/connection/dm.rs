@@ -20,7 +20,11 @@ pub(super) const DM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// answers our outstanding invite and nobody joined: our ticket must stop
 /// accepting inbound call dials (see `setup_connection`'s gate) even though
 /// no call peer was ever established to disconnect.
-pub(super) async fn handle_call_signal(manager: &ConnectionManager, dm_msg: &DmMessage, peer_id: &str) -> bool {
+pub(super) async fn handle_call_signal(
+    manager: &ConnectionManager,
+    dm_msg: &DmMessage,
+    peer_id: &str,
+) -> bool {
     match dm_msg {
         DmMessage::CallInvite { ticket } => {
             let _ = manager.event_tx.send(Event::CallInviteReceived {
@@ -138,7 +142,11 @@ pub(super) async fn drain_duplicate_dm_frame_once(
 
 /// Shared DM stream reader loop — reads framed messages, handles files,
 /// emits events. Used by both connect_dm and setup_dm_connection.
-pub(super) async fn run_dm_reader(recv: &mut iroh::endpoint::RecvStream, peer_id: &str, manager: &ConnectionManager) {
+pub(super) async fn run_dm_reader(
+    recv: &mut iroh::endpoint::RecvStream,
+    peer_id: &str,
+    manager: &ConnectionManager,
+) {
     let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
     loop {
         match crate::messages::read_framed(recv, MAX_DM_FRAME_BYTES).await {
@@ -355,7 +363,10 @@ impl ConnectionManager {
             .insert(peer_id.to_string())
     }
 
-    pub(super) fn reserve_dm_connecting_guard(&self, peer_id: &str) -> Option<ConnectingReservation> {
+    pub(super) fn reserve_dm_connecting_guard(
+        &self,
+        peer_id: &str,
+    ) -> Option<ConnectingReservation> {
         ConnectingReservation::try_reserve(
             self.dm_connecting.clone(),
             peer_id,
@@ -894,7 +905,7 @@ impl ConnectionManager {
                         "DM entry for {peer_id} pre-dates recent gossip rejoin; evicting + redialing"
                     );
                     self.cleanup_dm(peer_id, Some(b"dm_entry_predates_rejoin"), None)
-                    .await;
+                        .await;
                     continue;
                 }
                 return Ok(());
@@ -966,7 +977,7 @@ impl ConnectionManager {
             Err(first_err) => {
                 tracing::warn!("DM write to peer {peer_id} failed; reconnecting once: {first_err}");
                 self.cleanup_dm(peer_id, Some(b"dm_write_failed"), active_connection_id)
-                .await;
+                    .await;
 
                 self.ensure_dm_connected(peer_id).await.map_err(|reconnect_err| {
                     anyhow::anyhow!(
@@ -984,8 +995,7 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect_dm(&self, peer_id: &str) {
-        self.cleanup_dm(peer_id, Some(b"dm_closed"), None)
-        .await;
+        self.cleanup_dm(peer_id, Some(b"dm_closed"), None).await;
     }
 }
 
@@ -1004,7 +1014,10 @@ mod tests {
         assert!(!recent.check_and_insert("newcomer", "m"));
         assert_eq!(recent.peers.len(), RECENT_DM_PEERS_CAPACITY);
         assert!(!recent.peers.contains_key("peer-1"));
-        assert!(recent.check_and_insert("peer-0", "m"), "peer-0 kept its ids");
+        assert!(
+            recent.check_and_insert("peer-0", "m"),
+            "peer-0 kept its ids"
+        );
     }
 
     #[test]
