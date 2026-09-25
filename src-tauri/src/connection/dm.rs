@@ -324,16 +324,32 @@ impl ConnectionManager {
     }
 
     /// Replace the saved-contact set (startup load from the contacts store).
+    /// Ids are stored canonically (`canonical_node_id`) so they match the
+    /// `remote_id().to_string()` a connection reports; invalid ids are
+    /// dropped.
     pub fn set_contacts(&self, node_ids: impl IntoIterator<Item = String>) {
-        *self.lock_contacts() = node_ids.into_iter().collect();
+        *self.lock_contacts() = node_ids
+            .into_iter()
+            .filter_map(|id| {
+                let canonical = canonical_node_id(&id);
+                if canonical.is_none() {
+                    tracing::warn!("Ignoring saved contact with invalid node id {id:?}");
+                }
+                canonical
+            })
+            .collect();
     }
 
-    pub fn add_contact(&self, node_id: &str) {
-        self.lock_contacts().insert(node_id.to_string());
+    pub fn add_contact(&self, node_id: &str) -> Result<()> {
+        let id = canonical_node_id(node_id)
+            .ok_or_else(|| anyhow::anyhow!("invalid contact node id {node_id:?}"))?;
+        self.lock_contacts().insert(id);
+        Ok(())
     }
 
     pub fn remove_contact(&self, node_id: &str) {
-        self.lock_contacts().remove(node_id);
+        let id = canonical_node_id(node_id).unwrap_or_else(|| node_id.to_string());
+        self.lock_contacts().remove(&id);
     }
 
     pub(super) fn is_contact(&self, node_id: &str) -> bool {

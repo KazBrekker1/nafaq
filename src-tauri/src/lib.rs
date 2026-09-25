@@ -180,6 +180,34 @@ pub fn run() {
                 latest_ticket.clone(),
             ));
 
+            // Seed the contact set (it gates inbound files) before the router
+            // below starts accepting connections — a contact's file sent right
+            // at startup must not be rejected as coming from a stranger. Ids
+            // are normalized to canonical form, and the store is migrated if
+            // that changed anything so the frontend sees the same ids.
+            let startup_contacts: Vec<Contact> = match app.store("contacts.json") {
+                Ok(store) => {
+                    let mut contacts = commands::load_contacts(&store);
+                    if commands::canonicalize_contact_ids(&mut contacts) {
+                        match serde_json::to_value(&contacts) {
+                            Ok(value) => {
+                                store.set("contacts", value);
+                                if let Err(e) = store.save() {
+                                    tracing::warn!("failed to save normalized contacts: {e}");
+                                }
+                            }
+                            Err(e) => tracing::warn!("failed to serialize contacts: {e}"),
+                        }
+                    }
+                    contacts
+                }
+                Err(e) => {
+                    tracing::warn!("contacts store unavailable at startup: {e}");
+                    Vec::new()
+                }
+            };
+            conn_manager.set_contacts(startup_contacts.iter().map(|c| c.node_id.clone()));
+
             let conn_manager_for_rt = conn_manager.clone();
             let event_tx_for_presence = event_tx.clone();
             // A UDP bind failure (port conflict, VPN/firewall/sandbox denial) must
@@ -302,26 +330,11 @@ pub fn run() {
             app.manage(app_state);
             app.manage(media_bridge);
 
-            // Track presence for every contact on startup, and seed the
-            // connection manager's contact set (it gates inbound files).
-            let conn_manager_for_bootstrap = conn_manager.clone();
+            // Track presence for every contact on startup (the contact set
+            // itself was seeded before the router started).
             let presence_for_bootstrap = presence.clone();
-            let app_handle_for_bootstrap = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                let store = match app_handle_for_bootstrap.store("contacts.json") {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!("contacts store unavailable for presence bootstrap: {e}");
-                        return;
-                    }
-                };
-                let contacts: Vec<Contact> = store
-                    .get("contacts")
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .unwrap_or_default();
-                conn_manager_for_bootstrap
-                    .set_contacts(contacts.iter().map(|contact| contact.node_id.clone()));
-                for contact in contacts {
+                for contact in startup_contacts {
                     if let Err(e) = presence_for_bootstrap.track_contact(&contact.node_id).await {
                         tracing::warn!("presence track failed for {}: {e}", contact.node_id);
                     }

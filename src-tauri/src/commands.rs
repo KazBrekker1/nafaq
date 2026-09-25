@@ -8,6 +8,7 @@ use tauri::{
 use tauri_plugin_store::StoreExt;
 
 use crate::codec::{AudioEncoder, VideoEncoder};
+use crate::connection::canonical_node_id;
 use crate::identity;
 use crate::messages::{
     Contact, ControlAction, DmMessage, Event, MediaBridgeMode,
@@ -462,11 +463,31 @@ pub async fn get_presence_snapshot(
 
 // ── Contacts helpers ────────────────────────────────────────────────
 
-fn load_contacts(store: &tauri_plugin_store::Store<tauri::Wry>) -> Vec<Contact> {
+pub(crate) fn load_contacts(store: &tauri_plugin_store::Store<tauri::Wry>) -> Vec<Contact> {
     store
         .get("contacts")
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default()
+}
+
+/// Rewrites every valid contact id into the canonical form peers are keyed
+/// by (`canonical_node_id`), so a contact saved from e.g. a base32 id still
+/// matches `remote_id().to_string()`, and drops duplicates this creates.
+/// Invalid ids are left untouched. Returns whether anything changed.
+pub(crate) fn canonicalize_contact_ids(contacts: &mut Vec<Contact>) -> bool {
+    let mut changed = false;
+    for contact in contacts.iter_mut() {
+        if let Some(id) = canonical_node_id(&contact.node_id) {
+            if id != contact.node_id {
+                contact.node_id = id;
+                changed = true;
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let before = contacts.len();
+    contacts.retain(|contact| seen.insert(contact.node_id.clone()));
+    changed || contacts.len() != before
 }
 
 // ── DM commands ────────────────────────────────────────────────────
@@ -692,16 +713,15 @@ pub async fn get_contacts(app: tauri::AppHandle) -> Result<Vec<Contact>, String>
 
 #[tauri::command]
 pub async fn add_contact(
-    contact: Contact,
+    mut contact: Contact,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<Contact>, String> {
     // Reject malformed ids before persisting — otherwise an invalid contact is
-    // saved to disk and only fails later at presence.track_contact.
-    contact
-        .node_id
-        .parse::<iroh::PublicKey>()
-        .map_err(|_| "Invalid contact node id".to_string())?;
+    // saved to disk and only fails later at presence.track_contact. Stored in
+    // canonical form so it matches the peer ids connections report.
+    contact.node_id =
+        canonical_node_id(&contact.node_id).ok_or_else(|| "Invalid contact node id".to_string())?;
     if contact.display_name.len() > MAX_DISPLAY_NAME_LEN {
         return Err("Display name too long".into());
     }
@@ -709,6 +729,7 @@ pub async fn add_contact(
     // Held across load..save so concurrent add/remove can't lose an update.
     let _contacts_guard = state.contacts_lock.lock().await;
     let mut contacts = load_contacts(&store);
+    canonicalize_contact_ids(&mut contacts);
     let node_id = contact.node_id.clone();
     let is_new = !contacts.iter().any(|c| c.node_id == node_id);
     // Upsert by node_id
@@ -723,7 +744,10 @@ pub async fn add_contact(
         serde_json::to_value(&contacts).map_err(|e| e.to_string())?,
     );
     store.save().map_err(|e| e.to_string())?;
-    state.conn_manager.add_contact(&node_id);
+    state
+        .conn_manager
+        .add_contact(&node_id)
+        .map_err(|e| e.to_string())?;
 
     if is_new {
         if let Err(e) = state.presence.track_contact(&node_id).await {
@@ -739,9 +763,12 @@ pub async fn remove_contact(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<Contact>, String> {
+    let node_id =
+        canonical_node_id(&node_id).ok_or_else(|| "Invalid contact node id".to_string())?;
     let store = app.store("contacts.json").map_err(|e| e.to_string())?;
     let _contacts_guard = state.contacts_lock.lock().await;
     let mut contacts = load_contacts(&store);
+    canonicalize_contact_ids(&mut contacts);
     contacts.retain(|c| c.node_id != node_id);
     store.set(
         "contacts",
@@ -979,5 +1006,39 @@ async fn encode_and_send_video_all(
             .map_err(|e| e.to_string())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messages::ContactSource;
+
+    fn contact(node_id: &str, name: &str) -> Contact {
+        Contact {
+            node_id: node_id.to_string(),
+            display_name: name.to_string(),
+            added_at: 0,
+            last_seen: 0,
+            source: ContactSource::Manual,
+        }
+    }
+
+    #[test]
+    fn canonicalize_contact_ids_normalizes_and_dedupes() {
+        let hex = iroh::SecretKey::generate().public().to_string();
+        let mut contacts = vec![
+            contact(&hex.to_uppercase(), "first"),
+            contact(&hex, "duplicate"),
+            contact("garbage", "invalid"),
+        ];
+        assert!(canonicalize_contact_ids(&mut contacts));
+        let ids: Vec<_> = contacts.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(ids, [hex.as_str(), "garbage"]);
+        assert_eq!(contacts[0].display_name, "first");
+        assert!(
+            !canonicalize_contact_ids(&mut contacts),
+            "already canonical"
+        );
     }
 }

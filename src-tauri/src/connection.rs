@@ -123,7 +123,9 @@ fn classify_call_close_reason(reason: &[u8]) -> CallCloseDisposition {
 /// a valid node id. Accepts any encoding `iroh::PublicKey` parses (e.g. a
 /// base32 id typed in by a user).
 pub fn canonical_node_id(id: &str) -> Option<String> {
+    // Hex parsing is lowercase-only; base32 is case-insensitive.
     id.trim()
+        .to_ascii_lowercase()
         .parse::<iroh::PublicKey>()
         .ok()
         .map(|key| key.to_string())
@@ -3174,6 +3176,56 @@ mod tests {
         router_a.shutdown().await.ok();
         endpoint_b.close().await;
         endpoint_a.close().await;
+    }
+
+    /// RFC 4648 base32 without padding — the non-hex form `PublicKey` parses.
+    fn base32_nopad(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut out = String::new();
+        let (mut buffer, mut bits) = (0u32, 0u32);
+        for &byte in bytes {
+            buffer = (buffer << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                out.push(ALPHABET[((buffer >> bits) & 31) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((buffer << (5 - bits)) & 31) as usize] as char);
+        }
+        out
+    }
+
+    #[test]
+    fn contact_ids_are_canonicalized_so_any_encoding_matches_the_remote_id() {
+        let key = test_public_key();
+        let hex = key.to_string();
+        let base32 = base32_nopad(key.as_bytes());
+        assert_eq!(canonical_node_id(&base32).as_deref(), Some(hex.as_str()));
+        assert_eq!(
+            canonical_node_id(&base32.to_lowercase()).as_deref(),
+            Some(hex.as_str())
+        );
+        assert_eq!(
+            canonical_node_id(&hex.to_uppercase()).as_deref(),
+            Some(hex.as_str())
+        );
+        assert_eq!(canonical_node_id("not-a-node-id"), None);
+
+        let (event_tx, _) = broadcast::channel::<Event>(4);
+        let (audio_tx, _) = broadcast::channel::<AudioPacket>(1);
+        let (video_tx, _) = broadcast::channel::<VideoPacket>(1);
+        let mgr = test_manager(event_tx, audio_tx, video_tx);
+        assert!(mgr.add_contact("not-a-node-id").is_err());
+        mgr.add_contact(&base32).unwrap();
+        assert!(mgr.is_contact(&hex), "a base32-entered contact must match");
+        mgr.remove_contact(&hex.to_uppercase());
+        assert!(!mgr.is_contact(&hex));
+
+        mgr.set_contacts([base32, "garbage".to_string()]);
+        assert!(mgr.is_contact(&hex));
+        assert_eq!(mgr.lock_contacts().len(), 1);
     }
 
     #[test]
