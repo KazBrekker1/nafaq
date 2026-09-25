@@ -124,7 +124,11 @@ function startWaitingForAnswer(targetPeerId: string) {
 // not the notification lands. `notifyPeer: false` skips the CallCancel send
 // for the decline-received path, where the callee already knows the call is
 // over (they're the one who declined) — there's nothing to notify them of.
-async function cancelPendingCall({ notifyPeer = true }: { notifyPeer?: boolean } = {}) {
+// `navigate: false` is for callers already leaving /call (route guard).
+async function cancelPendingCall({
+  notifyPeer = true,
+  navigate = true,
+}: { notifyPeer?: boolean; navigate?: boolean } = {}) {
   clearAnswerTimer();
   const target = invitedPeerId.value;
   invitedPeerId.value = null;
@@ -136,7 +140,7 @@ async function cancelPendingCall({ notifyPeer = true }: { notifyPeer?: boolean }
       console.warn("[call] cancel_call failed:", e);
     }
   }
-  await terminateCall({ navigate: true });
+  await terminateCall({ navigate });
 }
 
 // Shared teardown for both the explicit "End Call" button and any path
@@ -183,12 +187,12 @@ async function terminateCall({ navigate = true }: { navigate?: boolean } = {}) {
 // (nobody ever joined) — route it through cancelPendingCall so the callee is
 // told and our own session-active flag is cleared, instead of silently
 // tearing down local state with nothing sent over the wire.
-async function endCall() {
+async function endCall({ navigate = true }: { navigate?: boolean } = {}) {
   if (state.value === "waiting") {
-    await cancelPendingCall();
+    await cancelPendingCall({ navigate });
     return;
   }
-  await terminateCall({ navigate: true });
+  await terminateCall({ navigate });
 }
 
 async function acceptInvite() {
@@ -360,6 +364,17 @@ async function initCallListeners() {
           action: { action: "set_display_name", name: displayName.value },
         }).catch(() => {});
       }
+      // Mute / camera-off are only broadcast on change, so a peer joining
+      // later would assume both are on — send our current state.
+      const { audioMuted, videoMuted } = useMedia();
+      invoke("send_control", {
+        peerId: pid,
+        action: { action: "mute", muted: audioMuted.value },
+      }).catch(() => {});
+      invoke("send_control", {
+        peerId: pid,
+        action: { action: "video_off", off: videoMuted.value },
+      }).catch(() => {});
     }));
 
     callUnlisteners.push(await listen<any>("peer-disconnected", (event) => {
@@ -431,6 +446,17 @@ async function initCallListeners() {
       } else {
         // Already busy — record as missed call
         showMissedCall(callerName(pid));
+        // Tell the second caller we're busy instead of letting them ring
+        // out. Skip peers already part of this call (a duplicate invite
+        // from the caller we're ringing for, or someone we're talking to).
+        const partOfThisCall = incomingInvite.value?.peerId === pid
+          || invitedPeerId.value === pid
+          || peers.value.includes(pid);
+        if (!partOfThisCall) {
+          invoke("send_call_decline", { peerId: pid }).catch((e) => {
+            console.warn(`[call] failed to send busy decline to ${pid}:`, e);
+          });
+        }
       }
     }));
 

@@ -1407,7 +1407,6 @@ impl ConnectionManager {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn peer_count(&self) -> usize {
         self.peers.lock().await.len()
     }

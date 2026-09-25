@@ -67,6 +67,11 @@ export function useMedia() {
 
     const generation = ++previewGeneration;
 
+    // Replacing a live stream (device switch): release the current camera
+    // first — Android's camera HAL won't open a second one while it's held,
+    // so asking for the new device would fail with NotReadableError.
+    localStream.value?.getVideoTracks().forEach((t) => t.stop());
+
     // Capture is downscaled to at most 640x360 @ 12 fps before encoding;
     // asking for more only burns camera/CPU (notably on Android).
     const videoConstraint: MediaTrackConstraints = {

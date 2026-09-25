@@ -112,12 +112,6 @@ export class PcmJitterBuffer {
     this.size -= n;
     this.droppedSamples += n;
   }
-
-  reset() {
-    this.readPos = 0;
-    this.size = 0;
-    this.playing = false;
-  }
 }
 
 export const PLAYBACK_PROCESSOR_NAME = "nafaq-playback";
@@ -133,7 +127,6 @@ class NafaqPlaybackProcessor extends AudioWorkletProcessor {
     this.port.onmessage = (event) => {
       const data = event.data;
       if (data && data.pcm) this.buffer.push(data.pcm);
-      else if (data && data.reset) this.buffer.reset();
     };
   }
   process(_inputs, outputs) {

@@ -11,9 +11,8 @@ use crate::codec::{AudioEncoder, VideoEncoder};
 use crate::identity;
 use crate::messages::{
     Contact, ControlAction, DmMessage, Event, MediaBridgeMode,
-    MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaPlaybackStatus,
-    MediaReceiveAudioMode, MediaReceiveVideoMode, MediaSendIngressMode, MediaSessionProfile,
-    RelayStatusKind,
+    MediaBridgeRegistration as MediaBridgeRegistrationRequest, MediaReceiveVideoMode,
+    MediaSessionProfile, RelayStatusKind,
 };
 use crate::node;
 use crate::state::{AppState, MediaBridgeRegistration, MediaBridgeState};
@@ -265,10 +264,6 @@ pub async fn register_media_bridge(
         session_id: registration.session_id.clone(),
         receive_bridge_mode: selected_mode,
         receive_video_mode,
-        receive_audio_mode: MediaReceiveAudioMode::DecodedPcm,
-        send_ingress_mode: MediaSendIngressMode::InvokeRaw,
-        playback_ready: registration.playback_ready,
-        bridge_ready: false,
     };
 
     *bridge.current.lock().await = Some(MediaBridgeRegistration {
@@ -307,52 +302,6 @@ pub async fn clear_media_bridge(
     {
         *guard = None;
         tracing::info!("Cleared media bridge session={session_id}");
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn ack_media_bridge_ready(
-    session_id: String,
-    bridge: State<'_, MediaBridgeState>,
-) -> Result<(), String> {
-    let mut guard = bridge.current.lock().await;
-    let Some(current) = guard.as_mut() else {
-        return Err("No registered media bridge".into());
-    };
-    if current.profile.session_id != session_id {
-        return Err("Media bridge session mismatch".into());
-    }
-    current.profile.bridge_ready = true;
-    tracing::info!("Media bridge ready session={session_id}");
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn report_media_playback_status(
-    status: MediaPlaybackStatus,
-    bridge: State<'_, MediaBridgeState>,
-) -> Result<(), String> {
-    let mut guard = bridge.current.lock().await;
-    let Some(current) = guard.as_mut() else {
-        return Err("No registered media bridge".into());
-    };
-    if current.profile.session_id != status.session_id {
-        return Err("Media bridge session mismatch".into());
-    }
-    current.profile.playback_ready = status.audio_ready || status.video_ready;
-    if let Some(last_failure) = status.last_failure.as_deref() {
-        tracing::warn!(
-            "Media playback degraded session={} failure={last_failure}",
-            status.session_id
-        );
-    } else {
-        tracing::info!(
-            "Media playback status session={} audio_ready={} video_ready={}",
-            status.session_id,
-            status.audio_ready,
-            status.video_ready
-        );
     }
     Ok(())
 }
@@ -474,6 +423,32 @@ pub async fn reinit_video_encoder_with_config(
     );
     tracing::info!("Video encoder reinitialized: {width}x{height} @ {bitrate_bps}bps {fps}fps");
     Ok(())
+}
+
+/// Same shape as the `quality-profile-changed` event payload.
+#[derive(serde::Serialize)]
+pub struct QualityProfile {
+    peer_count: usize,
+    bitrate_bps: u32,
+    fps: u32,
+    max_width: u32,
+    max_height: u32,
+}
+
+/// Current call-size profile, so a transport starting after the last
+/// `quality-profile-changed` event doesn't encode at the 1:1 default.
+#[tauri::command]
+pub async fn get_quality_profile(state: State<'_, AppState>) -> Result<QualityProfile, String> {
+    let peer_count = state.conn_manager.peer_count().await;
+    let (bitrate_bps, fps, max_width, max_height) =
+        crate::connection::ConnectionManager::quality_profile_for_peers(peer_count);
+    Ok(QualityProfile {
+        peer_count,
+        bitrate_bps,
+        fps,
+        max_width,
+        max_height,
+    })
 }
 
 // ── Presence (gossip-driven) ────────────────────────────────────────

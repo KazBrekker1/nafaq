@@ -34,3 +34,28 @@ export function sendQualityForLevel(level: number): SendQuality {
   if (level === 1) return "degraded";
   return "poor";
 }
+
+export type VideoQualityPreference = "auto" | "low" | "medium" | "high";
+
+// User ceiling from Settings → video quality / data saver. "auto" and "high"
+// leave the call-size profile alone; the backend's congestion levels still
+// apply on top of whatever this returns.
+const PREFERENCE_CAPS: Partial<Record<VideoQualityPreference, VideoProfile>> = {
+  low: { bitrateBps: 150_000, fps: 8, maxWidth: 320, maxHeight: 180 },
+  medium: { bitrateBps: 250_000, fps: 10, maxWidth: 480, maxHeight: 270 },
+};
+
+export function capProfileForPreference(
+  profile: VideoProfile,
+  videoQuality: VideoQualityPreference,
+  dataSaver: boolean,
+): VideoProfile {
+  const cap = PREFERENCE_CAPS[dataSaver ? "low" : videoQuality];
+  if (!cap) return profile;
+  return {
+    bitrateBps: Math.min(profile.bitrateBps, cap.bitrateBps),
+    fps: Math.min(profile.fps, cap.fps),
+    maxWidth: Math.min(profile.maxWidth, cap.maxWidth),
+    maxHeight: Math.min(profile.maxHeight, cap.maxHeight),
+  };
+}

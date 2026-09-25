@@ -105,22 +105,9 @@ pub enum MediaBridgeMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MediaReceiveAudioMode {
-    DecodedPcm,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MediaReceiveVideoMode {
     DecodedJpeg,
     RawH264Nalu,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MediaSendIngressMode {
-    InvokeRaw,
-    InvokeJsonFallback,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,7 +115,6 @@ pub enum MediaSendIngressMode {
 pub struct MediaBridgeRegistration {
     pub session_id: String,
     pub preferred_bridge_modes: Vec<MediaBridgeMode>,
-    pub playback_ready: bool,
     #[serde(default)]
     pub webcodecs_active: bool,
 }
@@ -139,19 +125,6 @@ pub struct MediaSessionProfile {
     pub session_id: String,
     pub receive_bridge_mode: MediaBridgeMode,
     pub receive_video_mode: MediaReceiveVideoMode,
-    pub receive_audio_mode: MediaReceiveAudioMode,
-    pub send_ingress_mode: MediaSendIngressMode,
-    pub playback_ready: bool,
-    pub bridge_ready: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MediaPlaybackStatus {
-    pub session_id: String,
-    pub audio_ready: bool,
-    pub video_ready: bool,
-    pub last_failure: Option<String>,
 }
 
 /// Commands from frontend → Rust backend (via Tauri invoke)

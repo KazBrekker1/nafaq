@@ -10,6 +10,7 @@ const { peerConnectionStatuses } = useNodeRuntime();
 const { playPeerConnected, playPeerLeft, playMessageReceived } = useNotificationSounds();
 const { starFromCall, contacts } = useContacts();
 const { request: requestWakeLock, release: releaseWakeLock } = useWakeLock();
+const toast = useToast();
 
 const starredPeers = ref<Set<string>>(new Set());
 
@@ -140,13 +141,29 @@ defineShortcuts({
 // Called both on the lobby → connected transition and, defensively, on mount
 // when the page is created with a call already connected (e.g. a stale
 // remount) — the transition watcher below only fires on a change, so it
-// never runs in that second case.
-async function startConnectedPipeline() {
+// never runs in that second case. Both can fire for the same connection
+// (state flips to connected while onMounted awaits the preview), so the
+// pipeline is single-flight: later callers share the first run.
+let pipelinePromise: Promise<void> | null = null;
+// Set once the pipeline has created the encoders; sending before that would
+// only feed frames to a backend with no encoder.
+let codecsReady = false;
+function startConnectedPipeline() {
+  if (!pipelinePromise) {
+    pipelinePromise = runConnectedPipeline().catch((e) => {
+      console.warn("[call] media pipeline failed to start:", e);
+      // Let a later connected transition retry.
+      pipelinePromise = null;
+    });
+  }
+  return pipelinePromise;
+}
+
+async function runConnectedPipeline() {
   // Guards against starting after an unmount-triggered cleanup — starting
   // transport after cleanup would leak it with no owner to stop it.
   if (cleaned) return;
 
-  // Clean up any previous instances (e.g. peer reconnect scenario)
   if (durationInterval) { clearInterval(durationInterval); durationInterval = null; }
   videoVisibilityObserver?.disconnect();
 
@@ -161,10 +178,13 @@ async function startConnectedPipeline() {
   // Re-attach tiles that were observed by the previous observer instance.
   for (const el of observedPeerContainers.values()) videoVisibilityObserver.observe(el);
 
-  await transport.initCodecs(media.localStream.value);
-  if (cleaned) return;
+  // Receiving first: it picks up the current call-size profile, which the
+  // encoder created by initCodecs must start with.
   await transport.startReceiving(() => call.peers.value);
   if (cleaned) return;
+  await transport.initCodecs(media.localStream.value);
+  if (cleaned) return;
+  codecsReady = true;
 
   if (media.localStream.value && call.peers.value.length > 0) {
     await transport.startSending(media.localStream.value);
@@ -203,18 +223,29 @@ onMounted(async () => {
 // ── Leaving /call always means leaving the call — no confirmation prompt,
 // the decision is unambiguous. Torn down before navigation resolves so the
 // backend session and call state are already reset by the time onUnmounted
-// (or a fresh mount of /call) runs. ──────────────────────────────────────
+// (or a fresh mount of /call) runs. endCall (not terminateCall) so leaving
+// while still ringing the callee cancels the invite on their side too. ──
 onBeforeRouteLeave(async () => {
   if (!isCallActive()) return;
   await cleanup();
   chat.clearMessages();
-  await call.terminateCall({ navigate: false });
+  await call.endCall({ navigate: false });
 });
 
 // ── Transition: lobby → active call when state becomes connected ─────
 watch(() => call.state.value, async (newState, oldState) => {
   if (newState === "connected" && oldState !== "connected") {
     await startConnectedPipeline();
+    return;
+  }
+  // Dropped back to idle without leaving the page ourselves (join failed,
+  // invite declined or unanswered): don't strand the user in the lobby.
+  // The toast outlives the navigation (UApp hosts it).
+  if (newState === "idle" && !cleaned) {
+    if (call.error.value) {
+      toast.add({ title: "Call ended", description: call.error.value, color: "error" });
+    }
+    navigateTo("/");
   }
 });
 
@@ -228,36 +259,29 @@ watch([() => media.localStream.value, localVideoEl], ([stream, el]) => {
   if (el) el.srcObject = stream || null;
 }, { immediate: true });
 
-watch(() => call.peers.value, async (peerIds, oldPeerIds) => {
+// peers is mutated in place (push/splice), so a deep watch hands over the
+// same array as old and new value — watch a copy to compare lengths.
+watch(() => [...call.peers.value], async (peerIds, oldPeerIds) => {
   if (cleaned) return;
-  await transport.syncSubscriptions(peerIds);
-  if (cleaned) return;
-  if (media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
-    await transport.startSending(media.localStream.value);
-  }
   // Notification sounds
   if (oldPeerIds && peerIds.length > oldPeerIds.length) playPeerConnected();
   if (oldPeerIds && peerIds.length < oldPeerIds.length) playPeerLeft();
-}, { deep: true });
-
-// Restart transport when device is switched mid-call.
-let wasEncoding = false;
-watch(() => media.localStream.value, async (newStream) => {
-  if (cleaned) return;
-  if (!newStream) {
-    wasEncoding = transport.encoding.value;
-    return;
+  if (codecsReady && media.localStream.value && peerIds.length > 0 && !transport.encoding.value) {
+    await transport.startSending(media.localStream.value);
   }
-  // Reset unconditionally — a stale true (stream arrived with no peers yet)
-  // must not trigger a restart on a later, unrelated stream change.
-  const shouldRestart = wasEncoding && call.peers.value.length > 0;
-  wasEncoding = false;
-  if (shouldRestart) {
-    try {
-      await transport.restartSending(newStream);
-    } catch (e) {
-      console.warn("[call] restartSending failed:", e);
-    }
+});
+
+// Restart transport when device is switched mid-call. startPreview swaps the
+// stream synchronously (old → new, the intermediate null is never observed),
+// so compare the two streams directly.
+watch(() => media.localStream.value, async (newStream, oldStream) => {
+  if (cleaned) return;
+  if (!newStream || !oldStream || newStream === oldStream) return;
+  if (!transport.encoding.value || call.peers.value.length === 0) return;
+  try {
+    await transport.restartSending(newStream);
+  } catch (e) {
+    console.warn("[call] restartSending failed:", e);
   }
 });
 
@@ -289,10 +313,10 @@ onUnmounted(async () => {
   // Fallback teardown: guarantees the Rust-side session and call state don't
   // outlive this page even if a leave path bypassed the route guard above.
   // No-op when handleEndCall or the route guard already tore down the call,
-  // since terminateCall() always leaves state at "idle".
+  // since endCall() always leaves state at "idle".
   if (isCallActive()) {
     chat.clearMessages();
-    await call.terminateCall({ navigate: false });
+    await call.endCall({ navigate: false });
   }
 });
 
@@ -446,6 +470,28 @@ function handleSendChat(text: string) {
                 <span v-if="isPeerSuspect(peer)" class="suspect-dot" aria-hidden="true" />
                 {{ peer.slice(0, 12) }}...
               </span>
+              <!-- Remote mute / camera-off state (from the peer's control messages) -->
+              <div
+                v-if="call.peerMuted.value[peer] || call.peerVideoOff.value[peer]"
+                class="absolute top-1.5 left-1.5 flex items-center gap-1"
+              >
+                <span
+                  v-if="call.peerMuted.value[peer]"
+                  class="size-5 bg-error flex items-center justify-center"
+                  title="Muted"
+                  aria-label="Muted"
+                >
+                  <UIcon name="i-lucide-mic-off" class="text-inverted text-[10px]" />
+                </span>
+                <span
+                  v-if="call.peerVideoOff.value[peer]"
+                  class="size-5 bg-black/70 flex items-center justify-center"
+                  title="Camera off"
+                  aria-label="Camera off"
+                >
+                  <UIcon name="i-heroicons-video-camera-slash" class="text-dimmed text-xs" />
+                </span>
+              </div>
               <div class="absolute top-1.5 right-1.5 flex items-center gap-1.5">
                 <span v-if="transport.activeSpeaker.value === peer" class="text-[8px] text-primary bg-black/70 px-1.5 py-0.5 font-bold tracking-wider">SPEAKER</span>
                 <button
@@ -487,8 +533,8 @@ function handleSendChat(text: string) {
                 :key="i"
                 class="w-[3px]"
                 :style="{
-                  height: `${3 + (i <= media.micLevel.value / 12 ? (media.micLevel.value / 12) * 1.5 : 0)}px`,
-                  background: i <= media.micLevel.value / 12 ? 'var(--ui-primary)' : 'var(--ui-border-muted)'
+                  height: `${3 + (i <= media.micLevel.value * 8 ? media.micLevel.value * 8 * 1.5 : 0)}px`,
+                  background: i <= media.micLevel.value * 8 ? 'var(--ui-primary)' : 'var(--ui-border-muted)'
                 }"
               />
             </div>
