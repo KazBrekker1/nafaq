@@ -61,6 +61,11 @@ const CLOSE_STALE_CALL_CONNECTION: &[u8] = b"stale_call_connection";
 const CLOSE_PEER_REJOINED_GOSSIP: &[u8] = b"peer_rejoined_gossip";
 /// Evicted: the initiator re-dialed in the same direction.
 const CLOSE_SUPERSEDED_BY_REDIAL: &[u8] = b"superseded_by_redial";
+/// A control write timed out and the stream was reset; it can't be reopened
+/// on this connection, so both sides redial.
+const CLOSE_CONTROL_STREAM_STALLED: &[u8] = b"control_stream_stalled";
+/// Same as `CLOSE_CONTROL_STREAM_STALLED`, for the chat stream.
+const CLOSE_CHAT_STREAM_STALLED: &[u8] = b"chat_stream_stalled";
 
 /// What a call connection's close means for the peer entry and its ticket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +112,7 @@ fn classify_call_close_reason(reason: &[u8]) -> CallCloseDisposition {
         | CLOSE_STALE_CALL_CONNECTION
         | CLOSE_PEER_REJOINED_GOSSIP
         | CLOSE_SUPERSEDED_BY_REDIAL => CallCloseDisposition::KeepTicket,
+        CLOSE_CONTROL_STREAM_STALLED | CLOSE_CHAT_STREAM_STALLED => CallCloseDisposition::Reconnect,
         // Unknown (e.g. a newer peer's reason): not known to be a hang-up.
         _ => CallCloseDisposition::KeepTicket,
     }
@@ -218,6 +224,62 @@ impl std::fmt::Display for FrameWriteError {
 }
 
 impl std::error::Error for FrameWriteError {}
+
+/// The peer-facing bidi streams of a call connection that we write frames to.
+#[derive(Debug, Clone, Copy)]
+enum CallStream {
+    Chat,
+    Control,
+}
+
+impl CallStream {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Control => "control",
+        }
+    }
+
+    fn write_timeout(self) -> Duration {
+        match self {
+            Self::Chat => CHAT_WRITE_TIMEOUT,
+            Self::Control => CONTROL_WRITE_TIMEOUT,
+        }
+    }
+
+    fn stall_close_reason(self) -> &'static [u8] {
+        match self {
+            Self::Chat => CLOSE_CHAT_STREAM_STALLED,
+            Self::Control => CLOSE_CONTROL_STREAM_STALLED,
+        }
+    }
+}
+
+/// Writes one frame to a call connection's chat or control stream.
+///
+/// A stalled write resets the stream, and it can't be replaced on this
+/// connection: the peer accepts one bidi stream per type for the connection's
+/// lifetime, and inbound media alone keeps liveness from ever noticing. So a
+/// stall closes the whole connection with a reconnect reason
+/// (`classify_call_close`): our close watcher sees it closed under a live
+/// entry and the peer sees the reason, and both start the normal redial.
+async fn write_call_frame(
+    peer_id: &str,
+    slot: &Mutex<Option<SendStream>>,
+    connection: &Connection,
+    data: &[u8],
+    stream: CallStream,
+) -> std::result::Result<(), FrameWriteError> {
+    let result = write_frame_or_reset(slot, data, stream.write_timeout(), stream.name()).await;
+    if result.as_ref().is_err_and(FrameWriteError::is_stalled) {
+        tracing::warn!(
+            "{} stream to {peer_id} stalled; closing the call connection to reconnect",
+            stream.name()
+        );
+        connection.close(0u32.into(), stream.stall_close_reason());
+    }
+    result
+}
 
 fn relay_targets_for_announce<'a>(
     peer_ids: impl IntoIterator<Item = &'a String>,
@@ -1055,7 +1117,9 @@ impl ConnectionManager {
                 tracing::info!(
                     "Rejecting {direction:?} call connection with {peer_id}: call ended during setup"
                 );
-                peer_conn.connection.close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
+                peer_conn
+                    .connection
+                    .close(0u32.into(), CLOSE_CALL_NOT_ACTIVE);
                 return Ok(());
             }
             let old = peers.len();
@@ -1768,30 +1832,51 @@ impl ConnectionManager {
     pub async fn send_chat(&self, peer_id: &str, message: &str) -> Result<()> {
         let stream = {
             let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.chat_send.clone())
+            peers
+                .get(peer_id)
+                .map(|p| (p.chat_send.clone(), p.connection.clone()))
         };
-        let Some(s) = stream else {
+        let Some((s, connection)) = stream else {
             anyhow::bail!("Peer {peer_id} is not connected");
         };
 
-        write_frame_or_reset(&s, message.as_bytes(), CHAT_WRITE_TIMEOUT, "chat")
-            .await
-            .map_err(|e| anyhow::anyhow!("chat to {peer_id} failed: {e}"))
+        write_call_frame(
+            peer_id,
+            &s,
+            &connection,
+            message.as_bytes(),
+            CallStream::Chat,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("chat to {peer_id} failed: {e}"))
     }
 
     pub async fn send_chat_to_all(&self, message: &str) -> Vec<String> {
-        let streams: Vec<(String, Arc<Mutex<Option<SendStream>>>)> = {
+        type ChatTarget = (String, Arc<Mutex<Option<SendStream>>>, Connection);
+        let streams: Vec<ChatTarget> = {
             let peers = self.peers.lock().await;
             peers
                 .iter()
-                .map(|(peer_id, peer)| (peer_id.clone(), peer.chat_send.clone()))
+                .map(|(peer_id, peer)| {
+                    (
+                        peer_id.clone(),
+                        peer.chat_send.clone(),
+                        peer.connection.clone(),
+                    )
+                })
                 .collect()
         };
 
         let mut failed = Vec::new();
-        for (peer_id, stream) in streams {
-            if let Err(e) =
-                write_frame_or_reset(&stream, message.as_bytes(), CHAT_WRITE_TIMEOUT, "chat").await
+        for (peer_id, stream, connection) in streams {
+            if let Err(e) = write_call_frame(
+                &peer_id,
+                &stream,
+                &connection,
+                message.as_bytes(),
+                CallStream::Chat,
+            )
+            .await
             {
                 tracing::debug!("Chat to {peer_id} failed: {e}");
                 failed.push(peer_id);
@@ -2042,15 +2127,17 @@ impl ConnectionManager {
         let data = serde_json::to_vec(action)?;
         let stream = {
             let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.control_send.clone())
+            peers
+                .get(peer_id)
+                .map(|p| (p.control_send.clone(), p.connection.clone()))
         };
-        let Some(s) = stream else {
+        let Some((s, connection)) = stream else {
             anyhow::bail!("Peer {peer_id} is not connected");
         };
 
         // A peer that stopped reading would otherwise block this forever
         // (and every caller queued behind the stream lock).
-        write_frame_or_reset(&s, &data, CONTROL_WRITE_TIMEOUT, "control")
+        write_call_frame(peer_id, &s, &connection, &data, CallStream::Control)
             .await
             .map_err(|e| anyhow::anyhow!("control write to {peer_id} failed: {e}"))
     }
@@ -3094,7 +3181,12 @@ mod tests {
             CLOSE_RECONNECT_NO_LONGER_WANTED,
             b"",
         ] {
-            assert_eq!(app(reason), ForgetTicket, "{:?}", String::from_utf8_lossy(reason));
+            assert_eq!(
+                app(reason),
+                ForgetTicket,
+                "{:?}",
+                String::from_utf8_lossy(reason)
+            );
         }
         // Replacement / arbitration closes reach peers still in the call.
         for reason in [
@@ -3105,10 +3197,21 @@ mod tests {
             CLOSE_SUPERSEDED_BY_REDIAL,
             b"some_future_reason",
         ] {
-            assert_eq!(app(reason), KeepTicket, "{:?}", String::from_utf8_lossy(reason));
+            assert_eq!(
+                app(reason),
+                KeepTicket,
+                "{:?}",
+                String::from_utf8_lossy(reason)
+            );
         }
+        // A reset chat/control stream can only be replaced by a new connection.
+        assert_eq!(app(CLOSE_CONTROL_STREAM_STALLED), Reconnect);
+        assert_eq!(app(CLOSE_CHAT_STREAM_STALLED), Reconnect);
         assert_eq!(classify_call_close(&ConnectionError::TimedOut), Reconnect);
-        assert_eq!(classify_call_close(&ConnectionError::LocallyClosed), Reconnect);
+        assert_eq!(
+            classify_call_close(&ConnectionError::LocallyClosed),
+            Reconnect
+        );
         assert_eq!(classify_call_close(&ConnectionError::Reset), KeepTicket);
     }
 
@@ -3178,6 +3281,58 @@ mod tests {
         })
         .await
         .expect("timed out waiting for reconnect to succeed");
+
+        router_a.shutdown().await.ok();
+        endpoint_b.close().await;
+        endpoint_a.close().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_control_stream_closes_connection_and_redials() {
+        let (event_tx_a, _) = broadcast::channel::<Event>(64);
+        let (event_tx_b, _) = broadcast::channel::<Event>(256);
+        let (mgr_a, mgr_b, endpoint_a, endpoint_b, router_a, peer_id) =
+            connected_call_pair(event_tx_a, event_tx_b.clone()).await;
+        let mut rx_b = event_tx_b.subscribe();
+        mgr_b
+            .upsert_peer_ticket(&peer_id, &node::generate_ticket(&endpoint_a))
+            .await;
+        let old_connection = mgr_b.peers.lock().await[&peer_id].connection.clone();
+
+        // What write_call_frame does once a control write stalls and the
+        // stream has been reset.
+        old_connection.close(0u32.into(), CallStream::Control.stall_close_reason());
+
+        // Our own watcher sees the connection closed under a live entry and
+        // redials instead of dropping the peer.
+        timeout(Duration::from_secs(10), async {
+            loop {
+                match rx_b.recv().await {
+                    Ok(Event::PeerDisconnected { peer_id: id }) if id == peer_id => {
+                        panic!("a stalled stream must not end the call");
+                    }
+                    Ok(Event::PeerConnected { peer_id: id }) if id == peer_id => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the redial after a stalled stream");
+
+        let new_connection_id = mgr_b.peers.lock().await[&peer_id].connection.stable_id();
+        assert_ne!(new_connection_id, old_connection.stable_id());
+        let b_id = endpoint_b.id().to_string();
+        timeout(Duration::from_secs(10), async {
+            while !mgr_a.call_peer_connected(&b_id).await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("A should accept the redial");
+        mgr_b
+            .send_control(&peer_id, &ControlAction::Heartbeat)
+            .await
+            .expect("control works on the new connection");
 
         router_a.shutdown().await.ok();
         endpoint_b.close().await;
