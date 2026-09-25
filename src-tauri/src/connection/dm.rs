@@ -994,6 +994,7 @@ impl ConnectionManager {
         }
     }
 
+    #[cfg(test)]
     pub async fn disconnect_dm(&self, peer_id: &str) {
         self.cleanup_dm(peer_id, Some(b"dm_closed"), None).await;
     }

@@ -486,9 +486,6 @@ async function initCallListeners() {
       }
     }));
 
-    callUnlisteners.push(await listen<any>("nafaq-error", (event) => {
-      error.value = event.payload?.message || String(event.payload);
-    }));
   } catch (e) {
     console.warn("[call] listener init failed:", e);
     // Surface on the call error ref — nodeError belongs to useNodeRuntime and

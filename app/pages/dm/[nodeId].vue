@@ -264,6 +264,7 @@ onUnmounted(() => {
           :local-path="msg.localPath"
           :from="msg.from"
           :failed="msg.failed"
+          :fail-reason="msg.failReason"
         />
       </div>
 

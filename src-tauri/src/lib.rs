@@ -858,7 +858,6 @@ pub fn run() {
             commands::get_quality_profile,
             commands::get_pinned_name,
             commands::set_pinned_name,
-            commands::toggle_persistent_identity,
             commands::get_settings,
             commands::update_settings,
             commands::get_contacts,
@@ -868,7 +867,6 @@ pub fn run() {
             commands::connect_dm,
             commands::send_dm,
             commands::send_file,
-            commands::disconnect_dm,
         ])
         .run(tauri::generate_context!())
         .expect("error running nafaq");

@@ -24,6 +24,7 @@ export interface DmFileMessage {
   from: "self" | "peer";
   timestamp: number;
   failed?: boolean;
+  failReason?: string;
 }
 
 export type DmMessageItem = DmTextMessage | DmFileMessage;
@@ -209,10 +210,13 @@ async function initDmListeners() {
   }));
 
   dmUnlisteners.push(await listen<any>("dm-file-transfer-failed", (event) => {
-    const { peer_id, file_id } = event.payload;
+    const { peer_id, file_id, reason } = event.payload;
     if (!peer_id || !file_id) return;
     const fileMsg = findFileMsg(peer_id, file_id);
-    if (fileMsg && fileMsg.localPath === null) fileMsg.failed = true;
+    if (fileMsg && fileMsg.localPath === null) {
+      fileMsg.failed = true;
+      fileMsg.failReason = typeof reason === "string" ? reason : undefined;
+    }
   }));
 
   dmUnlisteners.push(await listen<any>("dm-received", (event) => {

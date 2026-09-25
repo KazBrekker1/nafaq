@@ -8,6 +8,7 @@ const { progress, localPath, failed } = defineProps<{
   localPath: string | null;
   from: "self" | "peer";
   failed?: boolean;
+  failReason?: string;
 }>();
 
 const isComplete = computed(() => progress >= 1);
@@ -43,13 +44,16 @@ async function openFile() {
     </div>
 
     <!-- Failed transfer -->
+    <!-- Checked before completion: a transfer can fail after the last byte
+         (size mismatch, save error). -->
     <div
-      v-if="failed && !isComplete"
+      v-if="failed"
       class="border-t border-error/60 px-3 py-2"
     >
       <p class="text-[10px] font-bold tracking-widest text-error">
         TRANSFER FAILED
       </p>
+      <p v-if="failReason" class="mt-0.5 text-[10px] text-dimmed">{{ failReason }}</p>
     </div>
 
     <!-- Progress bar -->
@@ -78,7 +82,7 @@ async function openFile() {
       />
     </div>
     <div
-      v-else-if="isComplete"
+      v-else-if="isComplete && !failed"
       class="border-t border-primary/40 px-3 py-2"
     >
       <p class="text-[10px] font-bold tracking-widest text-primary">

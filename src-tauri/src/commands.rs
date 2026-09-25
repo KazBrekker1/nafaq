@@ -603,13 +603,6 @@ pub async fn send_dm(
         .map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub async fn disconnect_dm(peer_id: String, state: State<'_, AppState>) -> Result<(), String> {
-    validate_peer_id(&peer_id)?;
-    state.conn_manager.disconnect_dm(&peer_id).await;
-    Ok(())
-}
-
 // ── Settings commands ───────────────────────────────────────────────
 
 #[tauri::command]
@@ -753,22 +746,6 @@ pub async fn remove_contact(
 }
 
 // ── Identity persistence commands ───────────────────────────────────
-
-#[tauri::command]
-pub async fn toggle_persistent_identity(
-    enabled: bool,
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    if !enabled {
-        return Err("Persistent identity cannot be disabled".into());
-    }
-
-    let store = app.store("settings.json").map_err(|e| e.to_string())?;
-    let key = state.endpoint.secret_key();
-    identity::persist_secret_key(&store, key).map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 // ── Name persistence commands ───────────────────────────────────────
 
