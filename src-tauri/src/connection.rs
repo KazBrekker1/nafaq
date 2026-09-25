@@ -130,6 +130,11 @@ fn relay_targets_for_announce<'a>(
         .collect()
 }
 
+/// Record inbound traffic on a call connection for the liveness ladder.
+fn mark_active(last_activity_ms: &AtomicU64) {
+    last_activity_ms.store(ConnectionManager::current_timestamp_ms(), Ordering::Relaxed);
+}
+
 /// Whether a peer-opened bidi stream of `stream_type` may be accepted on a
 /// call connection: one each of chat, control and DM; records it as seen.
 fn accept_call_bi_stream_type(seen: &mut HashSet<u8>, stream_type: u8) -> bool {
@@ -968,15 +973,6 @@ impl ConnectionManager {
             .unwrap_or(0)
     }
 
-    async fn mark_peer_active(&self, peer_id: &str) {
-        let last_activity = {
-            let peers = self.peers.lock().await;
-            peers.get(peer_id).map(|p| p.last_activity_ms.clone())
-        };
-        if let Some(last_activity) = last_activity {
-            last_activity.store(Self::current_timestamp_ms(), Ordering::Relaxed);
-        }
-    }
 
     pub fn new(
         event_tx: broadcast::Sender<Event>,
@@ -2037,6 +2033,7 @@ impl ConnectionManager {
         };
 
         let video_writer = peer_conn.video_writer.clone();
+        let last_activity_ms = peer_conn.last_activity_ms.clone();
 
         let (old_connection, old_count, new_count) = {
             let local_node_id = self.local_node_id().await;
@@ -2093,7 +2090,7 @@ impl ConnectionManager {
 
         Self::emit_quality_profile_if_changed(old_count, new_count, &self.event_tx);
 
-        self.spawn_stream_receivers(peer_id.clone(), connection, direction);
+        self.spawn_stream_receivers(peer_id.clone(), connection, direction, last_activity_ms);
 
         if let Some(announce_self) = self.latest_self_announce_action().await {
             let _ = self.send_control(&peer_id, &announce_self).await;
@@ -2267,11 +2264,14 @@ impl ConnectionManager {
         });
     }
 
+    /// `last_activity_ms` is this connection's entry's liveness counter; the
+    /// receivers bump it directly instead of looking the peer up per packet.
     fn spawn_stream_receivers(
         &self,
         peer_id: String,
         connection: Connection,
         direction: ConnectionDirection,
+        last_activity_ms: Arc<AtomicU64>,
     ) {
         let connection_id = connection.stable_id();
 
@@ -2280,6 +2280,7 @@ impl ConnectionManager {
             let manager = self.clone();
             let peer_id = peer_id.clone();
             let connection = connection.clone();
+            let last_activity_ms = last_activity_ms.clone();
             // Per-connection: dies with this connection's receiver tasks.
             let video_state = Arc::new(StdMutex::new(VideoReceiveState::default()));
             tokio::spawn(async move {
@@ -2289,9 +2290,16 @@ impl ConnectionManager {
                             let manager = manager.clone();
                             let peer_id = peer_id.clone();
                             let video_state = video_state.clone();
+                            let last_activity_ms = last_activity_ms.clone();
                             tokio::spawn(async move {
                                 manager
-                                    .handle_uni_stream(recv, &peer_id, connection_id, &video_state)
+                                    .handle_uni_stream(
+                                        recv,
+                                        &peer_id,
+                                        connection_id,
+                                        &video_state,
+                                        &last_activity_ms,
+                                    )
                                     .await;
                             });
                         }
@@ -2309,12 +2317,13 @@ impl ConnectionManager {
             let manager = self.clone();
             let peer_id = peer_id.clone();
             let connection = connection.clone();
+            let last_activity_ms = last_activity_ms.clone();
             tokio::spawn(async move {
                 loop {
                     match connection.read_datagram().await {
                         Ok(data) => {
                             if let Some(packet) = AudioDatagram::decode(&data) {
-                                manager.mark_peer_active(&peer_id).await;
+                                mark_active(&last_activity_ms);
                                 let _ = manager.audio_media_tx.send(AudioPacket {
                                     peer_id: peer_id.clone(),
                                     connection_id,
@@ -2418,8 +2427,11 @@ impl ConnectionManager {
                         }
                         let manager = manager.clone();
                         let peer_id = peer_id.clone();
+                        let last_activity_ms = last_activity_ms.clone();
                         tokio::spawn(async move {
-                            manager.handle_bi_stream(stream_type, &peer_id, recv).await;
+                            manager
+                                .handle_bi_stream(stream_type, &peer_id, recv, &last_activity_ms)
+                                .await;
                         });
                     }
                     Err(_) => {
@@ -2438,6 +2450,7 @@ impl ConnectionManager {
         peer_id: &str,
         connection_id: usize,
         video_state: &StdMutex<VideoReceiveState>,
+        last_activity_ms: &AtomicU64,
     ) {
         let mut type_buf = [0u8; 1];
         if recv.read_exact(&mut type_buf).await.is_err() {
@@ -2448,7 +2461,7 @@ impl ConnectionManager {
                 match crate::messages::read_framed(&mut recv, MAX_CONTROL_FRAME_BYTES).await {
                     Ok(Some(data)) => {
                         if let Some(packet) = AudioDatagram::decode(&data) {
-                            self.mark_peer_active(peer_id).await;
+                            mark_active(last_activity_ms);
                             let _ = self.audio_media_tx.send(AudioPacket {
                                 peer_id: peer_id.to_string(),
                                 connection_id,
@@ -2477,7 +2490,7 @@ impl ConnectionManager {
                 let Some((seq, timestamp_ms, payload)) = decode_video_frame(&body) else {
                     return;
                 };
-                self.mark_peer_active(peer_id).await;
+                mark_active(last_activity_ms);
                 let frame = ReceivedVideoFrame {
                     seq,
                     timestamp_ms,
@@ -2521,7 +2534,13 @@ impl ConnectionManager {
         }
     }
 
-    async fn handle_bi_stream(&self, stream_type: u8, peer_id: &str, mut recv: RecvStream) {
+    async fn handle_bi_stream(
+        &self,
+        stream_type: u8,
+        peer_id: &str,
+        mut recv: RecvStream,
+        last_activity_ms: &AtomicU64,
+    ) {
         let mut active_files: HashMap<String, ActiveFileReceive> = HashMap::new();
         let max_frame_len = match stream_type {
             STREAM_CHAT => MAX_CHAT_FRAME_BYTES,
@@ -2533,7 +2552,7 @@ impl ConnectionManager {
             match crate::messages::read_framed(&mut recv, max_frame_len).await {
                 Ok(Some(data)) => match stream_type {
                     STREAM_CHAT => {
-                        self.mark_peer_active(peer_id).await;
+                        mark_active(last_activity_ms);
                         if let Ok(message) = String::from_utf8(data) {
                             let _ = self.event_tx.send(Event::ChatReceived {
                                 peer_id: peer_id.to_string(),
@@ -2542,7 +2561,7 @@ impl ConnectionManager {
                         }
                     }
                     STREAM_CONTROL => {
-                        self.mark_peer_active(peer_id).await;
+                        mark_active(last_activity_ms);
                         if let Ok(action) = serde_json::from_slice::<ControlAction>(&data) {
                             if matches!(action, ControlAction::Heartbeat) {
                                 continue;
