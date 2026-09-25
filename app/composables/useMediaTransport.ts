@@ -29,7 +29,14 @@ import {
   type QualityProfilePayload,
 } from "./media/profile";
 import { resetBridgeFallback, setupReceiveBridge, teardownReceiveBridge } from "./media/receiveBridge";
-import { destroyAllVideoDecoders, forgetPeerVideoDecoderState, registerPeerCanvas } from "./media/receiveVideo";
+import {
+  destroyAllVideoDecoders,
+  forgetPeerVideoDecoderState,
+  registerPeerCanvas,
+  resetWebCodecsFallback,
+  resyncPeerVideo,
+  setWebCodecsFallbackHandler,
+} from "./media/receiveVideo";
 import {
   bumpReceiveRun,
   currentReceiveRun,
@@ -37,6 +44,7 @@ import {
   invokePromise,
   listenForRun,
   peerMediaStates,
+  requestKeyframe,
   setPeerIdsProvider,
 } from "./media/shared";
 
@@ -141,9 +149,24 @@ export function useMediaTransport() {
 
     await ensurePlaybackContext(token);
     resetBridgeFallback();
+    resetWebCodecsFallback();
     await teardownReceiveBridge(false);
     ensureReceiveRun(token);
     await setupReceiveBridge(token, false);
+    requestKeyframesForMountedTiles();
+
+    // WebCodecs turned out unusable on this device: re-register the bridge so
+    // the backend decodes to JPEG instead (it reads the registration per
+    // frame), then ask for keyframes — its decoder starts from scratch.
+    setWebCodecsFallbackHandler(() => {
+      if (token !== currentReceiveRun()) return;
+      void (async () => {
+        await teardownReceiveBridge(true);
+        if (token !== currentReceiveRun()) return;
+        await setupReceiveBridge(token, false);
+        requestKeyframesForMountedTiles();
+      })().catch((e) => console.warn("[transport] JPEG fallback failed:", e));
+    });
 
     unlistenDisconnect = await listenForRun<{ peer_id: string }>(token, "peer-disconnected", (event) => {
       const pid = typeof event.payload === "string" ? event.payload : event.payload?.peer_id;
@@ -159,8 +182,16 @@ export function useMediaTransport() {
     startActiveSpeakerDetection();
   }
 
+  // Keyframes requested before the bridge existed were decoded to nowhere.
+  function requestKeyframesForMountedTiles() {
+    for (const [peerId, state] of peerMediaStates) {
+      if (state.canvas && !state.videoPaused) requestKeyframe(peerId, true).catch(() => {});
+    }
+  }
+
   async function stop() {
     bumpReceiveRun();
+    setWebCodecsFallbackHandler(null);
 
     teardownCapture();
     await teardownReceiveBridge(true);
@@ -194,6 +225,8 @@ export function useMediaTransport() {
     const state = peerMediaStates.get(peerId);
     if (!state || state.videoPaused === paused) return;
     state.videoPaused = paused;
+    // Deltas were dropped while paused: resume from a fresh keyframe.
+    if (!paused) resyncPeerVideo(peerId);
     const invoke = await invokePromise;
     await invoke("send_control", {
       peerId,

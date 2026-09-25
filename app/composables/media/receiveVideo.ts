@@ -9,11 +9,15 @@ import {
 // Remote video: raw H.264 decoded in the WebView (WebCodecs) where supported,
 // otherwise JPEG frames decoded by the backend, drawn to each peer's canvas.
 
-const DECODER_CODEC = "avc1.42001E"; // H.264 Constrained Baseline Level 3.0
+// Constrained Baseline, level 3.1: covers openh264's output and the Android
+// WebView encoder (which declares 3.1).
+const DECODER_CODEC = "avc1.42E01F";
 // A VideoDecoder global doesn't guarantee H.264 support (e.g. Linux WebKitGTK
 // without the codec plugins); probe once and reuse the answer.
 let webCodecsDecodeSupport: Promise<boolean> | null = null;
+let webCodecsDisabled = false;
 export function supportsWebCodecsDecode(): Promise<boolean> {
+  if (webCodecsDisabled) return Promise.resolve(false);
   if (!webCodecsDecodeSupport) {
     webCodecsDecodeSupport = typeof VideoDecoder === "undefined"
       ? Promise.resolve(false)
@@ -38,6 +42,25 @@ const peerDecoderCooldownUntil = new Map<string, number>();
 const DECODER_ERROR_STORM_LIMIT = 3;
 const DECODER_ERROR_STORM_WINDOW_MS = 10_000;
 const DECODER_ERROR_COOLDOWN_MS = 10_000;
+// isConfigSupported can say yes while real decoding keeps failing (WebKitGTK
+// without codec plugins, flaky MediaCodec). After this many error storms —
+// or an outright NotSupportedError — stop using WebCodecs for the session
+// and have the backend send decoded JPEG frames instead.
+const MAX_ERROR_STORMS_BEFORE_FALLBACK = 2;
+let errorStorms = 0;
+let onWebCodecsUnusable: (() => void) | null = null;
+
+export function setWebCodecsFallbackHandler(handler: (() => void) | null) {
+  onWebCodecsUnusable = handler;
+}
+
+function disableWebCodecs(reason: string) {
+  if (webCodecsDisabled) return;
+  webCodecsDisabled = true;
+  console.warn(`[transport] WebCodecs decoding unusable (${reason}); falling back to JPEG frames`);
+  destroyAllVideoDecoders();
+  onWebCodecsUnusable?.();
+}
 
 function isVideoDecoderInCooldown(peerId: string): boolean {
   const until = peerDecoderCooldownUntil.get(peerId);
@@ -56,7 +79,11 @@ function isVideoDecoderInCooldown(peerId: string): boolean {
 // before an IDR, and asks the peer for a fresh keyframe. If errors keep
 // recurring in a short window, backs off from recreating the decoder for a
 // cooldown period instead of spinning.
-function recoverVideoDecoder(peerId: string, reason: string) {
+function recoverVideoDecoder(peerId: string, reason: string, notSupported = false) {
+  if (notSupported) {
+    disableWebCodecs(reason);
+    return;
+  }
   destroyVideoDecoder(peerId);
   peersAwaitingKeyframe.add(peerId);
 
@@ -68,6 +95,12 @@ function recoverVideoDecoder(peerId: string, reason: string) {
   peerDecoderErrorTimestamps.set(peerId, recent);
 
   if (recent.length > DECODER_ERROR_STORM_LIMIT) {
+    errorStorms += 1;
+    if (errorStorms >= MAX_ERROR_STORMS_BEFORE_FALLBACK) {
+      disableWebCodecs(reason);
+      return;
+    }
+    peerDecoderErrorTimestamps.delete(peerId);
     peerDecoderCooldownUntil.set(peerId, now + DECODER_ERROR_COOLDOWN_MS);
     console.warn(
       `VideoDecoder for ${peerId} errored ${recent.length} times in ${DECODER_ERROR_STORM_WINDOW_MS}ms (${reason}); pausing decoder recreation for ${DECODER_ERROR_COOLDOWN_MS}ms`,
@@ -100,7 +133,7 @@ function getOrCreateVideoDecoder(peerId: string, canvas: HTMLCanvasElement): Vid
       frame.close();
     },
     error(e: DOMException) {
-      recoverVideoDecoder(peerId, `VideoDecoder error: ${e.message}`);
+      recoverVideoDecoder(peerId, `VideoDecoder error: ${e.message}`, e.name === "NotSupportedError");
     },
   });
   decoder.configure({
@@ -124,6 +157,18 @@ export function forgetPeerVideoDecoderState(peerId: string) {
   destroyVideoDecoder(peerId);
   peerDecoderErrorTimestamps.delete(peerId);
   peerDecoderCooldownUntil.delete(peerId);
+}
+
+/** The chain for this peer is broken (e.g. its tile was paused): wait for,
+ *  and ask for, a fresh keyframe before decoding again. */
+export function resyncPeerVideo(peerId: string) {
+  if (peerVideoDecoders.has(peerId)) peersAwaitingKeyframe.add(peerId);
+  requestKeyframe(peerId, true).catch(() => {});
+}
+
+export function resetWebCodecsFallback() {
+  webCodecsDisabled = false;
+  errorStorms = 0;
 }
 
 export function destroyAllVideoDecoders() {
@@ -152,8 +197,10 @@ export function handleRawNalu(peerId: string, timestamp: number, isKeyframe: boo
   if (isKeyframe) {
     peersAwaitingKeyframe.delete(peerId);
   } else if (peersAwaitingKeyframe.has(peerId)) {
-    // Still waiting for the first IDR — dropping this delta avoids a
-    // decoder error and the black frame it would cause.
+    // Still waiting for an IDR — dropping this delta avoids a decoder error.
+    // Keep asking (debounced): the keyframe requested when the canvas
+    // mounted may have arrived before this bridge was registered.
+    requestKeyframe(peerId).catch(() => {});
     return;
   }
   try {
